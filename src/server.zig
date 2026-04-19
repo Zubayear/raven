@@ -1,6 +1,7 @@
 const std = @import("std");
 
 const Io = std.Io;
+const AccountStore = @import("account_index.zig").AccountStore;
 const Config = @import("config.zig").Config;
 const AliasTable = @import("alias_index.zig").AliasTable;
 const Storage = @import("storage.zig").Storage;
@@ -64,11 +65,29 @@ pub const Server = struct {
         var sender: ?[]u8 = null;
         defer if (sender) |value| self.allocator.free(value);
 
+        var auth_identity: ?MailIdentity = null;
+        defer if (auth_identity) |value| freeMailIdentity(self.allocator, value);
+
+        var auth_pending: ?AuthChallenge = null;
+
         var recipients = std.ArrayList(Recipient).empty;
         defer recipients.deinit(self.allocator);
 
         while (true) {
             const line = try nextLine(r) orelse return;
+
+            if (auth_pending != null) {
+                auth_pending = null;
+                const identity = completeAuthPlain(self.allocator, io, self.storage, tenant_catalog, line) catch {
+                    try w.writeAll("535 5.7.8 Authentication failed\r\n");
+                    continue;
+                };
+
+                if (auth_identity) |value| freeMailIdentity(self.allocator, value);
+                auth_identity = identity;
+                try w.writeAll("235 2.7.0 Authentication successful\r\n");
+                continue;
+            }
 
             if (startsWithIgnoreCase(line, "QUIT")) {
                 try w.writeAll("221 bye\r\n");
@@ -78,12 +97,40 @@ pub const Server = struct {
             if (startsWithIgnoreCase(line, "EHLO") or startsWithIgnoreCase(line, "HELO")) {
                 try w.writeAll("250-");
                 try w.writeAll(self.config.hostname);
-                try w.writeAll("\r\n250 PIPELINING\r\n");
+                try w.writeAll("\r\n250-AUTH PLAIN\r\n250 PIPELINING\r\n");
                 continue;
             }
 
             if (startsWithIgnoreCase(line, "NOOP")) {
                 try w.writeAll("250 ok\r\n");
+                continue;
+            }
+
+            if (startsWithIgnoreCase(line, "AUTH ")) {
+                const auth = parseAuthCommand(line) catch {
+                    try w.writeAll("501 bad auth command\r\n");
+                    continue;
+                };
+
+                if (!std.ascii.eqlIgnoreCase(auth.mechanism, "PLAIN")) {
+                    try w.writeAll("504 mechanism unsupported\r\n");
+                    continue;
+                }
+
+                if (auth.initial_response) |response| {
+                    const identity = completeAuthPlain(self.allocator, io, self.storage, tenant_catalog, response) catch {
+                        try w.writeAll("535 5.7.8 Authentication failed\r\n");
+                        continue;
+                    };
+
+                    if (auth_identity) |value| freeMailIdentity(self.allocator, value);
+                    auth_identity = identity;
+                    try w.writeAll("235 2.7.0 Authentication successful\r\n");
+                    continue;
+                }
+
+                auth_pending = .plain;
+                try w.writeAll("334 \r\n");
                 continue;
             }
 
@@ -97,6 +144,26 @@ pub const Server = struct {
 
             if (startsWithIgnoreCase(line, "MAIL FROM:")) {
                 if (sender) |value| self.allocator.free(value);
+                const request = parseRecipient(trimAfterColon(line)) catch {
+                    try w.writeAll("501 bad sender\r\n");
+                    continue;
+                };
+
+                const resolved_tenant = tenant_catalog.resolveTenant(request.tenant_hint, request.domain) catch {
+                    try w.writeAll("550 sender not hosted\r\n");
+                    continue;
+                };
+
+                if (auth_identity) |identity| {
+                    if (!senderMatchesAuth(identity, resolved_tenant, request)) {
+                        try w.writeAll("553 sender not authorized\r\n");
+                        continue;
+                    }
+                } else if (!std.mem.eql(u8, resolved_tenant, request.domain)) {
+                    try w.writeAll("530 authentication required\r\n");
+                    continue;
+                }
+
                 sender = try self.allocator.dupe(u8, trimAfterColon(line));
                 clearRecipients(self.allocator, &recipients);
                 try w.writeAll("250 ok\r\n");
@@ -177,6 +244,90 @@ const RecipientRequest = struct {
     domain: []const u8,
     user: []const u8,
 };
+
+const AuthChallenge = enum { plain };
+
+const AuthCommand = struct {
+    mechanism: []const u8,
+    initial_response: ?[]const u8,
+};
+
+const MailIdentity = struct {
+    tenant: []u8,
+    domain: []u8,
+    user: []u8,
+};
+
+fn parseAuthCommand(line: []const u8) !AuthCommand {
+    const after_auth = std.mem.trim(u8, line[4..], " \t");
+    var parts = std.mem.tokenizeAny(u8, after_auth, " \t");
+    const mechanism = parts.next() orelse return error.InvalidRecipient;
+    return .{ .mechanism = mechanism, .initial_response = parts.next() };
+}
+
+fn completeAuthPlain(
+    allocator: std.mem.Allocator,
+    io: Io,
+    storage: Storage,
+    catalog: *const TenantCatalog,
+    encoded: []const u8,
+) !MailIdentity {
+    const decoded = try decodeBase64Payload(allocator, std.mem.trim(u8, encoded, " \t"));
+    defer allocator.free(decoded);
+
+    const first_zero = std.mem.indexOfScalar(u8, decoded, 0) orelse return error.InvalidRecipient;
+    const second_zero = std.mem.indexOfScalarPos(u8, decoded, first_zero + 1, 0) orelse return error.InvalidRecipient;
+
+    const login = std.mem.trim(u8, decoded[first_zero + 1 .. second_zero], " \t");
+    const password = decoded[second_zero + 1 ..];
+    if (login.len == 0 or password.len == 0) return error.InvalidRecipient;
+
+    const login_request = parseRecipient(login) catch return error.InvalidRecipient;
+    const tenant_name = try catalog.resolveTenant(login_request.tenant_hint, login_request.domain);
+
+    var account_store = try AccountStore.load(allocator, io, storage, tenant_name, login_request.domain);
+    defer account_store.deinit(allocator);
+
+    if (!account_store.verify(login_request.user, password)) return error.InvalidRecipient;
+
+    return .{
+        .tenant = try allocator.dupe(u8, tenant_name),
+        .domain = try allocator.dupe(u8, login_request.domain),
+        .user = try allocator.dupe(u8, login_request.user),
+    };
+}
+
+fn decodeBase64Payload(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 {
+    const clean = std.mem.trim(u8, encoded, " \t");
+    const codecs = [_]std.base64.Codecs{ std.base64.standard, std.base64.standard_no_pad };
+
+    for (codecs) |codec| {
+        const decoder = &codec.Decoder;
+        const size = decoder.calcSizeForSlice(clean) catch continue;
+        const buf = try allocator.alloc(u8, size);
+        errdefer allocator.free(buf);
+
+        decoder.decode(buf, clean) catch {
+            allocator.free(buf);
+            continue;
+        };
+        return buf;
+    }
+
+    return error.InvalidRecipient;
+}
+
+fn senderMatchesAuth(identity: MailIdentity, resolved_tenant: []const u8, request: RecipientRequest) bool {
+    return std.mem.eql(u8, identity.tenant, resolved_tenant) and
+        std.mem.eql(u8, identity.domain, request.domain) and
+        std.mem.eql(u8, identity.user, request.user);
+}
+
+fn freeMailIdentity(allocator: std.mem.Allocator, identity: MailIdentity) void {
+    allocator.free(identity.tenant);
+    allocator.free(identity.domain);
+    allocator.free(identity.user);
+}
 
 fn nextLine(reader: *Io.Reader) !?[]const u8 {
     const line = reader.takeDelimiterExclusive('\n') catch |err| switch (err) {
@@ -365,4 +516,98 @@ test "resolveRecipient applies domain alias" {
     defer allocator.free(recipient.user);
 
     try std.testing.expectEqualStrings("team-sales", recipient.user);
+}
+
+test "completeAuthPlain authenticates hosted account" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try TenantIndex.parseForTest(allocator, "tenant acme example.com\n");
+    defer catalog.deinit(allocator);
+
+    var hash_buf: [64]u8 = undefined;
+    const hash = @import("account_index.zig").passwordHashHex("secret", &hash_buf);
+    const accounts = try std.fmt.allocPrint(allocator, "alice {s}\n", .{hash});
+    defer allocator.free(accounts);
+
+    try tmp.dir.createDirPath(std.testing.io, "tenants/acme/domains/example.com");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "tenants/acme/domains/example.com/accounts.txt",
+        .data = accounts,
+    });
+
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(root);
+
+    const payload = try buildPlainAuthPayload(allocator, "alice@example.com", "secret");
+    defer allocator.free(payload);
+
+    const identity = try completeAuthPlain(allocator, std.testing.io, Storage.init(root), &catalog, payload);
+    defer freeMailIdentity(allocator, identity);
+
+    try std.testing.expectEqualStrings("acme", identity.tenant);
+    try std.testing.expectEqualStrings("example.com", identity.domain);
+    try std.testing.expectEqualStrings("alice", identity.user);
+}
+
+test "completeAuthPlain rejects bad password" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var catalog = try TenantIndex.parseForTest(allocator, "tenant acme example.com\n");
+    defer catalog.deinit(allocator);
+
+    var hash_buf: [64]u8 = undefined;
+    const hash = @import("account_index.zig").passwordHashHex("secret", &hash_buf);
+    const accounts = try std.fmt.allocPrint(allocator, "alice {s}\n", .{hash});
+    defer allocator.free(accounts);
+
+    try tmp.dir.createDirPath(std.testing.io, "tenants/acme/domains/example.com");
+    try tmp.dir.writeFile(std.testing.io, .{
+        .sub_path = "tenants/acme/domains/example.com/accounts.txt",
+        .data = accounts,
+    });
+
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(root);
+
+    const payload = try buildPlainAuthPayload(allocator, "alice@example.com", "wrong");
+    defer allocator.free(payload);
+
+    try std.testing.expectError(error.InvalidRecipient, completeAuthPlain(allocator, std.testing.io, Storage.init(root), &catalog, payload));
+}
+
+test "senderMatchesAuth enforces exact sender" {
+    const allocator = std.testing.allocator;
+    const identity = MailIdentity{
+        .tenant = try allocator.dupe(u8, "acme"),
+        .domain = try allocator.dupe(u8, "example.com"),
+        .user = try allocator.dupe(u8, "alice"),
+    };
+    defer freeMailIdentity(allocator, identity);
+
+    const request = try parseRecipient("alice@example.com");
+    try std.testing.expect(senderMatchesAuth(identity, "acme", request));
+    try std.testing.expect(!senderMatchesAuth(identity, "beta", request));
+}
+
+fn buildPlainAuthPayload(allocator: std.mem.Allocator, login: []const u8, password: []const u8) ![]u8 {
+    const raw_len = login.len + password.len + 2;
+    var raw = try allocator.alloc(u8, raw_len);
+    errdefer allocator.free(raw);
+
+    raw[0] = 0;
+    @memcpy(raw[1 .. 1 + login.len], login);
+    raw[1 + login.len] = 0;
+    @memcpy(raw[2 + login.len ..], password);
+
+    const encoded_len = std.base64.standard.Encoder.calcSize(raw.len);
+    const encoded = try allocator.alloc(u8, encoded_len);
+    errdefer allocator.free(encoded);
+
+    const out = std.base64.standard.Encoder.encode(encoded, raw);
+    allocator.free(raw);
+    return out;
 }
