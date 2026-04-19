@@ -29,14 +29,29 @@ pub const ImapServer = struct {
 
     pub fn run(self: *ImapServer) !void {
         const io = std.Options.debug_io;
-        const address = try std.Io.net.IpAddress.parse(self.config.listen_address, self.config.imap_port);
-        var listener = try address.listen(io, .{ .reuse_address = true });
+        var listener = try self.listen(io);
         defer listener.deinit(io);
 
-        std.debug.print("imap listening on {any}\n", .{address});
+        var shutdown = std.atomic.Value(bool).init(false);
+        try self.serve(io, &listener, &shutdown);
+    }
 
-        while (true) {
-            var stream = try listener.accept(io);
+    pub fn listen(self: *ImapServer, io: Io) !std.Io.net.Server {
+        const address = try std.Io.net.IpAddress.parse(self.config.listen_address, self.config.imap_port);
+        const listener = try address.listen(io, .{ .reuse_address = true });
+        std.debug.print("imap listening on {any}\n", .{address});
+        return listener;
+    }
+
+    pub fn serve(self: *ImapServer, io: Io, listener: *std.Io.net.Server, shutdown: *const std.atomic.Value(bool)) !void {
+        while (!shutdown.load(.seq_cst)) {
+            var stream = listener.accept(io) catch |err| switch (err) {
+                error.SocketNotListening => return,
+                else => {
+                    std.debug.print("imap accept error: {}\n", .{err});
+                    continue;
+                },
+            };
             defer stream.close(io);
 
             self.handleClient(io, stream) catch |err| {

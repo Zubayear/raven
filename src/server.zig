@@ -24,27 +24,43 @@ pub const Server = struct {
 
     pub fn run(self: *Server) !void {
         const io = std.Options.debug_io;
-
         try self.storage.ensureLayout(io, self.allocator);
 
         var tenant_catalog = try TenantCatalog.load(self.allocator, io, self.storage);
         defer tenant_catalog.deinit(self.allocator);
 
-        var imap_server = ImapServer.init(self.allocator, self.config, self.storage, &tenant_catalog);
-        const imap_thread = try std.Thread.spawn(.{}, ImapServer.run, .{&imap_server});
-        defer imap_thread.join();
-
-        const address = try std.Io.net.IpAddress.parse(self.config.listen_address, self.config.listen_port);
-        var listener = try address.listen(io, .{ .reuse_address = true });
+        var listener = try self.listen(io);
         defer listener.deinit(io);
 
-        std.debug.print("raven listening on {any}\n", .{address});
+        var shutdown = std.atomic.Value(bool).init(false);
+        try self.serve(io, &listener, &tenant_catalog, &shutdown);
+    }
 
-        while (true) {
-            var stream = try listener.accept(io);
+    pub fn listen(self: *Server, io: Io) !std.Io.net.Server {
+        const address = try std.Io.net.IpAddress.parse(self.config.listen_address, self.config.listen_port);
+        const listener = try address.listen(io, .{ .reuse_address = true });
+        std.debug.print("smtp listening on {any}\n", .{address});
+        return listener;
+    }
+
+    pub fn serve(
+        self: *Server,
+        io: Io,
+        listener: *std.Io.net.Server,
+        tenant_catalog: *const TenantCatalog,
+        shutdown: *const std.atomic.Value(bool),
+    ) !void {
+        while (!shutdown.load(.seq_cst)) {
+            var stream = listener.accept(io) catch |err| switch (err) {
+                error.SocketNotListening => return,
+                else => {
+                    std.debug.print("smtp accept error: {}\n", .{err});
+                    continue;
+                },
+            };
             defer stream.close(io);
 
-            self.handleClient(io, stream, &tenant_catalog) catch |err| {
+            self.handleClient(io, stream, tenant_catalog) catch |err| {
                 std.debug.print("session error: {}\n", .{err});
             };
         }
