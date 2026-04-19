@@ -1,10 +1,13 @@
-pub fn main() !void {
-    const std = @import("std");
+const std = @import("std");
 
-    const allocator = std.heap.page_allocator;
+pub fn main(process: std.process.Init) !void {
+
     const Config = @import("config.zig").Config;
     const Server = @import("server.zig").Server;
 
-    var server = Server.init(allocator, Config{});
+    const config = try Config.load(process);
+    std.debug.print("starting raven {s} on {s}:{d} / imap {d} data={s}\n", .{ config.hostname, config.listen_address, config.listen_port, config.imap_port, config.data_dir });
+
+    var server = Server.init(process.arena.allocator(), config);
     try server.run();
 }
