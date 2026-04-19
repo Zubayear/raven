@@ -8,6 +8,7 @@ const Storage = @import("storage.zig").Storage;
 const ImapServer = @import("imap.zig").ImapServer;
 const TenantCatalog = @import("tenant_index.zig").TenantCatalog;
 const TenantIndex = @import("tenant_index.zig");
+const TlsServer = @import("tls.zig").TlsServer;
 
 pub const Server = struct {
     allocator: std.mem.Allocator,
@@ -33,7 +34,7 @@ pub const Server = struct {
         defer listener.deinit(io);
 
         var shutdown = std.atomic.Value(bool).init(false);
-        try self.serve(io, &listener, &tenant_catalog, &shutdown);
+        try self.serve(io, &listener, &tenant_catalog, &shutdown, null);
     }
 
     pub fn listen(self: *Server, io: Io) !std.Io.net.Server {
@@ -45,32 +46,48 @@ pub const Server = struct {
 
     pub fn serve(
         self: *Server,
-        io: Io,
+        fs_io: Io,
         listener: *std.Io.net.Server,
         tenant_catalog: *const TenantCatalog,
         shutdown: *const std.atomic.Value(bool),
+        tls_server: ?*TlsServer,
     ) !void {
         while (!shutdown.load(.seq_cst)) {
-            var stream = listener.accept(io) catch |err| switch (err) {
+            var stream = listener.accept(fs_io) catch |err| switch (err) {
                 error.SocketNotListening => return,
                 else => {
                     std.debug.print("smtp accept error: {}\n", .{err});
                     continue;
                 },
             };
-            defer stream.close(io);
 
-            self.handleClient(io, stream, tenant_catalog) catch |err| {
+            if (tls_server) |server| {
+                var tls_conn = server.accept(stream.socket.handle) catch |err| {
+                    std.debug.print("smtp tls handshake error: {}\n", .{err});
+                    stream.close(fs_io);
+                    continue;
+                };
+                defer tls_conn.deinit();
+                const net_io = tls_conn.io();
+                defer stream.close(net_io);
+                self.handleClient(fs_io, net_io, stream, tenant_catalog) catch |err| {
+                    std.debug.print("session error: {}\n", .{err});
+                };
+                continue;
+            }
+
+            defer stream.close(fs_io);
+            self.handleClient(fs_io, fs_io, stream, tenant_catalog) catch |err| {
                 std.debug.print("session error: {}\n", .{err});
             };
         }
     }
 
-    fn handleClient(self: *Server, io: Io, stream: std.Io.net.Stream, tenant_catalog: *const TenantCatalog) !void {
+    fn handleClient(self: *Server, fs_io: Io, net_io: Io, stream: std.Io.net.Stream, tenant_catalog: *const TenantCatalog) !void {
         var read_buf: [1024]u8 = undefined;
         var write_buf: [1024]u8 = undefined;
-        var reader = stream.reader(io, &read_buf);
-        var writer = stream.writer(io, &write_buf);
+        var reader = stream.reader(net_io, &read_buf);
+        var writer = stream.writer(net_io, &write_buf);
         const r = &reader.interface;
         const w = &writer.interface;
 
@@ -94,7 +111,7 @@ pub const Server = struct {
 
             if (auth_pending != null) {
                 auth_pending = null;
-                const identity = completeAuthPlain(self.allocator, io, self.storage, tenant_catalog, line) catch {
+                const identity = completeAuthPlain(self.allocator, fs_io, self.storage, tenant_catalog, line) catch {
                     try w.writeAll("535 5.7.8 Authentication failed\r\n");
                     continue;
                 };
@@ -134,7 +151,7 @@ pub const Server = struct {
                 }
 
                 if (auth.initial_response) |response| {
-                    const identity = completeAuthPlain(self.allocator, io, self.storage, tenant_catalog, response) catch {
+                    const identity = completeAuthPlain(self.allocator, fs_io, self.storage, tenant_catalog, response) catch {
                         try w.writeAll("535 5.7.8 Authentication failed\r\n");
                         continue;
                     };
@@ -197,7 +214,7 @@ pub const Server = struct {
                     continue;
                 };
 
-                const recipient = resolveRecipient(self.allocator, io, self.storage, tenant_catalog, request) catch |err| switch (err) {
+                const recipient = resolveRecipient(self.allocator, fs_io, self.storage, tenant_catalog, request) catch |err| switch (err) {
                     error.UnknownTenant, error.DomainNotHosted => {
                         try w.writeAll("550 mailbox unavailable\r\n");
                         continue;
@@ -220,12 +237,12 @@ pub const Server = struct {
                 const message = try readDataBlock(self.allocator, r);
                 defer self.allocator.free(message);
 
-                const stored_path = try self.storage.writeInboundMessage(io, self.allocator, message);
+                const stored_path = try self.storage.writeInboundMessage(fs_io, self.allocator, message);
                 defer self.allocator.free(stored_path);
 
                 for (recipients.items) |recipient| {
                     const mailbox_path = try self.storage.deliverMailboxMessage(
-                        io,
+                        fs_io,
                         self.allocator,
                         recipient.tenant,
                         recipient.domain,

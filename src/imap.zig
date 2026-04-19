@@ -6,6 +6,7 @@ const AccountStore = @import("account_index.zig").AccountStore;
 const Storage = @import("storage.zig").Storage;
 const freeMailboxMessages = @import("storage.zig").freeMailboxMessages;
 const TenantCatalog = @import("tenant_index.zig").TenantCatalog;
+const TlsServer = @import("tls.zig").TlsServer;
 
 pub const ImapServer = struct {
     allocator: std.mem.Allocator,
@@ -33,7 +34,7 @@ pub const ImapServer = struct {
         defer listener.deinit(io);
 
         var shutdown = std.atomic.Value(bool).init(false);
-        try self.serve(io, &listener, &shutdown);
+        try self.serve(io, &listener, &shutdown, null);
     }
 
     pub fn listen(self: *ImapServer, io: Io) !std.Io.net.Server {
@@ -43,28 +44,43 @@ pub const ImapServer = struct {
         return listener;
     }
 
-    pub fn serve(self: *ImapServer, io: Io, listener: *std.Io.net.Server, shutdown: *const std.atomic.Value(bool)) !void {
+    pub fn serve(self: *ImapServer, fs_io: Io, listener: *std.Io.net.Server, shutdown: *const std.atomic.Value(bool), tls_server: ?*TlsServer) !void {
         while (!shutdown.load(.seq_cst)) {
-            var stream = listener.accept(io) catch |err| switch (err) {
+            var stream = listener.accept(fs_io) catch |err| switch (err) {
                 error.SocketNotListening => return,
                 else => {
                     std.debug.print("imap accept error: {}\n", .{err});
                     continue;
                 },
             };
-            defer stream.close(io);
 
-            self.handleClient(io, stream) catch |err| {
+            if (tls_server) |server| {
+                var tls_conn = server.accept(stream.socket.handle) catch |err| {
+                    std.debug.print("imap tls handshake error: {}\n", .{err});
+                    stream.close(fs_io);
+                    continue;
+                };
+                defer tls_conn.deinit();
+                const net_io = tls_conn.io();
+                defer stream.close(net_io);
+                self.handleClient(fs_io, net_io, stream) catch |err| {
+                    std.debug.print("imap session error: {}\n", .{err});
+                };
+                continue;
+            }
+
+            defer stream.close(fs_io);
+            self.handleClient(fs_io, fs_io, stream) catch |err| {
                 std.debug.print("imap session error: {}\n", .{err});
             };
         }
     }
 
-    fn handleClient(self: *ImapServer, io: Io, stream: std.Io.net.Stream) !void {
+    fn handleClient(self: *ImapServer, fs_io: Io, net_io: Io, stream: std.Io.net.Stream) !void {
         var read_buf: [1024]u8 = undefined;
         var write_buf: [1024]u8 = undefined;
-        var reader = stream.reader(io, &read_buf);
-        var writer = stream.writer(io, &write_buf);
+        var reader = stream.reader(net_io, &read_buf);
+        var writer = stream.writer(net_io, &write_buf);
         const r = &reader.interface;
         const w = &writer.interface;
 
@@ -119,7 +135,7 @@ pub const ImapServer = struct {
                     else => return err,
                 };
 
-                var account_store = try AccountStore.load(self.allocator, io, self.storage, identity.tenant, identity.domain);
+                var account_store = try AccountStore.load(self.allocator, fs_io, self.storage, identity.tenant, identity.domain);
                 defer account_store.deinit(self.allocator);
 
                 if (!account_store.verify(identity.user, password)) {
@@ -160,7 +176,7 @@ pub const ImapServer = struct {
                     continue;
                 }
 
-                try session.loadMailbox(self.allocator, io, self.storage);
+                try session.loadMailbox(self.allocator, fs_io, self.storage);
                 const flags_line = try session.supportedFlags(self.allocator);
                 defer self.allocator.free(flags_line);
 
@@ -205,7 +221,7 @@ pub const ImapServer = struct {
                 defer self.allocator.free(flags_text);
 
                 const data = try self.storage.readMailboxMessage(
-                    io,
+                    fs_io,
                     self.allocator,
                     session.tenant.?,
                     session.domain.?,
@@ -265,7 +281,7 @@ pub const ImapServer = struct {
                 message.flags = message.flags.merge(added);
 
                 try self.storage.writeMailboxFlags(
-                    io,
+                    fs_io,
                     self.allocator,
                     session.tenant.?,
                     session.domain.?,
@@ -295,7 +311,7 @@ pub const ImapServer = struct {
                     if (!session.messages[idx].flags.deleted) continue;
 
                     try self.storage.deleteMailboxMessage(
-                        io,
+                        fs_io,
                         self.allocator,
                         session.tenant.?,
                         session.domain.?,
@@ -333,9 +349,9 @@ const Session = struct {
         self.user = identity.user;
     }
 
-    fn loadMailbox(self: *Session, allocator: std.mem.Allocator, io: Io, storage: Storage) !void {
+    fn loadMailbox(self: *Session, allocator: std.mem.Allocator, fs_io: Io, storage: Storage) !void {
         self.clearSelected(allocator);
-        self.messages = try storage.listMailboxMessages(io, allocator, self.tenant.?, self.domain.?, self.user.?);
+        self.messages = try storage.listMailboxMessages(fs_io, allocator, self.tenant.?, self.domain.?, self.user.?);
     }
 
     fn supportedFlags(self: Session, allocator: std.mem.Allocator) ![]u8 {

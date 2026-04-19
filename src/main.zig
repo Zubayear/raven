@@ -7,6 +7,7 @@ pub fn main(process: std.process.Init) !void {
     const ImapServer = @import("imap.zig").ImapServer;
     const Server = @import("server.zig").Server;
     const TenantCatalog = @import("tenant_index.zig").TenantCatalog;
+    const TlsServer = @import("tls.zig").TlsServer;
 
     const config = try Config.load(process);
     std.debug.print("starting raven {s} on {s}:{d} / imap {d} data={s}\n", .{ config.hostname, config.listen_address, config.listen_port, config.imap_port, config.data_dir });
@@ -20,6 +21,14 @@ pub fn main(process: std.process.Init) !void {
 
     var imap = ImapServer.init(allocator, config, smtp.storage, &tenant_catalog);
 
+    var tls_server: ?TlsServer = null;
+    if (config.tls_cert_file.len != 0 or config.tls_key_file.len != 0) {
+        if (config.tls_cert_file.len == 0 or config.tls_key_file.len == 0) return error.InvalidConfig;
+        tls_server = try TlsServer.init(allocator, config.tls_cert_file, config.tls_key_file);
+        defer if (tls_server) |*value| value.deinit();
+        std.debug.print("tls enabled with {s} and {s}\n", .{ config.tls_cert_file, config.tls_key_file });
+    }
+
     var smtp_listener = try smtp.listen(io);
     var imap_listener = try imap.listen(io);
 
@@ -27,9 +36,10 @@ pub fn main(process: std.process.Init) !void {
     var signal_set = std.posix.sigfillset();
     std.posix.sigprocmask(std.posix.SIG.BLOCK, &signal_set, null);
 
+    const tls_ptr: ?*TlsServer = if (tls_server) |*value| value else null;
     const signal_thread = try std.Thread.spawn(.{}, waitForShutdown, .{ io, &shutdown, &smtp_listener, &imap_listener, &signal_set });
-    const smtp_thread = try std.Thread.spawn(.{}, Server.serve, .{ &smtp, io, &smtp_listener, &tenant_catalog, &shutdown });
-    const imap_thread = try std.Thread.spawn(.{}, ImapServer.serve, .{ &imap, io, &imap_listener, &shutdown });
+    const smtp_thread = try std.Thread.spawn(.{}, Server.serve, .{ &smtp, io, &smtp_listener, &tenant_catalog, &shutdown, tls_ptr });
+    const imap_thread = try std.Thread.spawn(.{}, ImapServer.serve, .{ &imap, io, &imap_listener, &shutdown, tls_ptr });
 
     smtp_thread.join();
     imap_thread.join();

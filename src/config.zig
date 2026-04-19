@@ -6,6 +6,8 @@ pub const Config = struct {
     imap_port: u16 = 1143,
     hostname: []const u8 = "localhost",
     data_dir: []const u8 = "data",
+    tls_cert_file: []const u8 = "",
+    tls_key_file: []const u8 = "",
     config_path: ?[]const u8 = null,
 
     pub fn load(process: std.process.Init) !Config {
@@ -18,7 +20,15 @@ pub const Config = struct {
 
         try applyEnv(&config, process, arena);
         applyArgs(&config, args);
+        try config.validate();
         return config;
+    }
+
+    pub fn validate(self: Config) !void {
+        if (self.listen_address.len == 0) return error.InvalidConfig;
+        if (self.hostname.len == 0) return error.InvalidConfig;
+        if (self.data_dir.len == 0) return error.InvalidConfig;
+        if (self.listen_port == 0 or self.imap_port == 0) return error.InvalidConfig;
     }
 };
 
@@ -29,6 +39,8 @@ const ArgsOptions = struct {
     imap_port: ?u16 = null,
     hostname: ?[]const u8 = null,
     data_dir: ?[]const u8 = null,
+    tls_cert_file: ?[]const u8 = null,
+    tls_key_file: ?[]const u8 = null,
 };
 
 fn parseArgs(process: std.process.Init, arena: std.mem.Allocator) !ArgsOptions {
@@ -62,6 +74,14 @@ fn parseArgs(process: std.process.Init, arena: std.mem.Allocator) !ArgsOptions {
             args.data_dir = try arena.dupe(u8, it.next() orelse return error.MissingConfigValue);
             continue;
         }
+        if (std.mem.eql(u8, arg, "--tls-cert")) {
+            args.tls_cert_file = try arena.dupe(u8, it.next() orelse return error.MissingConfigValue);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--tls-key")) {
+            args.tls_key_file = try arena.dupe(u8, it.next() orelse return error.MissingConfigValue);
+            continue;
+        }
     }
     return args;
 }
@@ -72,6 +92,8 @@ fn applyArgs(config: *Config, args: ArgsOptions) void {
     if (args.imap_port) |value| config.imap_port = value;
     if (args.hostname) |value| config.hostname = value;
     if (args.data_dir) |value| config.data_dir = value;
+    if (args.tls_cert_file) |value| config.tls_cert_file = value;
+    if (args.tls_key_file) |value| config.tls_key_file = value;
 }
 
 fn applyEnv(config: *Config, process: std.process.Init, arena: std.mem.Allocator) !void {
@@ -80,6 +102,8 @@ fn applyEnv(config: *Config, process: std.process.Init, arena: std.mem.Allocator
     if (try getEnvValue(process, "RAVEN_IMAP_PORT")) |value| config.imap_port = try parsePort(value);
     if (try getEnvValue(process, "RAVEN_HOSTNAME")) |value| config.hostname = try arena.dupe(u8, value);
     if (try getEnvValue(process, "RAVEN_DATA_DIR")) |value| config.data_dir = try arena.dupe(u8, value);
+    if (try getEnvValue(process, "RAVEN_TLS_CERT")) |value| config.tls_cert_file = try arena.dupe(u8, value);
+    if (try getEnvValue(process, "RAVEN_TLS_KEY")) |value| config.tls_key_file = try arena.dupe(u8, value);
 }
 
 fn getEnvValue(process: std.process.Init, key: []const u8) !?[]const u8 {
@@ -131,6 +155,14 @@ fn applyKeyValue(config: *Config, allocator: std.mem.Allocator, key: []const u8,
         config.data_dir = try allocator.dupe(u8, value);
         return;
     }
+    if (std.mem.eql(u8, key, "tls_cert_file")) {
+        config.tls_cert_file = try allocator.dupe(u8, value);
+        return;
+    }
+    if (std.mem.eql(u8, key, "tls_key_file")) {
+        config.tls_key_file = try allocator.dupe(u8, value);
+        return;
+    }
 }
 
 fn parsePort(value: []const u8) !u16 {
@@ -174,4 +206,10 @@ test "parseText ignores comments and blanks" {
         \\
     , a);
     try std.testing.expectEqual(@as(u16, 2526), config.listen_port);
+}
+
+test "validate rejects empty values" {
+    try std.testing.expectError(error.InvalidConfig, (Config{ .listen_address = "", .hostname = "mail", .data_dir = "data" }).validate());
+    try std.testing.expectError(error.InvalidConfig, (Config{ .listen_address = "127.0.0.1", .hostname = "", .data_dir = "data" }).validate());
+    try std.testing.expectError(error.InvalidConfig, (Config{ .listen_address = "127.0.0.1", .hostname = "mail", .data_dir = "" }).validate());
 }

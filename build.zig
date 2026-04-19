@@ -64,6 +64,10 @@ pub fn build(b: *std.Build) void {
         .name = "raven",
         .root_module = exe_mod,
     });
+    exe.root_module.addIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/openssl@3/include" });
+    exe.root_module.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/openssl@3/lib" });
+    exe.root_module.linkSystemLibrary("ssl", .{});
+    exe.root_module.linkSystemLibrary("crypto", .{});
 
     // This declares intent for the executable to be installed into the
     // standard location when the user invokes the "install" step (the default
@@ -104,6 +108,10 @@ pub fn build(b: *std.Build) void {
     const exe_unit_tests = b.addTest(.{
         .root_module = exe_mod,
     });
+    exe_unit_tests.root_module.addIncludePath(.{ .cwd_relative = "/opt/homebrew/opt/openssl@3/include" });
+    exe_unit_tests.root_module.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/opt/openssl@3/lib" });
+    exe_unit_tests.root_module.linkSystemLibrary("ssl", .{});
+    exe_unit_tests.root_module.linkSystemLibrary("crypto", .{});
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
 
