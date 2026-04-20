@@ -1,69 +1,62 @@
 const std = @import("std");
-const net = std.net;
-const posix = std.posix;
 
-pub fn main() !void {
-    const address = try std.net.Address.parseIp("127.0.0.1", 5882);
-    const tpe: u32 = posix.SOCK.STREAM;
-    const protocol = posix.IPPROTO.TCP;
-    const listener = try posix.socket(address.any.family, tpe, protocol);
-    defer posix.close(listener);
+pub fn main(process: std.process.Init) !void {
+    const io = process.io;
+    const allocator = process.arena.allocator();
+    const Config = @import("config.zig").Config;
+    const ImapServer = @import("imap.zig").ImapServer;
+    const Server = @import("server.zig").Server;
+    const TenantCatalog = @import("tenant_index.zig").TenantCatalog;
+    const TlsServer = @import("tls.zig").TlsServer;
 
-    try posix.setsockopt(listener, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1)));
-    try posix.bind(listener, &address.any, address.getOsSockLen());
-    try printAddress(listener);
-    try posix.listen(listener, 128);
-    var buf: [128]u8 = undefined;
+    const config = try Config.load(process);
+    std.debug.print("starting raven {s} on {s}:{d} / imap {d} data={s}\n", .{ config.hostname, config.listen_address, config.listen_port, config.imap_port, config.data_dir });
 
-    while (true) {
-        var client_address: net.Address = undefined;
-        var client_address_len: posix.socklen_t = @sizeOf(net.Address);
+    var smtp = Server.init(allocator, config);
 
-        const socket = posix.accept(listener, &client_address.any, &client_address_len, 0) catch |err| {
-            std.debug.print("error accept: {}\n", .{err});
-            continue;
-        };
+    try smtp.storage.ensureLayout(io, allocator);
 
-        defer posix.close(socket);
-        std.debug.print("{} connected\n", .{client_address});
+    var tenant_catalog = try TenantCatalog.load(allocator, io, smtp.storage);
+    defer tenant_catalog.deinit(allocator);
 
-        const timeout = posix.timeval{.sec = 2, .usec = 500_000};
-        try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.RCVTIMEO, &std.mem.toBytes(timeout));
+    var imap = ImapServer.init(allocator, config, smtp.storage, &tenant_catalog);
 
-        try posix.setsockopt(socket, posix.SOL.SOCKET, posix.SO.SNDTIMEO, &std.mem.toBytes(timeout));
-
-        // read from client
-        const read = posix.read(socket, &buf) catch |err| {
-            std.debug.print("error reading: {}\n", .{err});
-            continue;
-        };
-
-        if (read == 0) {
-            continue;
-        }
-
-        write(socket, buf[0..read]) catch |err| {
-            std.debug.print("error writing: {}\n", .{err});
-        };
-
-        
+    var tls_server: ?TlsServer = null;
+    if (config.tls_cert_file.len != 0 or config.tls_key_file.len != 0) {
+        if (config.tls_cert_file.len == 0 or config.tls_key_file.len == 0) return error.InvalidConfig;
+        tls_server = try TlsServer.init(allocator, config.tls_cert_file, config.tls_key_file);
+        defer if (tls_server) |*value| value.deinit();
+        std.debug.print("tls enabled with {s} and {s}\n", .{ config.tls_cert_file, config.tls_key_file });
     }
+
+    var smtp_listener = try smtp.listen(io);
+    var imap_listener = try imap.listen(io);
+
+    var shutdown = std.atomic.Value(bool).init(false);
+    var signal_set = std.posix.sigfillset();
+    std.posix.sigprocmask(std.posix.SIG.BLOCK, &signal_set, null);
+
+    const tls_ptr: ?*TlsServer = if (tls_server) |*value| value else null;
+    const signal_thread = try std.Thread.spawn(.{}, waitForShutdown, .{ io, &shutdown, &smtp_listener, &imap_listener, &signal_set });
+    const smtp_thread = try std.Thread.spawn(.{}, Server.serve, .{ &smtp, io, &smtp_listener, &tenant_catalog, &shutdown, tls_ptr });
+    const imap_thread = try std.Thread.spawn(.{}, ImapServer.serve, .{ &imap, io, &imap_listener, &shutdown, tls_ptr });
+
+    smtp_thread.join();
+    imap_thread.join();
+    signal_thread.join();
 }
 
-fn printAddress(socket: posix.socket_t) !void {
-    var address: std.net.Address = undefined;
-    var len: posix.socklen_t = @sizeOf(net.Address);
-    try posix.getsockname(socket, &address.any, &len);
-    std.debug.print("{}\n", .{address}); 
-}
-
-fn write(socket: posix.socket_t, msg: []const u8) !void {
-    var pos: usize = 0;
-    while (pos < msg.len) {
-        const written = try posix.write(socket, msg[pos..]);
-        if (written == 0) {
-            return error.Closed;
-        }
-        pos += written; 
-    }
+fn waitForShutdown(
+    io: std.Io,
+    shutdown: *std.atomic.Value(bool),
+    smtp_listener: *std.Io.net.Server,
+    imap_listener: *std.Io.net.Server,
+    signal_set: *std.posix.sigset_t,
+) void {
+    var sig: c_int = 0;
+    _ = std.c.sigwait(signal_set, &sig);
+    shutdown.store(true, .seq_cst);
+    smtp_listener.deinit(io);
+    imap_listener.deinit(io);
+    std.debug.print("shutdown requested by signal {d}\n", .{sig});
 }
