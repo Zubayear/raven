@@ -85,7 +85,7 @@ pub const Server = struct {
 
     fn handleClient(self: *Server, fs_io: Io, net_io: Io, stream: std.Io.net.Stream, tenant_catalog: *const TenantCatalog) !void {
         var read_buf: [1024]u8 = undefined;
-        var write_buf: [1024]u8 = undefined;
+        var write_buf: [0]u8 = undefined;
         var reader = stream.reader(net_io, &read_buf);
         var writer = stream.writer(net_io, &write_buf);
         const r = &reader.interface;

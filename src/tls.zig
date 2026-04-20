@@ -44,11 +44,13 @@ pub const TlsServer = struct {
         errdefer c.SSL_free(ssl);
 
         if (c.SSL_set_fd(ssl, @intCast(socket_handle)) != 1) return error.TlsHandshakeFailed;
+        _ = c.SSL_set_accept_state(ssl);
 
         while (true) {
             const rc = c.SSL_accept(ssl);
             if (rc == 1) break;
             const err = c.SSL_get_error(ssl, rc);
+            std.debug.print("tls accept rc={d} err={d}\n", .{ rc, err });
             switch (err) {
                 c.SSL_ERROR_WANT_READ, c.SSL_ERROR_WANT_WRITE => continue,
                 else => return error.TlsHandshakeFailed,
