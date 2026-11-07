@@ -126,6 +126,7 @@ test {
     _ = @import("config.zig");
     _ = @import("conn.zig");
     _ = @import("imap.zig");
+    _ = @import("imap_proto.zig");
     _ = @import("server.zig");
     _ = @import("storage.zig");
     _ = @import("tenant_index.zig");

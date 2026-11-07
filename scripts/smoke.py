@@ -43,38 +43,14 @@ class Raven:
         self.proc.wait(timeout=10)
 
 
-class Imap:
-    """Raw IMAP client: imaplib quotes LOGIN arguments, which raven can't parse yet (#12)."""
-
-    def __init__(self, sock):
-        self.file = sock.makefile("rwb")
-        self.tag = 0
-        line = self.file.readline()
-        assert line.startswith(b"* OK"), line
-
-    def cmd(self, text):
-        self.tag += 1
-        tag = b"t%d" % self.tag
-        self.file.write(tag + b" " + text.encode() + b"\r\n")
-        self.file.flush()
-        out = b""
-        while True:
-            line = self.file.readline()
-            if not line:
-                raise AssertionError(f"connection closed during {text!r}: {out!r}")
-            out += line
-            if line.startswith(tag + b" "):
-                assert line.startswith(tag + b" OK"), out
-                return out
-
-
+PASSWORD = "correct horse"  # the space exercises IMAP quoting (#12)
 PASSWORD_HASH = None
 
 
 def setup_accounts(root):
     global PASSWORD_HASH
     if PASSWORD_HASH is None:  # argon2id is deliberately slow: hash once
-        PASSWORD_HASH = subprocess.run([BIN, "passwd"], input=b"secret\n", capture_output=True,
+        PASSWORD_HASH = subprocess.run([BIN, "passwd"], input=PASSWORD.encode() + b"\n", capture_output=True,
                                        check=True).stdout.decode().strip()
         assert PASSWORD_HASH.startswith("$argon2id$"), PASSWORD_HASH
     domain = root / "tenants/acme/domains/example.com"
@@ -83,17 +59,20 @@ def setup_accounts(root):
     (domain / "accounts.txt").write_text(f"alice {PASSWORD_HASH}\n")
 
 
-def check_delivery(smtp, imap_sock, expected=1, sender="bob@external.test"):
+def check_delivery(smtp, imap, expected=1, sender="bob@external.test"):
     smtp.sendmail(sender, ["alice+smoke@example.com"], f"Subject: smoke {expected}\r\n\r\nhello raven\r\n")
     smtp.quit()
 
-    imap = Imap(imap_sock)
-    imap.cmd("LOGIN alice@example.com secret")
-    assert b"* %d EXISTS" % expected in imap.cmd("SELECT INBOX")
-    fetched = imap.cmd("FETCH %d BODY[]" % expected)
+    imap.login("alice@example.com", PASSWORD)
+    assert imap.select("INBOX") == ("OK", [b"%d" % expected])
+    fetched = imap.fetch(str(expected), "(BODY[])")[1][0][1]
     assert b"Subject: smoke %d" % expected in fetched
     assert b"Return-Path: <%s>" % sender.encode() in fetched and b"([127.0.0.1])" in fetched, fetched  # #11
-    imap.cmd("LOGOUT")
+    imap.logout()
+
+
+def imap_plain():
+    return imaplib.IMAP4(HOST, IMAP_PORT, timeout=5)
 
 
 def main():
@@ -105,19 +84,17 @@ def main():
         with Raven(data):
             # Silent clients must not block anyone else (#5).
             idle = [socket.create_connection((HOST, port), timeout=5) for port in (SMTP_PORT, IMAP_PORT)]
-            check_delivery(smtplib.SMTP(HOST, SMTP_PORT, timeout=5),
-                           socket.create_connection((HOST, IMAP_PORT), timeout=5))
+            check_delivery(smtplib.SMTP(HOST, SMTP_PORT, timeout=5), imap_plain())
             for s in idle:
                 s.close()
 
         with Raven(data):  # delivery after a restart must not collide with existing files (#6)
-            check_delivery(smtplib.SMTP(HOST, SMTP_PORT, timeout=5),
-                           socket.create_connection((HOST, IMAP_PORT), timeout=5), expected=2)
-            imap = Imap(socket.create_connection((HOST, IMAP_PORT), timeout=5))
-            imap.cmd("LOGIN alice@example.com secret")
-            imap.cmd("SELECT INBOX")
-            imap.cmd("STORE 1 +FLAGS (\\Seen)")
-            imap.cmd("LOGOUT")
+            check_delivery(smtplib.SMTP(HOST, SMTP_PORT, timeout=5), imap_plain(), expected=2)
+            imap = imap_plain()
+            imap.login("alice@example.com", PASSWORD)
+            imap.select("INBOX")
+            assert imap.store("1", "+FLAGS", "(\\Seen)")[0] == "OK"
+            imap.logout()
         # Any standard Maildir reader must see both messages and the flag.
         maildir = mailbox.Maildir(data / "tenants/acme/domains/example.com/users/alice/Maildir", create=False)
         assert sorted(m.get_flags() for m in maildir) == ["", "S"], [m.get_flags() for m in maildir]
@@ -150,17 +127,16 @@ def main():
             smtp = smtplib.SMTP(HOST, SMTP_PORT, timeout=5)
             smtp.ehlo()
             assert smtp.has_extn("starttls") and not smtp.has_extn("auth"), smtp.esmtp_features
-            credentials = base64.b64encode(b"\0alice@example.com\0secret").decode()
+            credentials = base64.b64encode(b"\0alice@example.com\0" + PASSWORD.encode()).decode()
             assert smtp.docmd("AUTH", "PLAIN " + credentials)[0] == 538
             smtp.starttls(context=ctx)
-            smtp.login("alice@example.com", "secret")
-            check_delivery(smtp, ctx.wrap_socket(socket.create_connection((HOST, IMAP_PORT), timeout=5)),
-                           sender="alice@example.com")
+            smtp.login("alice@example.com", PASSWORD)
+            check_delivery(smtp, imaplib.IMAP4_SSL(HOST, IMAP_PORT, ssl_context=ctx, timeout=5), sender="alice@example.com")
 
             smtps = smtplib.SMTP_SSL(HOST, SMTPS_PORT, timeout=5, context=ctx)
-            smtps.login("alice@example.com", "secret")
-            check_delivery(smtps, ctx.wrap_socket(socket.create_connection((HOST, IMAP_PORT), timeout=5)),
-                           expected=2, sender="alice@example.com")
+            smtps.login("alice@example.com", PASSWORD)
+            check_delivery(smtps, imaplib.IMAP4_SSL(HOST, IMAP_PORT, ssl_context=ctx, timeout=5), expected=2,
+                           sender="alice@example.com")
 
             s_client = subprocess.run(["openssl", "s_client", "-starttls", "smtp", "-connect", f"{HOST}:{SMTP_PORT}",
                                        "-CAfile", cert, "-quiet"], input=b"EHLO client\r\nQUIT\r\n",
