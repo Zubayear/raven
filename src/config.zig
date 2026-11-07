@@ -24,6 +24,8 @@ pub const Config = struct {
     max_message_size: u64 = 25 * 1024 * 1024,
     /// Accept AUTH without TLS. Only for local testing.
     allow_plaintext_auth: bool = false,
+    /// Least severe level logged: err, warn, info or debug.
+    log_level: std.log.Level = .info,
     config_path: ?[]const u8 = null,
 
     pub fn load(process: std.process.Init) !Config {
@@ -67,6 +69,7 @@ const ArgsOptions = struct {
     max_connections: ?u32 = null,
     max_message_size: ?u64 = null,
     allow_plaintext_auth: ?bool = null,
+    log_level: ?std.log.Level = null,
 };
 
 fn parseArgs(process: std.process.Init, arena: std.mem.Allocator) !ArgsOptions {
@@ -112,6 +115,10 @@ fn parseArgs(process: std.process.Init, arena: std.mem.Allocator) !ArgsOptions {
             args.relay_port = try parsePort(it.next() orelse return error.MissingConfigValue);
             continue;
         }
+        if (std.mem.eql(u8, arg, "--log-level")) {
+            args.log_level = try parseLogLevel(it.next() orelse return error.MissingConfigValue);
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--allow-plaintext-auth")) {
             args.allow_plaintext_auth = true;
             continue;
@@ -154,6 +161,7 @@ fn applyArgs(config: *Config, args: ArgsOptions) void {
     if (args.relay_host) |value| config.relay_host = value;
     if (args.relay_port) |value| config.relay_port = value;
     if (args.allow_plaintext_auth) |value| config.allow_plaintext_auth = value;
+    if (args.log_level) |value| config.log_level = value;
     if (args.hostname) |value| config.hostname = value;
     if (args.data_dir) |value| config.data_dir = value;
     if (args.tls_cert_file) |value| config.tls_cert_file = value;
@@ -172,6 +180,7 @@ fn applyEnv(config: *Config, process: std.process.Init, arena: std.mem.Allocator
     if (try getEnvValue(process, "RAVEN_RELAY_HOST")) |value| config.relay_host = try arena.dupe(u8, value);
     if (try getEnvValue(process, "RAVEN_RELAY_PORT")) |value| config.relay_port = try parsePort(value);
     if (try getEnvValue(process, "RAVEN_ALLOW_PLAINTEXT_AUTH")) |value| config.allow_plaintext_auth = try parseBool(value);
+    if (try getEnvValue(process, "RAVEN_LOG_LEVEL")) |value| config.log_level = try parseLogLevel(value);
     if (try getEnvValue(process, "RAVEN_HOSTNAME")) |value| config.hostname = try arena.dupe(u8, value);
     if (try getEnvValue(process, "RAVEN_DATA_DIR")) |value| config.data_dir = try arena.dupe(u8, value);
     if (try getEnvValue(process, "RAVEN_TLS_CERT")) |value| config.tls_cert_file = try arena.dupe(u8, value);
@@ -245,6 +254,10 @@ fn applyKeyValue(config: *Config, allocator: std.mem.Allocator, key: []const u8,
         config.allow_plaintext_auth = try parseBool(value);
         return;
     }
+    if (std.mem.eql(u8, key, "log_level")) {
+        config.log_level = try parseLogLevel(value);
+        return;
+    }
     if (std.mem.eql(u8, key, "hostname")) {
         config.hostname = try allocator.dupe(u8, value);
         return;
@@ -277,6 +290,10 @@ fn parseBool(value: []const u8) !bool {
     return error.InvalidConfig;
 }
 
+fn parseLogLevel(value: []const u8) !std.log.Level {
+    return std.meta.stringToEnum(std.log.Level, value) orelse error.InvalidConfig;
+}
+
 fn parsePort(value: []const u8) !u16 {
     const port = try std.fmt.parseInt(u16, value, 10);
     if (port == 0) return error.InvalidPort;
@@ -295,6 +312,7 @@ test "parseText reads config values" {
         \\imap_port = 1144
         \\hostname = mail.example.com
         \\data_dir = /srv/raven
+        \\log_level = debug
     ;
 
     const config = try parseText(raw, a);
@@ -303,6 +321,8 @@ test "parseText reads config values" {
     try std.testing.expectEqual(@as(u16, 1144), config.imap_port);
     try std.testing.expectEqualStrings("mail.example.com", config.hostname);
     try std.testing.expectEqualStrings("/srv/raven", config.data_dir);
+    try std.testing.expectEqual(std.log.Level.debug, config.log_level);
+    try std.testing.expectError(error.InvalidConfig, parseText("log_level = verbose", a));
 }
 
 test "parseText ignores comments and blanks" {

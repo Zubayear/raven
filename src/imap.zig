@@ -33,10 +33,12 @@ pub const ImapServer = struct {
         };
     }
 
+    pub const log_scope = .imap;
+
     pub fn listen(self: *ImapServer, io: Io, port: u16) !std.Io.net.Server {
         const ip = try std.Io.net.IpAddress.parse(self.config.listen_address, port);
         const listener = try ip.listen(io, .{ .reuse_address = true });
-        std.debug.print("imap listening on {any}\n", .{ip});
+        std.log.scoped(log_scope).info("listening on {f}", .{ip});
         return listener;
     }
 
@@ -223,8 +225,10 @@ const Context = struct {
         if (!authAllowed(ctx.server, ctx.client)) return ctx.no("[PRIVACYREQUIRED] LOGIN requires TLS; use STARTTLS");
 
         const s = ctx.server;
+        // Neither `user` nor `password` is logged on failure: people type
+        // passwords into the user field.
         const identity = account_index.authenticate(s.allocator, ctx.io, s.storage, s.tenant_catalog, user, password) catch |err| switch (err) {
-            error.AuthFailed => return ctx.no("[AUTHENTICATIONFAILED] authentication failed"),
+            error.AuthFailed => return ctx.authFailed(),
             else => return err,
         };
         try ctx.loggedIn(identity, "LOGIN");
@@ -251,14 +255,21 @@ const Context = struct {
         if (std.mem.eql(u8, response, "*")) return ctx.bad("authentication canceled");
 
         const s = ctx.server;
+        // Never log `response`: it carries the password.
         const identity = account_index.authenticatePlain(s.allocator, ctx.io, s.storage, s.tenant_catalog, response) catch |err| switch (err) {
-            error.AuthFailed => return ctx.no("[AUTHENTICATIONFAILED] authentication failed"),
+            error.AuthFailed => return ctx.authFailed(),
             else => return err,
         };
         try ctx.loggedIn(identity, "AUTHENTICATE");
     }
 
+    fn authFailed(ctx: Context) !void {
+        ctx.client.log(.warn, ImapServer.log_scope, "authentication failed", .{});
+        return ctx.no("[AUTHENTICATIONFAILED] authentication failed");
+    }
+
     fn loggedIn(ctx: Context, identity: Identity, command: []const u8) !void {
+        ctx.client.log(.info, ImapServer.log_scope, "authenticated as {s}@{s}", .{ identity.user, identity.domain });
         const s = ctx.server;
         ctx.session.identity = identity;
         ctx.session.maildir = try s.storage.maildirPath(s.allocator, identity.tenant, identity.domain, identity.user);
@@ -1326,11 +1337,11 @@ test "list patterns" {
 /// Runs one IMAP session over fixed buffers against a mailbox holding two
 /// messages for alice (password "pass word"). Returns the transcript.
 fn testSession(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    return testSessionWith(allocator, true, input);
+    return testSessionWith(allocator, true, input, null);
 }
 
-/// `secure` stands in for TLS.
-fn testSessionWith(allocator: std.mem.Allocator, secure: bool, input: []const u8) ![]u8 {
+/// `secure` stands in for TLS; `log` collects the session's log lines.
+fn testSessionWith(allocator: std.mem.Allocator, secure: bool, input: []const u8, log: ?*Io.Writer) ![]u8 {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
@@ -1358,7 +1369,7 @@ fn testSessionWith(allocator: std.mem.Allocator, secure: bool, input: []const u8
     var in: Io.Reader = .fixed(input);
     var out: Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
-    var client: conn.Client = .{ .reader = &in, .writer = &out.writer, .secure = secure };
+    var client: conn.Client = .{ .reader = &in, .writer = &out.writer, .secure = secure, .log_capture = log };
     try server.handleClient(std.testing.io, &client);
     return out.toOwnedSlice();
 }
@@ -1637,7 +1648,7 @@ test "imap session: idle until done" {
 test "imap session: passwords need TLS unless allowed" {
     const allocator = std.testing.allocator;
     const transcript = try testSessionWith(allocator, false, "a1 CAPABILITY\r\na2 LOGIN alice@example.com \"pass word\"\r\n" ++
-        "a3 AUTHENTICATE PLAIN AGFsaWNlQGV4YW1wbGUuY29tAHBhc3Mgd29yZA==\r\na4 STARTTLS\r\na5 ID NIL\r\n");
+        "a3 AUTHENTICATE PLAIN AGFsaWNlQGV4YW1wbGUuY29tAHBhc3Mgd29yZA==\r\na4 STARTTLS\r\na5 ID NIL\r\n", null);
     defer allocator.free(transcript);
     try std.testing.expectEqualStrings("* OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE IDLE ID LOGINDISABLED] raven ready\r\n" ++
         "* CAPABILITY IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE IDLE ID LOGINDISABLED\r\na1 OK CAPABILITY completed\r\n" ++
@@ -1664,4 +1675,23 @@ test "imap session: AUTHENTICATE PLAIN" {
         "+ \r\na4 OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE IDLE ID] AUTHENTICATE completed\r\n" ++
         "a5 BAD command not valid in this state\r\n" ++
         "a6 BAD command not valid in this state\r\n");
+}
+
+test "LOGIN and AUTHENTICATE payloads never reach the log" {
+    const allocator = std.testing.allocator;
+    var log_lines: Io.Writer.Allocating = .init(allocator);
+    defer log_lines.deinit();
+    // base64 of "\x00alice@example.com\x00hunter2-wrong" and "...\x00pass word".
+    const wrong = "AGFsaWNlQGV4YW1wbGUuY29tAGh1bnRlcjItd3Jvbmc=";
+    const right = "AGFsaWNlQGV4YW1wbGUuY29tAHBhc3Mgd29yZA==";
+    const transcript = try testSessionWith(allocator, true, "a1 AUTHENTICATE PLAIN " ++ wrong ++ "\r\n" ++
+        "a2 LOGIN alice@example.com \"hunter2-wrong\"\r\n" ++
+        "a3 AUTHENTICATE PLAIN\r\n" ++ right ++ "\r\na4 LOGOUT\r\n", &log_lines.writer);
+    defer allocator.free(transcript);
+    try std.testing.expect(std.mem.indexOf(u8, transcript, "a3 OK") != null);
+
+    const logged = log_lines.written();
+    try std.testing.expectEqual(2, std.mem.count(u8, logged, "#0: authentication failed\n"));
+    try std.testing.expect(std.mem.indexOf(u8, logged, "#0: authenticated as alice@example.com\n") != null);
+    for ([_][]const u8{ "pass word", "hunter2", wrong, right }) |leak| try std.testing.expect(std.mem.indexOf(u8, logged, leak) == null);
 }

@@ -115,6 +115,7 @@ Common options:
 - `--imaps-port` (implicit-TLS IMAP; off by default)
 - `--submission-port` (mail submission, RFC 6409; AUTH required; off by default)
 - `--relay-host`, `--relay-port` (send outbound mail through a smarthost instead of MX lookup)
+- `--log-level` (`err`, `warn`, `info` or `debug`; default `info`)
 - `--allow-plaintext-auth` (testing only)
 
 Environment variables use the `RAVEN_` prefix:
@@ -133,6 +134,7 @@ Environment variables use the `RAVEN_` prefix:
 - `RAVEN_IMAPS_PORT`
 - `RAVEN_SUBMISSION_PORT`
 - `RAVEN_RELAY_HOST`, `RAVEN_RELAY_PORT`
+- `RAVEN_LOG_LEVEL`
 - `RAVEN_ALLOW_PLAINTEXT_AUTH`
 
 Example config file:
@@ -148,6 +150,20 @@ tls_key_file = key.pem
 max_connections = 100
 max_message_size = 26214400
 ```
+
+## Logging
+
+Raven logs one line per event to stderr, tagged with its level and protocol. Lines about a connection carry its number and the client's address, so `grep '#42 '` follows one session:
+
+```text
+info(smtp): listening on 127.0.0.1:5882
+debug(smtp): #1 127.0.0.1:63625: connected
+warning(smtp): #1 127.0.0.1:63625: authentication failed
+info(smtp): #2 127.0.0.1:63631: authenticated as alice@example.com
+info(queue): 1794050302.M963224R...: delivered to bob@remote.test
+```
+
+`--log-level` sets the least severe level shown; `debug` adds connects and disconnects. Passwords and AUTH payloads are never logged, and failed logins record only the client's address.
 
 ## Accounts
 
