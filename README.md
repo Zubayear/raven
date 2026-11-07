@@ -14,7 +14,7 @@ It currently provides SMTP, IMAP, filesystem-backed storage, tenant-aware routin
 - Maildir storage: atomic delivery, flags in file names, safe across restarts
 - Multi-tenant routing: only hosted domains and known users are accepted (no open relay), with aliases and `user+tag` plus-addressing
 - Accounts with argon2id password hashes (`raven passwd`)
-- TLS via OpenSSL: SMTP `STARTTLS` and implicit-TLS SMTPS; authentication only over TLS
+- TLS via OpenSSL: `STARTTLS` for SMTP and IMAP, implicit-TLS SMTPS/IMAPS; passwords only over TLS
 - Concurrent sessions with idle timeouts (SMTP 5 min, IMAP 30 min) and a connection cap
 - Graceful shutdown on signal
 
@@ -64,6 +64,7 @@ zig build run -- \
   --listen-port 5882 \
   --smtps-port 5465 \
   --imap-port 1143 \
+  --imaps-port 5993 \
   --hostname localhost \
   --data-dir data \
   --tls-cert cert.pem \
@@ -74,17 +75,19 @@ With a certificate configured:
 
 - the SMTP port offers `STARTTLS` (RFC 3207); `AUTH` is only offered and accepted after it
 - `--smtps-port` (usually 465) serves SMTP over implicit TLS
-- the IMAP port uses implicit TLS (IMAP `STARTTLS` is tracked in #19)
+- the IMAP port offers `STARTTLS` and advertises `LOGINDISABLED` until it is used
+- `--imaps-port` (usually 993) serves IMAP over implicit TLS
 
 `--tls-cert` accepts a full chain (e.g. Let's Encrypt `fullchain.pem`).
-For local testing without TLS, `--allow-plaintext-auth` lets `AUTH` through on a plaintext connection; never use it in production.
+For local testing without TLS, `--allow-plaintext-auth` accepts SMTP `AUTH` and IMAP `LOGIN`/`AUTHENTICATE` on plaintext connections; never use it in production.
 
 Connect with `openssl s_client`:
 
 ```bash
 openssl s_client -starttls smtp -connect 127.0.0.1:5882 -quiet -CAfile cert.pem
 openssl s_client -connect 127.0.0.1:5465 -quiet -CAfile cert.pem
-openssl s_client -connect 127.0.0.1:1143 -quiet -CAfile cert.pem
+openssl s_client -starttls imap -connect 127.0.0.1:1143 -quiet -CAfile cert.pem
+openssl s_client -connect 127.0.0.1:5993 -quiet -CAfile cert.pem
 ```
 
 ## Configuration
@@ -108,6 +111,7 @@ Common options:
 - `--max-connections` (per listener, default 100)
 - `--max-message-size` (bytes, default 26214400; advertised with SMTP `SIZE`)
 - `--smtps-port` (implicit-TLS SMTP; off by default)
+- `--imaps-port` (implicit-TLS IMAP; off by default)
 - `--allow-plaintext-auth` (testing only)
 
 Environment variables use the `RAVEN_` prefix:
@@ -123,6 +127,7 @@ Environment variables use the `RAVEN_` prefix:
 - `RAVEN_MAX_CONNECTIONS`
 - `RAVEN_MAX_MESSAGE_SIZE`
 - `RAVEN_SMTPS_PORT`
+- `RAVEN_IMAPS_PORT`
 - `RAVEN_ALLOW_PLAINTEXT_AUTH`
 
 Example config file:

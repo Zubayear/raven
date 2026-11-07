@@ -33,18 +33,19 @@ pub const ImapServer = struct {
         };
     }
 
-    pub fn listen(self: *ImapServer, io: Io) !std.Io.net.Server {
-        const ip = try std.Io.net.IpAddress.parse(self.config.listen_address, self.config.imap_port);
+    pub fn listen(self: *ImapServer, io: Io, port: u16) !std.Io.net.Server {
+        const ip = try std.Io.net.IpAddress.parse(self.config.listen_address, port);
         const listener = try ip.listen(io, .{ .reuse_address = true });
         std.debug.print("imap listening on {any}\n", .{ip});
         return listener;
     }
 
     pub fn handleClient(self: *ImapServer, fs_io: Io, client: *conn.Client) !void {
-        const w = client.writer;
-        try w.writeAll("* OK [CAPABILITY " ++ capabilities ++ "] raven ready\r\n");
-
         var session: Session = .{};
+        try client.writer.writeAll("* OK [CAPABILITY ");
+        try writeCapabilities(client.writer, self, client, &session);
+        try client.writer.writeAll("] raven ready\r\n");
+
         defer session.deinit(self.allocator);
         var arena_state = std.heap.ArenaAllocator.init(self.allocator);
         defer arena_state.deinit();
@@ -52,6 +53,7 @@ pub const ImapServer = struct {
         while (session.state != .logout) {
             _ = arena_state.reset(.retain_capacity);
             const arena = arena_state.allocator();
+            const w = client.writer; // replaced by STARTTLS
             const input = proto.readCommand(arena, client.reader, w, self.config.max_message_size) catch |err| switch (err) {
                 error.LiteralTooLarge => {
                     try w.writeAll("* BYE literal too large\r\n");
@@ -85,11 +87,25 @@ pub const ImapServer = struct {
     }
 };
 
-const capabilities = "IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE IDLE";
+/// Advertised in every state; see `writeCapabilities` for the rest.
+const capabilities = "IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE IDLE ID";
+
+/// Before login, STARTTLS is offered while possible and passwords are only
+/// accepted over TLS (LOGINDISABLED otherwise), unless the operator opted out.
+fn writeCapabilities(w: *Io.Writer, server: *const ImapServer, client: *const conn.Client, session: *const Session) !void {
+    try w.writeAll(capabilities);
+    if (session.state != .not_authenticated) return;
+    if (client.canStartTls()) try w.writeAll(" STARTTLS");
+    try w.writeAll(if (authAllowed(server, client)) " AUTH=PLAIN SASL-IR" else " LOGINDISABLED");
+}
+
+fn authAllowed(server: *const ImapServer, client: *const conn.Client) bool {
+    return client.secure or server.config.allow_plaintext_auth;
+}
 
 const State = enum { not_authenticated, authenticated, selected, logout };
 
-const Command = enum { capability, noop, logout, login, select, examine, list, lsub, create, delete, rename, subscribe, unsubscribe, status, append, fetch, store, expunge, uid, check, close, unselect, copy, move, search, idle };
+const Command = enum { capability, noop, logout, login, select, examine, list, lsub, create, delete, rename, subscribe, unsubscribe, status, append, fetch, store, expunge, uid, check, close, unselect, copy, move, search, idle, starttls, authenticate, id };
 
 /// One command being executed.
 const Context = struct {
@@ -109,9 +125,9 @@ const Context = struct {
 
         const state = ctx.session.state;
         const allowed = switch (cmd) {
-            .capability, .noop, .logout => true,
+            .capability, .noop, .logout, .id => true,
             .idle => state == .authenticated or state == .selected,
-            .login => state == .not_authenticated,
+            .login, .starttls, .authenticate => state == .not_authenticated,
             .select, .examine, .list, .lsub, .create, .delete, .rename, .subscribe, .unsubscribe, .status, .append => state == .authenticated or state == .selected,
             .fetch, .store, .expunge, .uid, .check, .close, .unselect, .copy, .move, .search => state == .selected,
         };
@@ -120,9 +136,28 @@ const Context = struct {
         switch (cmd) {
             .capability => {
                 try p.end();
-                try ctx.w.writeAll("* CAPABILITY " ++ capabilities ++ "\r\n");
+                try ctx.w.writeAll("* CAPABILITY ");
+                try writeCapabilities(ctx.w, ctx.server, ctx.client, ctx.session);
+                try ctx.w.writeAll("\r\n");
                 try ctx.ok("CAPABILITY completed");
             },
+            .id => {
+                // RFC 2971: the client's ID is accepted and ignored.
+                try p.space();
+                p.pos = p.text.len;
+                try ctx.w.writeAll("* ID (\"name\" \"raven\")\r\n");
+                try ctx.ok("ID completed");
+            },
+            .starttls => {
+                try p.end();
+                if (ctx.client.secure) return ctx.bad("TLS already active");
+                if (!ctx.client.canStartTls()) return ctx.no("TLS not available");
+                try ctx.ok("begin TLS negotiation now");
+                try ctx.w.flush();
+                // A failed handshake leaves the stream in an unknown state: hang up.
+                try ctx.client.startTls();
+            },
+            .authenticate => try ctx.authenticate(p),
             .noop => {
                 try p.end();
                 try ctx.syncMailbox();
@@ -185,17 +220,51 @@ const Context = struct {
         try p.space();
         const password = try p.astring();
         try p.end();
+        if (!authAllowed(ctx.server, ctx.client)) return ctx.no("[PRIVACYREQUIRED] LOGIN requires TLS; use STARTTLS");
 
         const s = ctx.server;
         const identity = account_index.authenticate(s.allocator, ctx.io, s.storage, s.tenant_catalog, user, password) catch |err| switch (err) {
             error.AuthFailed => return ctx.no("[AUTHENTICATIONFAILED] authentication failed"),
             else => return err,
         };
+        try ctx.loggedIn(identity, "LOGIN");
+    }
+
+    /// AUTHENTICATE PLAIN with an optional initial response (RFC 4959).
+    fn authenticate(ctx: Context, p: *proto.Parser) !void {
+        try p.space();
+        const mechanism = try p.atom();
+        const initial = if (p.take(' ')) try p.atom() else null;
+        try p.end();
+        if (!std.ascii.eqlIgnoreCase(mechanism, "PLAIN")) return ctx.no("unsupported authentication mechanism");
+        if (!authAllowed(ctx.server, ctx.client)) return ctx.no("[PRIVACYREQUIRED] authentication requires TLS; use STARTTLS");
+
+        const response = initial orelse response: {
+            try ctx.w.writeAll("+ \r\n");
+            try ctx.w.flush();
+            const line = try ctx.client.reader.takeDelimiter('\n') orelse {
+                ctx.session.state = .logout;
+                return;
+            };
+            break :response std.mem.trimEnd(u8, line, "\r");
+        };
+        if (std.mem.eql(u8, response, "*")) return ctx.bad("authentication canceled");
+
+        const s = ctx.server;
+        const identity = account_index.authenticatePlain(s.allocator, ctx.io, s.storage, s.tenant_catalog, response) catch |err| switch (err) {
+            error.AuthFailed => return ctx.no("[AUTHENTICATIONFAILED] authentication failed"),
+            else => return err,
+        };
+        try ctx.loggedIn(identity, "AUTHENTICATE");
+    }
+
+    fn loggedIn(ctx: Context, identity: Identity, command: []const u8) !void {
+        const s = ctx.server;
         ctx.session.identity = identity;
         ctx.session.maildir = try s.storage.maildirPath(s.allocator, identity.tenant, identity.domain, identity.user);
         ctx.session.state = .authenticated;
         try ensureDefaultFolders(ctx.io, s.allocator, ctx.session.maildir.?);
-        try ctx.ok("[CAPABILITY " ++ capabilities ++ "] LOGIN completed");
+        try ctx.w.print("{s} OK [CAPABILITY " ++ capabilities ++ "] {s} completed\r\n", .{ ctx.tag, command });
     }
 
     fn select(ctx: Context, p: *proto.Parser, read_only: bool) !void {
@@ -1257,6 +1326,11 @@ test "list patterns" {
 /// Runs one IMAP session over fixed buffers against a mailbox holding two
 /// messages for alice (password "pass word"). Returns the transcript.
 fn testSession(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
+    return testSessionWith(allocator, true, input);
+}
+
+/// `secure` stands in for TLS.
+fn testSessionWith(allocator: std.mem.Allocator, secure: bool, input: []const u8) ![]u8 {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
@@ -1284,7 +1358,7 @@ fn testSession(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     var in: Io.Reader = .fixed(input);
     var out: Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
-    var client: conn.Client = .{ .reader = &in, .writer = &out.writer };
+    var client: conn.Client = .{ .reader = &in, .writer = &out.writer, .secure = secure };
     try server.handleClient(std.testing.io, &client);
     return out.toOwnedSlice();
 }
@@ -1302,10 +1376,10 @@ test "imap session: states, quoting and literals" {
         "a8 SELECT Nope\r\n" ++
         "a9 LOGOUT\r\n");
     defer allocator.free(transcript);
-    try std.testing.expectEqualStrings("* OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE IDLE] raven ready\r\n" ++
+    try std.testing.expectEqualStrings("* OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE IDLE ID AUTH=PLAIN SASL-IR] raven ready\r\n" ++
         "a0 BAD log in first\r\n" ++
         "a1 NO [AUTHENTICATIONFAILED] authentication failed\r\n" ++
-        "a2 OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE IDLE] LOGIN completed\r\n" ++
+        "a2 OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE IDLE ID] LOGIN completed\r\n" ++
         "a3 BAD command not valid in this state\r\n" ++
         "a4 BAD unknown command\r\n" ++
         "a5 BAD syntax error\r\n" ++
@@ -1332,8 +1406,8 @@ test "imap session: select, fetch, store and expunge" {
         "b2 UID BOGUS 1\r\n");
     defer allocator.free(transcript);
     const select = "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n";
-    try std.testing.expectEqualStrings("* OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE IDLE] raven ready\r\n" ++
-        "a1 OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE IDLE] LOGIN completed\r\n" ++
+    try std.testing.expectEqualStrings("* OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE IDLE ID AUTH=PLAIN SASL-IR] raven ready\r\n" ++
+        "a1 OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE IDLE ID] LOGIN completed\r\n" ++
         select ++ "* OK [PERMANENTFLAGS ()] read-only\r\n* 2 EXISTS\r\n* 2 RECENT\r\n* OK [UIDVALIDITY 1234567890] UIDs valid\r\n* OK [UIDNEXT 3] predicted next UID\r\na2 OK [READ-ONLY] EXAMINE completed\r\n" ++
         "a3 NO [READ-ONLY] mailbox is read-only\r\n" ++
         select ++ "* OK [PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)] limited\r\n* 2 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 1234567890] UIDs valid\r\n* OK [UIDNEXT 3] predicted next UID\r\na4 OK [READ-WRITE] SELECT completed\r\n" ++
@@ -1451,7 +1525,7 @@ test "imap session: folders, append, copy, move, status" {
     const end = std.mem.indexOf(u8, transcript, "a1 OK").?;
     const rest = transcript[end..];
     const after_select = std.mem.indexOf(u8, rest, "a7 OK").?;
-    try std.testing.expectEqualStrings("a1 OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE IDLE] LOGIN completed\r\n" ++
+    try std.testing.expectEqualStrings("a1 OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE IDLE ID] LOGIN completed\r\n" ++
         "a2 OK CREATE completed\r\n" ++
         "a3 NO [ALREADYEXISTS] mailbox exists\r\n" ++
         "a4 NO [CANNOT] invalid mailbox name\r\n" ++
@@ -1558,4 +1632,36 @@ test "imap session: idle until done" {
     defer allocator.free(transcript);
     try std.testing.expectStringEndsWith(transcript, "a2 OK [READ-WRITE] SELECT completed\r\n" ++
         "+ idling\r\na3 OK IDLE terminated\r\n+ idling\r\na4 BAD expected DONE\r\na5 OK NOOP completed\r\n");
+}
+
+test "imap session: passwords need TLS unless allowed" {
+    const allocator = std.testing.allocator;
+    const transcript = try testSessionWith(allocator, false, "a1 CAPABILITY\r\na2 LOGIN alice@example.com \"pass word\"\r\n" ++
+        "a3 AUTHENTICATE PLAIN AGFsaWNlQGV4YW1wbGUuY29tAHBhc3Mgd29yZA==\r\na4 STARTTLS\r\na5 ID NIL\r\n");
+    defer allocator.free(transcript);
+    try std.testing.expectEqualStrings("* OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE IDLE ID LOGINDISABLED] raven ready\r\n" ++
+        "* CAPABILITY IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE IDLE ID LOGINDISABLED\r\na1 OK CAPABILITY completed\r\n" ++
+        "a2 NO [PRIVACYREQUIRED] LOGIN requires TLS; use STARTTLS\r\n" ++
+        "a3 NO [PRIVACYREQUIRED] authentication requires TLS; use STARTTLS\r\n" ++
+        "a4 NO TLS not available\r\n" ++
+        "* ID (\"name\" \"raven\")\r\na5 OK ID completed\r\n", transcript);
+}
+
+test "imap session: AUTHENTICATE PLAIN" {
+    const allocator = std.testing.allocator;
+    // base64("\0alice@example.com\0pass word") and a wrong password.
+    const transcript = try testSession(allocator, "a1 AUTHENTICATE PLAIN\r\n*\r\n" ++
+        "a2 AUTHENTICATE PLAIN AGFsaWNlQGV4YW1wbGUuY29tAHdyb25n\r\n" ++
+        "a3 AUTHENTICATE CRAM-MD5\r\n" ++
+        "a4 AUTHENTICATE PLAIN\r\nAGFsaWNlQGV4YW1wbGUuY29tAHBhc3Mgd29yZA==\r\n" ++
+        "a5 AUTHENTICATE PLAIN AGFsaWNlQGV4YW1wbGUuY29tAHBhc3Mgd29yZA==\r\n" ++
+        "a6 STARTTLS\r\n");
+    defer allocator.free(transcript);
+    try std.testing.expectStringEndsWith(transcript, "raven ready\r\n" ++
+        "+ \r\na1 BAD authentication canceled\r\n" ++
+        "a2 NO [AUTHENTICATIONFAILED] authentication failed\r\n" ++
+        "a3 NO unsupported authentication mechanism\r\n" ++
+        "+ \r\na4 OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE IDLE ID] AUTHENTICATE completed\r\n" ++
+        "a5 BAD command not valid in this state\r\n" ++
+        "a6 BAD command not valid in this state\r\n");
 }

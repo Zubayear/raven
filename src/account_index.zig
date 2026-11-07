@@ -53,6 +53,39 @@ pub fn authenticate(allocator: std.mem.Allocator, io: Io, storage: Storage, cata
     return Identity.init(allocator, hosted.tenant, hosted.domain, account.user);
 }
 
+/// RFC 4616 PLAIN: base64("authzid\0authcid\0password").
+pub fn authenticatePlain(allocator: std.mem.Allocator, io: Io, storage: Storage, catalog: *const TenantCatalog, encoded: []const u8) !Identity {
+    const decoded = try decodeBase64Payload(allocator, std.mem.trim(u8, encoded, " \t"));
+    defer allocator.free(decoded);
+
+    var fields = std.mem.splitScalar(u8, decoded, 0);
+    const authzid = fields.next() orelse return error.AuthFailed;
+    const login = fields.next() orelse return error.AuthFailed;
+    const password = fields.next() orelse return error.AuthFailed;
+    if (fields.next() != null or password.len == 0) return error.AuthFailed;
+    // Acting as another user is not supported.
+    if (authzid.len != 0 and !std.ascii.eqlIgnoreCase(authzid, login)) return error.AuthFailed;
+
+    return authenticate(allocator, io, storage, catalog, login, password);
+}
+
+fn decodeBase64Payload(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 {
+    const clean = std.mem.trim(u8, encoded, " \t");
+    const codecs = [_]std.base64.Codecs{ std.base64.standard, std.base64.standard_no_pad };
+
+    for (codecs) |codec| {
+        const decoder = &codec.Decoder;
+        const size = decoder.calcSizeForSlice(clean) catch continue;
+        const buf = try allocator.alloc(u8, size);
+        decoder.decode(buf, clean) catch {
+            allocator.free(buf);
+            continue;
+        };
+        return buf;
+    }
+    return error.AuthFailed;
+}
+
 /// Returns an argon2id PHC string for `password`; the caller owns it.
 pub fn hashPassword(allocator: std.mem.Allocator, io: Io, password: []const u8) ![]u8 {
     var buf: [128]u8 = undefined;

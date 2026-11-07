@@ -14,11 +14,13 @@ import time
 from pathlib import Path
 
 BIN = os.environ.get("RAVEN_BIN", "zig-out/bin/raven")
-HOST, SMTP_PORT, IMAP_PORT, SMTPS_PORT = "127.0.0.1", 2525, 2143, 2465
+HOST, SMTP_PORT, IMAP_PORT, SMTPS_PORT, IMAPS_PORT = "127.0.0.1", 2525, 2143, 2465, 2993
 
 
 class Raven:
     def __init__(self, data_dir, *extra):
+        if "--tls-cert" not in extra:
+            extra += ("--allow-plaintext-auth",)  # no TLS in these runs, so IMAP LOGIN needs the opt-out
         self.args = [BIN, "--listen-address", HOST, "--listen-port", str(SMTP_PORT),
                      "--imap-port", str(IMAP_PORT), "--hostname", "localhost",
                      "--data-dir", str(data_dir), *extra]
@@ -162,7 +164,20 @@ def main():
 
         data = tmp / "tls"
         setup_accounts(data)
-        with Raven(data, "--tls-cert", str(cert), "--tls-key", str(key), "--smtps-port", str(SMTPS_PORT)):
+        with Raven(data, "--tls-cert", str(cert), "--tls-key", str(key), "--smtps-port", str(SMTPS_PORT),
+                   "--imaps-port", str(IMAPS_PORT)):
+            # IMAP refuses passwords before STARTTLS, then accepts them (#19).
+            imap = imaplib.IMAP4(HOST, IMAP_PORT, timeout=5)
+            assert "LOGINDISABLED" in imap.capabilities and "STARTTLS" in imap.capabilities, imap.capabilities
+            try:
+                imap.login("alice@example.com", PASSWORD)
+                sys.exit("LOGIN before STARTTLS must fail")
+            except imaplib.IMAP4.error as err:
+                assert "PRIVACYREQUIRED" in str(err), err
+            imap.starttls(ssl_context=ctx)
+            imap.login("alice@example.com", PASSWORD)
+            imap.logout()
+
             # Passwords never travel in the clear: no AUTH before STARTTLS (#9).
             smtp = smtplib.SMTP(HOST, SMTP_PORT, timeout=5)
             smtp.ehlo()
@@ -171,15 +186,15 @@ def main():
             assert smtp.docmd("AUTH", "PLAIN " + credentials)[0] == 538
             smtp.starttls(context=ctx)
             smtp.login("alice@example.com", PASSWORD)
-            check_delivery(smtp, imaplib.IMAP4_SSL(HOST, IMAP_PORT, ssl_context=ctx, timeout=5), sender="alice@example.com")
+            check_delivery(smtp, imaplib.IMAP4_SSL(HOST, IMAPS_PORT, ssl_context=ctx, timeout=5), sender="alice@example.com")
 
             smtps = smtplib.SMTP_SSL(HOST, SMTPS_PORT, timeout=5, context=ctx)
             smtps.login("alice@example.com", PASSWORD)
-            check_delivery(smtps, imaplib.IMAP4_SSL(HOST, IMAP_PORT, ssl_context=ctx, timeout=5), expected=2,
+            check_delivery(smtps, imaplib.IMAP4_SSL(HOST, IMAPS_PORT, ssl_context=ctx, timeout=5), expected=2,
                            sender="alice@example.com")
 
             # IDLE over TLS: poll timeouts must not break the TLS session (#18).
-            imap = imaplib.IMAP4_SSL(HOST, IMAP_PORT, ssl_context=ctx, timeout=10)
+            imap = imaplib.IMAP4_SSL(HOST, IMAPS_PORT, ssl_context=ctx, timeout=10)
             imap.login("alice@example.com", PASSWORD)
             imap.select("INBOX")
             tag = imap._new_tag()
@@ -197,8 +212,12 @@ def main():
                                        "-CAfile", cert, "-quiet"], input=b"EHLO client\r\nQUIT\r\n",
                                       capture_output=True, timeout=10)
             assert b"250-AUTH PLAIN" in s_client.stdout, s_client.stdout + s_client.stderr
+            s_client = subprocess.run(["openssl", "s_client", "-starttls", "imap", "-connect", f"{HOST}:{IMAP_PORT}",
+                                       "-CAfile", cert, "-quiet"], input=b"a CAPABILITY\r\nb LOGOUT\r\n",
+                                      capture_output=True, timeout=10)
+            assert b"AUTH=PLAIN" in s_client.stdout and b"LOGINDISABLED" not in s_client.stdout, s_client.stdout + s_client.stderr
             # Left open across shutdown: SIGTERM must still stop raven promptly.
-            idle_tls = ctx.wrap_socket(socket.create_connection((HOST, IMAP_PORT), timeout=5))
+            idle_tls = ctx.wrap_socket(socket.create_connection((HOST, IMAPS_PORT), timeout=5))
             assert idle_tls.recv(64).startswith(b"* OK")
         idle_tls.close()
 

@@ -84,6 +84,8 @@ pub const Connection = struct {
 
 fn stream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
     const conn: *Connection = @alignCast(@fieldParentPtr("reader", r));
+    // Send pending output before waiting for input, as plain sockets do.
+    conn.writer.flush() catch return error.ReadFailed;
     const dest = limit.slice(try w.writableSliceGreedy(1));
     const n = c.SSL_read(conn.ssl, dest.ptr, @intCast(@min(dest.len, std.math.maxInt(c_int))));
     if (n <= 0) return switch (c.SSL_get_error(conn.ssl, n)) {
@@ -132,8 +134,11 @@ fn bioWrite(bio: ?*c.BIO, buf: [*c]const u8, len: usize, written: [*c]usize) cal
     return 1;
 }
 
-fn bioCtrl(_: ?*c.BIO, cmd: c_int, _: c_long, _: ?*anyopaque) callconv(.c) c_long {
-    return @intFromBool(cmd == c.BIO_CTRL_FLUSH);
+fn bioCtrl(bio: ?*c.BIO, cmd: c_int, _: c_long, _: ?*anyopaque) callconv(.c) c_long {
+    if (cmd != c.BIO_CTRL_FLUSH) return 0;
+    const socket: *Socket = @ptrCast(@alignCast(c.BIO_get_data(bio)));
+    socket.writer.interface.flush() catch return 0;
+    return 1;
 }
 
 fn sslError(what: []const u8) error{TlsInitFailed} {

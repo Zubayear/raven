@@ -55,8 +55,9 @@ pub const Client = struct {
     /// not run as if they had arrived encrypted (CVE-2011-0411).
     pub fn startTls(self: *Client) !void {
         const t = self.transport.?;
+        try self.writer.flush(); // the "go ahead" reply must reach the client first
         self.reader.tossBuffered();
-        t.tls = try t.tls_server.?.accept(&t.socket, &t.tls_buf, &.{});
+        t.tls = try t.tls_server.?.accept(&t.socket, &t.tls_read_buf, &t.tls_write_buf);
         self.reader = &t.tls.?.reader;
         self.writer = &t.tls.?.writer;
         self.secure = true;
@@ -67,7 +68,8 @@ pub const Transport = struct {
     socket: Socket,
     tls_server: ?*TlsServer,
     tls: ?tls.Connection = null,
-    tls_buf: [1024]u8 = undefined,
+    tls_read_buf: [4096]u8 = undefined,
+    tls_write_buf: [4096]u8 = undefined,
 };
 
 /// A protocol server: `Handler.handleClient(*Handler, Io, *Client)`.
@@ -110,11 +112,18 @@ pub fn Listener(comptime Handler: type) type {
             }
             // IMAP clients send long command lines (RFC 7162 §4 suggests 8192).
             var read_buf: [8192]u8 = undefined;
+            var write_buf: [4096]u8 = undefined;
             var transport: Transport = .{
-                .socket = .init(io, stream, options.idle_timeout, &read_buf),
+                .socket = .init(io, stream, options.idle_timeout, &read_buf, &write_buf),
                 .tls_server = options.tls,
             };
-            defer if (transport.tls) |*conn| conn.deinit();
+            defer {
+                if (transport.tls) |*conn| {
+                    conn.writer.flush() catch {};
+                    conn.deinit();
+                }
+                transport.socket.writer.interface.flush() catch {};
+            }
             var client: Client = .{
                 .reader = &transport.socket.reader,
                 .writer = &transport.socket.writer.interface,
@@ -145,19 +154,22 @@ pub const Socket = struct {
     err: ?anyerror = null,
 
     /// The returned value must not move once `reader` or `writer` is used.
-    pub fn init(io: Io, stream: net.Stream, idle_timeout: Io.Duration, read_buffer: []u8) Socket {
+    pub fn init(io: Io, stream: net.Stream, idle_timeout: Io.Duration, read_buffer: []u8, write_buffer: []u8) Socket {
         return .{
             .io = io,
             .stream = stream,
             .idle_timeout = idle_timeout,
             .reader = .{ .vtable = &.{ .stream = streamRead }, .buffer = read_buffer, .seek = 0, .end = 0 },
-            .writer = stream.writer(io, &.{}),
+            .writer = stream.writer(io, write_buffer),
         };
     }
 
     /// Reads at least one byte, or returns 0 at end of stream. Fails with
-    /// `error.Timeout` if nothing arrives within `idle_timeout`.
+    /// `error.Timeout` if nothing arrives within `idle_timeout`. Pending
+    /// output is sent first, so a reply always reaches the peer before we
+    /// wait for its next command, and goes out as one write.
     pub fn read(self: *Socket, buf: []u8) !usize {
+        try self.writer.interface.flush();
         var data: [1][]u8 = .{buf};
         var storage: [1]Io.Operation.Storage = undefined;
         var batch: Io.Batch = .init(&storage);
@@ -191,7 +203,7 @@ test "socket read times out when the peer is silent" {
     defer accepted.close(io);
 
     var buf: [16]u8 = undefined;
-    var socket: Socket = .init(io, accepted, .fromMilliseconds(50), &buf);
+    var socket: Socket = .init(io, accepted, .fromMilliseconds(50), &buf, &.{});
     try std.testing.expectError(error.Timeout, socket.read(&buf));
 
     var peer = client.writer(io, &.{});
