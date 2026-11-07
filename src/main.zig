@@ -3,6 +3,7 @@ const Io = std.Io;
 const account_index = @import("account_index.zig");
 const Config = @import("config.zig").Config;
 const conn = @import("conn.zig");
+const dns = @import("dns.zig");
 const ImapServer = @import("imap.zig").ImapServer;
 const Server = @import("server.zig").Server;
 const Storage = @import("storage.zig").Storage;
@@ -18,6 +19,7 @@ pub fn main(process: std.process.Init) !void {
     _ = args.next();
     if (args.next()) |command| {
         if (std.mem.eql(u8, command, "passwd")) return passwd(io, allocator);
+        if (std.mem.eql(u8, command, "mx")) return mx(io, allocator, args.next() orelse return error.MissingDomain);
     }
 
     const config = try Config.load(process);
@@ -96,6 +98,18 @@ pub fn main(process: std.process.Init) !void {
     if (imaps_task) |*task| task.cancel(io);
 }
 
+/// `raven mx <domain>`: prints the mail exchangers Raven would use.
+fn mx(io: Io, allocator: std.mem.Allocator, domain: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    var out_buf: [1024]u8 = undefined;
+    var stdout = Io.File.stdout().writerStreaming(io, &out_buf);
+    for (try dns.lookupMx(arena_state.allocator(), io, domain)) |record| {
+        try stdout.interface.print("{d} {s}\n", .{ record.preference, record.host });
+    }
+    try stdout.interface.flush();
+}
+
 /// `raven passwd`: reads a password from stdin and prints its argon2id hash,
 /// ready for accounts.txt: `echo "alice $(raven passwd)" >> accounts.txt`.
 fn passwd(io: Io, allocator: std.mem.Allocator) !void {
@@ -136,6 +150,7 @@ test {
     _ = @import("alias_index.zig");
     _ = @import("config.zig");
     _ = @import("conn.zig");
+    _ = @import("dns.zig");
     _ = @import("imap.zig");
     _ = @import("imap_proto.zig");
     _ = @import("mime.zig");
