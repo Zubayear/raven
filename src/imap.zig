@@ -12,12 +12,15 @@ const MessageFlags = @import("storage.zig").MessageFlags;
 const TenantCatalog = @import("tenant_index.zig").TenantCatalog;
 const proto = @import("imap_proto.zig");
 const mime = @import("mime.zig");
+const AuthThrottle = @import("limits.zig").AuthThrottle;
 
 pub const ImapServer = struct {
     allocator: std.mem.Allocator,
     config: Config,
     storage: Storage,
     tenant_catalog: *const TenantCatalog,
+    /// Shared with the other listeners; null in tests.
+    throttle: ?*AuthThrottle = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -223,6 +226,7 @@ const Context = struct {
         const password = try p.astring();
         try p.end();
         if (!authAllowed(ctx.server, ctx.client)) return ctx.no("[PRIVACYREQUIRED] LOGIN requires TLS; use STARTTLS");
+        if (ctx.lockedOut()) return ctx.no("[UNAVAILABLE] too many failed logins, try again later");
 
         const s = ctx.server;
         // Neither `user` nor `password` is logged on failure: people type
@@ -242,6 +246,7 @@ const Context = struct {
         try p.end();
         if (!std.ascii.eqlIgnoreCase(mechanism, "PLAIN")) return ctx.no("unsupported authentication mechanism");
         if (!authAllowed(ctx.server, ctx.client)) return ctx.no("[PRIVACYREQUIRED] authentication requires TLS; use STARTTLS");
+        if (ctx.lockedOut()) return ctx.no("[UNAVAILABLE] too many failed logins, try again later");
 
         const response = initial orelse response: {
             try ctx.w.writeAll("+ \r\n");
@@ -263,8 +268,17 @@ const Context = struct {
         try ctx.loggedIn(identity, "AUTHENTICATE");
     }
 
+    /// Whether logins from this client are refused, before any password is checked.
+    fn lockedOut(ctx: Context) bool {
+        const throttle = ctx.server.throttle orelse return false;
+        if (!throttle.locked(ctx.io, ctx.client.remote)) return false;
+        ctx.client.log(.warn, ImapServer.log_scope, "login refused: too many failures", .{});
+        return true;
+    }
+
     fn authFailed(ctx: Context) !void {
         ctx.client.log(.warn, ImapServer.log_scope, "authentication failed", .{});
+        if (ctx.server.throttle) |throttle| try throttle.failed(ctx.io, ctx.client.remote);
         return ctx.no("[AUTHENTICATIONFAILED] authentication failed");
     }
 

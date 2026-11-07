@@ -256,6 +256,7 @@ test "delivers to a second Raven over SMTP, per-recipient results" {
     defer listener.deinit(io);
     var serving = try io.concurrent(conn.Listener(Server).serve, .{ io, &listener, &server, .{
         .max_connections = 4,
+        .max_connections_per_ip = 4,
         .idle_timeout = .fromSeconds(10),
         .busy_reply = "421 busy\r\n",
         .tls = null,

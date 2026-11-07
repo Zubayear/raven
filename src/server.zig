@@ -12,6 +12,7 @@ const TenantCatalog = @import("tenant_index.zig").TenantCatalog;
 const TenantIndex = @import("tenant_index.zig");
 const conn = @import("conn.zig");
 const dkim = @import("dkim.zig");
+const AuthThrottle = @import("limits.zig").AuthThrottle;
 
 const log = std.log.scoped(Server.log_scope);
 
@@ -22,6 +23,8 @@ pub const Server = struct {
     tenant_catalog: *const TenantCatalog,
     /// The submission port (587): every transaction needs AUTH.
     submission: bool = false,
+    /// Shared with the other listeners; null in tests.
+    throttle: ?*AuthThrottle = null,
 
     pub fn init(allocator: std.mem.Allocator, config: Config, tenant_catalog: *const TenantCatalog) Server {
         return .{
@@ -158,6 +161,13 @@ pub const Server = struct {
                     try w.writeAll("503 5.5.1 AUTH not allowed during a transaction\r\n");
                     continue;
                 }
+                // Locked out: refused before any password is checked.
+                const throttle = self.throttle;
+                if (throttle != null and throttle.?.locked(fs_io, client.remote)) {
+                    client.log(.warn, log_scope, "login refused: too many failures", .{});
+                    try w.writeAll("454 4.7.0 too many failed logins, try again later\r\n");
+                    continue;
+                }
                 var parts = std.mem.tokenizeScalar(u8, args, ' ');
                 const mechanism = parts.next() orelse "";
                 if (!std.ascii.eqlIgnoreCase(mechanism, "PLAIN")) {
@@ -179,6 +189,7 @@ pub const Server = struct {
                 auth_identity = account_index.authenticatePlain(allocator, fs_io, self.storage, catalog, response) catch |err| switch (err) {
                     error.AuthFailed => {
                         client.log(.warn, log_scope, "authentication failed", .{});
+                        if (throttle) |t| try t.failed(fs_io, client.remote);
                         try w.writeAll("535 5.7.8 authentication failed\r\n");
                         continue;
                     },
@@ -917,4 +928,41 @@ test "AUTH payloads never reach the log" {
     try std.testing.expect(std.mem.indexOf(u8, logged, "#0: authentication failed\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, logged, "#0: authenticated as alice@example.com\n") != null);
     for ([_][]const u8{ "secret", "hunter2", wrong, right }) |leak| try std.testing.expect(std.mem.indexOf(u8, logged, leak) == null);
+}
+
+test "repeated AUTH failures lock the client out, even with the right password" {
+    const allocator = std.testing.allocator;
+    var dir = try TestDir.init(allocator);
+    defer dir.deinit(allocator);
+    var throttle: AuthThrottle = .init(allocator);
+    defer throttle.deinit();
+    throttle.failure_delay = .fromSeconds(0);
+    var server = Server.init(allocator, .{ .data_dir = dir.root }, &dir.catalog);
+    server.throttle = &throttle;
+
+    const wrong = try buildPlainAuthPayload(allocator, "", "alice@example.com", "wrong");
+    defer allocator.free(wrong);
+    const right = try buildPlainAuthPayload(allocator, "", "alice@example.com", "secret");
+    defer allocator.free(right);
+    var input: Io.Writer.Allocating = .init(allocator);
+    defer input.deinit();
+    try input.writer.writeAll("EHLO client\r\n");
+    for (0..AuthThrottle.max_failures) |_| try input.writer.print("AUTH PLAIN {s}\r\n", .{wrong});
+    try input.writer.print("AUTH PLAIN {s}\r\nQUIT\r\n", .{right});
+
+    var in: Io.Reader = .fixed(input.written());
+    var out: Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var log_lines: Io.Writer.Allocating = .init(allocator);
+    defer log_lines.deinit();
+    var client: conn.Client = .{
+        .reader = &in,
+        .writer = &out.writer,
+        .secure = true,
+        .remote = try Io.net.IpAddress.parse("192.0.2.1", 4000),
+        .log_capture = &log_lines.writer,
+    };
+    try server.handleClient(std.testing.io, &client);
+    try std.testing.expectEqual(AuthThrottle.max_failures, std.mem.count(u8, out.written(), "535 5.7.8 authentication failed\r\n"));
+    try std.testing.expectStringEndsWith(out.written(), "454 4.7.0 too many failed logins, try again later\r\n221 2.0.0 bye\r\n");
 }

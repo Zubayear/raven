@@ -16,7 +16,8 @@ It currently provides SMTP, IMAP, filesystem-backed storage, tenant-aware routin
 - Accounts with argon2id password hashes (`raven passwd`)
 - TLS via OpenSSL: `STARTTLS` for SMTP and IMAP, implicit-TLS SMTPS/IMAPS; passwords only over TLS
 - Outbound delivery for authenticated users: durable queue, MX lookup, opportunistic STARTTLS, DKIM signing, retries with backoff for 5 days, DSN bounces
-- Concurrent sessions with idle timeouts (SMTP 5 min, IMAP 30 min) and a connection cap
+- Concurrent sessions with idle timeouts (SMTP 5 min, IMAP 30 min), connection caps overall and per client address
+- Password-guessing protection: failed logins are answered slowly, and repeated failures lock the address out of SMTP and IMAP
 - Graceful shutdown on signal
 
 ## Requirements
@@ -110,6 +111,7 @@ Common options:
 - `--tls-cert`
 - `--tls-key`
 - `--max-connections` (per listener, default 100)
+- `--max-connections-per-ip` (per listener and client address, default 20)
 - `--max-message-size` (bytes, default 26214400; advertised with SMTP `SIZE`)
 - `--smtps-port` (implicit-TLS SMTP; off by default)
 - `--imaps-port` (implicit-TLS IMAP; off by default)
@@ -129,6 +131,7 @@ Environment variables use the `RAVEN_` prefix:
 - `RAVEN_TLS_CERT`
 - `RAVEN_TLS_KEY`
 - `RAVEN_MAX_CONNECTIONS`
+- `RAVEN_MAX_CONNECTIONS_PER_IP`
 - `RAVEN_MAX_MESSAGE_SIZE`
 - `RAVEN_SMTPS_PORT`
 - `RAVEN_IMAPS_PORT`
@@ -182,6 +185,8 @@ echo "sales alice" >> data/tenants/acme/domains/example.com/aliases.txt   # opti
 ```
 
 Accounts and aliases are read on every login and delivery, so no restart is needed. Only argon2id hashes are accepted.
+
+Failed logins are answered after a one-second delay. Ten failures from one client address within 15 minutes lock that address out of SMTP `AUTH` and IMAP logins for 15 minutes, even with the right password (`454 4.7.0` / `NO [UNAVAILABLE]`). IPv6 clients count per /64 here and in `--max-connections-per-ip`. The lockout is kept in memory, so a restart clears it.
 
 ## DKIM
 

@@ -5,15 +5,17 @@ const Io = std.Io;
 const net = Io.net;
 const tls = @import("tls.zig");
 const TlsServer = tls.TlsServer;
+const limits = @import("limits.zig");
 
 /// Numbers connections across all listeners, for log lines.
 var next_id = std.atomic.Value(u64).init(1);
 
 pub const Options = struct {
     max_connections: u32,
+    max_connections_per_ip: u32,
     /// A session is closed when the peer sends nothing for this long.
     idle_timeout: Io.Duration,
-    /// Sent to clients turned away because `max_connections` is reached.
+    /// Sent to clients turned away by either connection limit.
     busy_reply: []const u8,
     /// Enables TLS: STARTTLS, or the whole connection when `implicit_tls`.
     tls: ?*TlsServer,
@@ -102,14 +104,18 @@ pub const Transport = struct {
     tls_write_buf: [4096]u8 = undefined,
 };
 
-/// A protocol server: `Handler.handleClient(*Handler, Io, *Client)`, with
-/// `Handler.log_scope` naming it in logs.
+/// A protocol server: `Handler.handleClient(*Handler, Io, *Client)`.
+/// `Handler.log_scope` names it in logs; `Handler.allocator` holds the
+/// per-address connection counts.
 pub fn Listener(comptime Handler: type) type {
     const log = std.log.scoped(Handler.log_scope);
     return struct {
         /// Accepts connections until canceled and serves each one
         /// concurrently. Canceling this task cancels every open session.
         pub fn serve(io: Io, listener: *net.Server, handler: *Handler, options: Options) void {
+            // Declared first so it outlives the sessions that release into it.
+            var per_ip: limits.ConnectionCounts = .{};
+            defer per_ip.deinit(handler.allocator);
             var sessions: Io.Group = .init;
             defer sessions.cancel(io);
             var active = std.atomic.Value(u32).init(0);
@@ -123,26 +129,30 @@ pub fn Listener(comptime Handler: type) type {
                     },
                 };
                 const id = next_id.fetchAdd(1, .monotonic);
-                if (active.fetchAdd(1, .monotonic) >= options.max_connections) {
+                const remote = stream.socket.address;
+                const full = active.fetchAdd(1, .monotonic) >= options.max_connections;
+                if (full or !per_ip.acquire(io, handler.allocator, remote, options.max_connections_per_ip)) {
                     _ = active.fetchSub(1, .monotonic);
-                    log.warn("{f}: turned away, {d} connections open", .{ Peer{ .id = id, .remote = stream.socket.address }, options.max_connections });
+                    log.warn("{f}: turned away, too many connections{s}", .{ Peer{ .id = id, .remote = remote }, if (full) "" else " from this address" });
                     var writer = stream.writer(io, &.{});
                     writer.interface.writeAll(options.busy_reply) catch {};
                     stream.close(io);
                     continue;
                 }
-                sessions.concurrent(io, session, .{ io, stream, handler, options, &active, id }) catch |err| {
+                sessions.concurrent(io, session, .{ io, stream, handler, options, &active, &per_ip, id }) catch |err| {
                     _ = active.fetchSub(1, .monotonic);
+                    per_ip.release(io, remote);
                     stream.close(io);
                     log.err("cannot start session: {t}", .{err});
                 };
             }
         }
 
-        fn session(io: Io, stream: net.Stream, handler: *Handler, options: Options, active: *std.atomic.Value(u32), id: u64) void {
+        fn session(io: Io, stream: net.Stream, handler: *Handler, options: Options, active: *std.atomic.Value(u32), per_ip: *limits.ConnectionCounts, id: u64) void {
             defer {
                 stream.close(io);
                 _ = active.fetchSub(1, .monotonic);
+                per_ip.release(io, stream.socket.address);
             }
             // IMAP clients send long command lines (RFC 7162 §4 suggests 8192).
             var read_buf: [8192]u8 = undefined;
