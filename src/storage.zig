@@ -62,37 +62,62 @@ pub const Storage = struct {
         return name;
     }
 
-    /// Lists INBOX oldest first, moving anything in `new/` to `cur/`.
-    pub fn listMailbox(self: Storage, io: Io, allocator: std.mem.Allocator, tenant: []const u8, domain: []const u8, user: []const u8) ![]Message {
+    /// Opens INBOX for IMAP: moves `new/` mail to `cur/`, assigns UIDs to
+    /// messages seen for the first time, and returns everything in UID order.
+    pub fn openMailbox(self: Storage, io: Io, allocator: std.mem.Allocator, tenant: []const u8, domain: []const u8, user: []const u8) !Mailbox {
         const maildir_path = try self.maildirPath(allocator, tenant, domain, user);
         defer allocator.free(maildir_path);
-        var maildir = Io.Dir.cwd().openDir(io, maildir_path, .{}) catch |err| switch (err) {
-            error.FileNotFound => return &.{},
-            else => return err,
-        };
+        var maildir = try Io.Dir.cwd().createDirPathOpen(io, maildir_path, .{});
         defer maildir.close(io);
+        for ([_][]const u8{ "tmp", "new", "cur" }) |sub| try maildir.createDirPath(io, sub);
         try claimNew(io, allocator, maildir);
 
-        var cur = maildir.openDir(io, "cur", .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => return &.{},
-            else => return err,
-        };
-        defer cur.close(io);
+        // Concurrent sessions must not hand out the same UID twice.
+        const lock = try maildir.createFile(io, "raven-uidlist.lock", .{ .truncate = false });
+        defer lock.close(io);
+        try lock.lock(io, .exclusive);
+        defer lock.unlock(io);
+
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var uids = try UidList.load(io, arena, maildir);
 
         var messages = std.ArrayList(Message).empty;
         defer messages.deinit(allocator);
         errdefer for (messages.items) |message| allocator.free(message.path);
 
+        var cur = try maildir.openDir(io, "cur", .{ .iterate = true });
+        defer cur.close(io);
         var it = cur.iterate();
         while (try it.next(io)) |entry| {
             if (entry.kind != .file) continue;
             const stat = try cur.statFile(io, entry.name, .{});
             const path = try std.fs.path.join(allocator, &.{ maildir_path, "cur", entry.name });
             errdefer allocator.free(path);
-            try messages.append(allocator, .{ .path = path, .size = stat.size, .flags = .fromFileName(entry.name) });
+            try messages.append(allocator, .{ .path = path, .size = stat.size, .flags = .fromFileName(entry.name), .uid = 0 });
         }
+
+        // New mail gets UIDs in delivery order; names sort that way.
         std.sort.pdq(Message, messages.items, {}, olderFirst);
-        return messages.toOwnedSlice(allocator);
+        var changed = false;
+        var known: usize = 0;
+        for (messages.items) |*message| {
+            if (uids.map.get(baseName(message.path))) |uid| {
+                message.uid = uid;
+                known += 1;
+            } else {
+                message.uid = uids.next;
+                uids.next += 1;
+                changed = true;
+            }
+        }
+        // Entries for expunged messages are dropped; their UIDs are never reused.
+        if (known != uids.map.count()) changed = true;
+        std.sort.pdq(Message, messages.items, {}, lowerUid);
+        if (changed) try uids.save(io, maildir, messages.items);
+
+        return .{ .messages = try messages.toOwnedSlice(allocator), .uid_validity = uids.validity, .uid_next = uids.next };
     }
 
     pub fn readMessage(io: Io, allocator: std.mem.Allocator, message: Message) ![]u8 {
@@ -126,6 +151,66 @@ pub const Message = struct {
     path: []u8,
     size: u64,
     flags: MessageFlags,
+    uid: u32,
+};
+
+pub const Mailbox = struct {
+    /// Ascending UIDs, so position + 1 is the IMAP sequence number.
+    messages: []Message,
+    uid_validity: u32,
+    uid_next: u32,
+};
+
+/// `raven-uidlist` in each Maildir: `<uidvalidity> <uidnext>` on the first
+/// line, then `<uid> <base name>` per message.
+const UidList = struct {
+    validity: u32,
+    next: u32,
+    /// Base name -> UID; keys point into the loaded file.
+    map: std.StringHashMapUnmanaged(u32) = .empty,
+
+    fn load(io: Io, arena: std.mem.Allocator, maildir: Io.Dir) !UidList {
+        const fresh: UidList = .{ .validity = @intCast(@divFloor(Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s)), .next = 1 };
+        const raw = maildir.readFileAlloc(io, "raven-uidlist", arena, .limited(64 * 1024 * 1024)) catch |err| switch (err) {
+            error.FileNotFound => return fresh,
+            else => return err,
+        };
+        // A damaged list starts over with a new UIDVALIDITY, which tells
+        // clients to drop their caches instead of trusting wrong UIDs.
+        return parse(arena, raw) catch fresh;
+    }
+
+    fn parse(arena: std.mem.Allocator, raw: []const u8) !UidList {
+        var lines = std.mem.tokenizeScalar(u8, raw, '\n');
+        var header = std.mem.tokenizeScalar(u8, lines.next() orelse return error.Corrupt, ' ');
+        var list: UidList = .{
+            .validity = try std.fmt.parseInt(u32, header.next() orelse return error.Corrupt, 10),
+            .next = try std.fmt.parseInt(u32, header.next() orelse return error.Corrupt, 10),
+        };
+        while (lines.next()) |line| {
+            const space = std.mem.indexOfScalar(u8, line, ' ') orelse return error.Corrupt;
+            const uid = try std.fmt.parseInt(u32, line[0..space], 10);
+            if (uid == 0 or uid >= list.next) return error.Corrupt;
+            try list.map.put(arena, line[space + 1 ..], uid);
+        }
+        return list;
+    }
+
+    /// Written to a temporary file and renamed, so a crash never leaves a
+    /// half-written list behind.
+    fn save(self: UidList, io: Io, maildir: Io.Dir, messages: []const Message) !void {
+        {
+            const file = try maildir.createFile(io, "raven-uidlist.tmp", .{});
+            defer file.close(io);
+            var buf: [4096]u8 = undefined;
+            var writer = file.writerStreaming(io, &buf);
+            try writer.interface.print("{d} {d}\n", .{ self.validity, self.next });
+            for (messages) |message| try writer.interface.print("{d} {s}\n", .{ message.uid, baseName(message.path) });
+            try writer.interface.flush();
+            try file.sync(io);
+        }
+        try maildir.rename("raven-uidlist.tmp", maildir, "raven-uidlist", io);
+    }
 };
 
 pub fn freeMessages(allocator: std.mem.Allocator, messages: []Message) void {
@@ -248,6 +333,10 @@ fn olderFirst(_: void, a: Message, b: Message) bool {
     return std.mem.order(u8, baseName(a.path), baseName(b.path)) == .lt;
 }
 
+fn lowerUid(_: void, a: Message, b: Message) bool {
+    return a.uid < b.uid;
+}
+
 fn testRoot(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u8 {
     return std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
 }
@@ -276,7 +365,7 @@ test "deliver goes through tmp into new and survives a fresh Storage" {
     try std.testing.expect(try tmp_it.next(io) == null);
 }
 
-test "listing claims new mail into cur, oldest first" {
+test "opening claims new mail into cur, oldest first" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -287,19 +376,60 @@ test "listing claims new mail into cur, oldest first" {
 
     for ([_][]const u8{ "one", "two", "three" }) |body| allocator.free(try storage.deliver(io, allocator, "acme", "example.com", "alice", "", body));
 
-    const messages = try storage.listMailbox(io, allocator, "acme", "example.com", "alice");
-    defer freeMessages(allocator, messages);
-    try std.testing.expectEqual(@as(usize, 3), messages.len);
-    for (messages, [_][]const u8{ "one", "two", "three" }) |message, expected| {
+    const mailbox = try storage.openMailbox(io, allocator, "acme", "example.com", "alice");
+    defer freeMessages(allocator, mailbox.messages);
+    try std.testing.expectEqual(@as(usize, 3), mailbox.messages.len);
+    for (mailbox.messages, [_][]const u8{ "one", "two", "three" }, 1..) |message, expected, uid| {
+        try std.testing.expectEqual(@as(u32, @intCast(uid)), message.uid);
         try std.testing.expect(std.mem.indexOf(u8, message.path, "/cur/") != null);
-        try std.testing.expect(std.mem.endsWith(u8, message.path, ":2,"));
         const body = try Storage.readMessage(io, allocator, message);
         defer allocator.free(body);
         try std.testing.expectEqualStrings(expected, body);
     }
+    try std.testing.expectEqual(@as(u32, 4), mailbox.uid_next);
 }
 
-test "flags live in the file name and survive relisting" {
+test "UIDs survive restarts and expunges and are never reused" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(allocator, &tmp);
+    defer allocator.free(root);
+
+    for (0..3) |_| allocator.free(try Storage.init(root).deliver(io, allocator, "acme", "example.com", "alice", "", "x"));
+    const first = try Storage.init(root).openMailbox(io, allocator, "acme", "example.com", "alice");
+    defer freeMessages(allocator, first.messages);
+    try Storage.deleteMessage(io, first.messages[1]); // UID 2
+
+    // A fresh Storage stands in for a restart.
+    allocator.free(try Storage.init(root).deliver(io, allocator, "acme", "example.com", "alice", "", "y"));
+    const second = try Storage.init(root).openMailbox(io, allocator, "acme", "example.com", "alice");
+    defer freeMessages(allocator, second.messages);
+    try std.testing.expectEqual(first.uid_validity, second.uid_validity);
+    try std.testing.expectEqual(@as(usize, 3), second.messages.len);
+    for (second.messages, [_]u32{ 1, 3, 4 }) |message, uid| try std.testing.expectEqual(uid, message.uid);
+    try std.testing.expectEqual(@as(u32, 5), second.uid_next);
+}
+
+test "a damaged UID list resets UIDVALIDITY" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(allocator, &tmp);
+    defer allocator.free(root);
+    const storage = Storage.init(root);
+
+    allocator.free(try storage.deliver(io, allocator, "acme", "example.com", "alice", "", "x"));
+    try tmp.dir.writeFile(io, .{ .sub_path = "tenants/acme/domains/example.com/users/alice/Maildir/raven-uidlist", .data = "7 3\n9 bogus\n" });
+    const mailbox = try storage.openMailbox(io, allocator, "acme", "example.com", "alice");
+    defer freeMessages(allocator, mailbox.messages);
+    try std.testing.expect(mailbox.uid_validity != 7);
+    try std.testing.expectEqual(@as(u32, 1), mailbox.messages[0].uid);
+}
+
+test "flags live in the file name and survive reopening" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
@@ -310,20 +440,21 @@ test "flags live in the file name and survive relisting" {
 
     allocator.free(try storage.deliver(io, allocator, "acme", "example.com", "alice", "Subject: x\r\n", "hello"));
     {
-        const messages = try storage.listMailbox(io, allocator, "acme", "example.com", "alice");
-        defer freeMessages(allocator, messages);
-        try Storage.setFlags(io, allocator, &messages[0], .{ .seen = true, .flagged = true, .deleted = true });
-        try std.testing.expect(std.mem.endsWith(u8, messages[0].path, ":2,FST"));
+        const mailbox = try storage.openMailbox(io, allocator, "acme", "example.com", "alice");
+        defer freeMessages(allocator, mailbox.messages);
+        try Storage.setFlags(io, allocator, &mailbox.messages[0], .{ .seen = true, .flagged = true, .deleted = true });
+        try std.testing.expect(std.mem.endsWith(u8, mailbox.messages[0].path, ":2,FST"));
     }
 
-    const messages = try storage.listMailbox(io, allocator, "acme", "example.com", "alice");
-    defer freeMessages(allocator, messages);
-    try std.testing.expectEqual(MessageFlags{ .seen = true, .flagged = true, .deleted = true }, messages[0].flags);
+    const mailbox = try storage.openMailbox(io, allocator, "acme", "example.com", "alice");
+    defer freeMessages(allocator, mailbox.messages);
+    try std.testing.expectEqual(MessageFlags{ .seen = true, .flagged = true, .deleted = true }, mailbox.messages[0].flags);
+    try std.testing.expectEqual(@as(u32, 1), mailbox.messages[0].uid); // renames keep the UID
 
-    try Storage.deleteMessage(io, messages[0]);
-    const after = try storage.listMailbox(io, allocator, "acme", "example.com", "alice");
-    defer freeMessages(allocator, after);
-    try std.testing.expectEqual(@as(usize, 0), after.len);
+    try Storage.deleteMessage(io, mailbox.messages[0]);
+    const after = try storage.openMailbox(io, allocator, "acme", "example.com", "alice");
+    defer freeMessages(allocator, after.messages);
+    try std.testing.expectEqual(@as(usize, 0), after.messages.len);
 }
 
 test "unique names are well formed" {

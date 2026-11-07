@@ -68,7 +68,11 @@ def check_delivery(smtp, imap, expected=1, sender="bob@external.test"):
     fetched = imap.fetch(str(expected), "(BODY[])")[1][0][1]
     assert b"Subject: smoke %d" % expected in fetched
     assert b"Return-Path: <%s>" % sender.encode() in fetched and b"([127.0.0.1])" in fetched, fetched  # #11
+    # Nothing is expunged in these runs, so the newest message has UID == count (#13).
+    assert b"UID %d " % expected in imap.uid("FETCH", str(expected), "(BODY[])")[1][0][0]
+    validity = imap.response("UIDVALIDITY")[1][0]
     imap.logout()
+    return validity
 
 
 def imap_plain():
@@ -84,12 +88,12 @@ def main():
         with Raven(data):
             # Silent clients must not block anyone else (#5).
             idle = [socket.create_connection((HOST, port), timeout=5) for port in (SMTP_PORT, IMAP_PORT)]
-            check_delivery(smtplib.SMTP(HOST, SMTP_PORT, timeout=5), imap_plain())
+            validity = check_delivery(smtplib.SMTP(HOST, SMTP_PORT, timeout=5), imap_plain())
             for s in idle:
                 s.close()
 
         with Raven(data):  # delivery after a restart must not collide with existing files (#6)
-            check_delivery(smtplib.SMTP(HOST, SMTP_PORT, timeout=5), imap_plain(), expected=2)
+            assert check_delivery(smtplib.SMTP(HOST, SMTP_PORT, timeout=5), imap_plain(), expected=2) == validity
             imap = imap_plain()
             imap.login("alice@example.com", PASSWORD)
             imap.select("INBOX")

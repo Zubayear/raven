@@ -87,7 +87,7 @@ const capabilities = "IMAP4rev1 LITERAL+";
 
 const State = enum { not_authenticated, authenticated, selected, logout };
 
-const Command = enum { capability, noop, logout, login, select, examine, list, fetch, store, expunge };
+const Command = enum { capability, noop, logout, login, select, examine, list, fetch, store, expunge, uid };
 
 /// One command being executed.
 const Context = struct {
@@ -109,7 +109,7 @@ const Context = struct {
             .capability, .noop, .logout => true,
             .login => state == .not_authenticated,
             .select, .examine, .list => state == .authenticated or state == .selected,
-            .fetch, .store, .expunge => state == .selected,
+            .fetch, .store, .expunge, .uid => state == .selected,
         };
         if (!allowed) return ctx.bad(if (state == .not_authenticated) "log in first" else "command not valid in this state");
 
@@ -132,9 +132,16 @@ const Context = struct {
             .login => try ctx.login(p),
             .select, .examine => try ctx.select(p, cmd == .examine),
             .list => try ctx.list(p),
-            .fetch => try ctx.fetch(p),
-            .store => try ctx.store(p),
+            .fetch => try ctx.fetch(p, .sequence),
+            .store => try ctx.store(p, .sequence),
             .expunge => try ctx.expunge(p),
+            .uid => {
+                try p.space();
+                const sub = try p.atom();
+                if (std.ascii.eqlIgnoreCase(sub, "FETCH")) return ctx.fetch(p, .uid);
+                if (std.ascii.eqlIgnoreCase(sub, "STORE")) return ctx.store(p, .uid);
+                return ctx.bad("unknown UID command");
+            },
         }
     }
 
@@ -165,7 +172,10 @@ const Context = struct {
         if (!std.ascii.eqlIgnoreCase(mailbox, "INBOX")) return ctx.no("[NONEXISTENT] no such mailbox");
 
         const id = session.identity.?;
-        session.messages = .fromOwnedSlice(try ctx.server.storage.listMailbox(ctx.io, ctx.server.allocator, id.tenant, id.domain, id.user));
+        const opened = try ctx.server.storage.openMailbox(ctx.io, ctx.server.allocator, id.tenant, id.domain, id.user);
+        session.messages = .fromOwnedSlice(opened.messages);
+        session.uid_validity = opened.uid_validity;
+        session.uid_next = opened.uid_next;
         session.read_only = read_only;
         session.state = .selected;
 
@@ -173,7 +183,7 @@ const Context = struct {
         try w.writeAll("* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n");
         try w.writeAll(if (read_only) "* OK [PERMANENTFLAGS ()] read-only\r\n" else "* OK [PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)] limited\r\n");
         try w.print("* {d} EXISTS\r\n* 0 RECENT\r\n", .{session.messages.items.len});
-        try w.writeAll("* OK [UIDVALIDITY 1] UIDs valid\r\n");
+        try w.print("* OK [UIDVALIDITY {d}] UIDs valid\r\n* OK [UIDNEXT {d}] predicted next UID\r\n", .{ session.uid_validity, session.uid_next });
         try ctx.ok(if (read_only) "[READ-ONLY] EXAMINE completed" else "[READ-WRITE] SELECT completed");
     }
 
@@ -192,7 +202,7 @@ const Context = struct {
         try ctx.ok("LIST completed");
     }
 
-    fn fetch(ctx: Context, p: *proto.Parser) !void {
+    fn fetch(ctx: Context, p: *proto.Parser, by: Addressing) !void {
         try p.space();
         const set = try p.sequenceSet();
         try p.space();
@@ -202,7 +212,7 @@ const Context = struct {
         const s = ctx.server;
         const messages = ctx.session.messages.items;
         for (messages, 1..) |message, number| {
-            if (!set.contains(@intCast(number), @intCast(messages.len))) continue;
+            if (!ctx.session.inSet(set, by, number)) continue;
             const data = Storage.readMessage(ctx.io, s.allocator, message) catch |err| switch (err) {
                 error.FileNotFound => return ctx.no("message no longer available"),
                 else => return err,
@@ -210,14 +220,17 @@ const Context = struct {
             defer s.allocator.free(data);
             const flags = try message.flags.format(s.allocator);
             defer s.allocator.free(flags);
-            try ctx.w.print("* {d} FETCH (FLAGS {s} BODY[] {{{d}}}\r\n", .{ number, flags, data.len });
+            try ctx.w.print("* {d} FETCH (", .{number});
+            // UID FETCH responses always carry the UID (RFC 3501 §6.4.8).
+            if (by == .uid) try ctx.w.print("UID {d} ", .{message.uid});
+            try ctx.w.print("FLAGS {s} BODY[] {{{d}}}\r\n", .{ flags, data.len });
             try ctx.w.writeAll(data);
             try ctx.w.writeAll(")\r\n");
         }
         try ctx.ok("FETCH completed");
     }
 
-    fn store(ctx: Context, p: *proto.Parser) !void {
+    fn store(ctx: Context, p: *proto.Parser, by: Addressing) !void {
         try p.space();
         const set = try p.sequenceSet();
         try p.space();
@@ -228,9 +241,8 @@ const Context = struct {
         try p.end();
         if (ctx.session.read_only) return ctx.no("[READ-ONLY] mailbox is read-only");
 
-        const messages = ctx.session.messages.items;
-        for (messages, 1..) |*message, number| {
-            if (!set.contains(@intCast(number), @intCast(messages.len))) continue;
+        for (ctx.session.messages.items, 1..) |*message, number| {
+            if (!ctx.session.inSet(set, by, number)) continue;
             Storage.setFlags(ctx.io, ctx.server.allocator, message, message.flags.merge(added)) catch |err| switch (err) {
                 error.FileNotFound => return ctx.no("message no longer available"),
                 else => return err,
@@ -266,11 +278,25 @@ const Context = struct {
     }
 };
 
+/// Whether a set names messages by sequence number or by UID.
+const Addressing = enum { sequence, uid };
+
 const Session = struct {
     state: State = .not_authenticated,
     identity: ?Identity = null,
     messages: std.ArrayList(Message) = .empty,
+    uid_validity: u32 = 0,
+    uid_next: u32 = 0,
     read_only: bool = false,
+
+    /// Whether the message at `number` (1-based) is in `set`.
+    fn inSet(self: *const Session, set: proto.SequenceSet, by: Addressing, number: usize) bool {
+        const items = self.messages.items;
+        return switch (by) {
+            .sequence => set.contains(@intCast(number), @intCast(items.len)),
+            .uid => set.contains(items[number - 1].uid, if (items.len == 0) 0 else items[items.len - 1].uid),
+        };
+    }
 
     fn closeMailbox(self: *Session, allocator: std.mem.Allocator) void {
         for (self.messages.items) |message| allocator.free(message.path);
@@ -358,6 +384,8 @@ fn testSession(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     try tmp.dir.createDirPath(std.testing.io, "tenants/acme/domains/example.com/users/alice/Maildir/new");
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tenants/acme/domains/example.com/users/alice/Maildir/new/1.eml", .data = "Subject: hi\r\n\r\nhello\r\n" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tenants/acme/domains/example.com/users/alice/Maildir/new/2.eml", .data = "Subject: two\r\n\r\n" });
+    // A fixed UIDVALIDITY keeps transcripts deterministic.
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tenants/acme/domains/example.com/users/alice/Maildir/raven-uidlist", .data = "1234567890 1\n" });
 
     var catalog = try @import("tenant_index.zig").parseForTest(allocator, "tenant acme example.com\n");
     defer catalog.deinit(allocator);
@@ -406,16 +434,22 @@ test "imap session: select, fetch, store and expunge" {
         "a5 FETCH 1:* BODY[]\r\n" ++
         "a6 STORE 1 +FLAGS.SILENT (\\Deleted \\Seen)\r\n" ++
         "a7 EXPUNGE\r\n" ++
-        "a8 FETCH 1 BODY[]\r\n");
+        "a8 FETCH 1 BODY[]\r\n" ++
+        "a9 UID FETCH 5:* BODY[]\r\n" ++
+        "b1 UID STORE 1 +FLAGS (\\Seen)\r\n" ++
+        "b2 UID BOGUS 1\r\n");
     defer allocator.free(transcript);
     const select = "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n";
     try std.testing.expectEqualStrings("* OK [CAPABILITY IMAP4rev1 LITERAL+] raven ready\r\n" ++
         "a1 OK [CAPABILITY IMAP4rev1 LITERAL+] LOGIN completed\r\n" ++
-        select ++ "* OK [PERMANENTFLAGS ()] read-only\r\n* 2 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 1] UIDs valid\r\na2 OK [READ-ONLY] EXAMINE completed\r\n" ++
+        select ++ "* OK [PERMANENTFLAGS ()] read-only\r\n* 2 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 1234567890] UIDs valid\r\n* OK [UIDNEXT 3] predicted next UID\r\na2 OK [READ-ONLY] EXAMINE completed\r\n" ++
         "a3 NO [READ-ONLY] mailbox is read-only\r\n" ++
-        select ++ "* OK [PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)] limited\r\n* 2 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 1] UIDs valid\r\na4 OK [READ-WRITE] SELECT completed\r\n" ++
+        select ++ "* OK [PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)] limited\r\n* 2 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 1234567890] UIDs valid\r\n* OK [UIDNEXT 3] predicted next UID\r\na4 OK [READ-WRITE] SELECT completed\r\n" ++
         "* 1 FETCH (FLAGS () BODY[] {22}\r\nSubject: hi\r\n\r\nhello\r\n)\r\n* 2 FETCH (FLAGS () BODY[] {16}\r\nSubject: two\r\n\r\n)\r\na5 OK FETCH completed\r\n" ++
         "a6 OK STORE completed\r\n" ++
         "* 1 EXPUNGE\r\na7 OK EXPUNGE completed\r\n" ++
-        "* 1 FETCH (FLAGS () BODY[] {16}\r\nSubject: two\r\n\r\n)\r\na8 OK FETCH completed\r\n", transcript);
+        "* 1 FETCH (FLAGS () BODY[] {16}\r\nSubject: two\r\n\r\n)\r\na8 OK FETCH completed\r\n" ++
+        "* 1 FETCH (UID 2 FLAGS () BODY[] {16}\r\nSubject: two\r\n\r\n)\r\na9 OK FETCH completed\r\n" ++
+        "b1 OK STORE completed\r\n" ++ // UID 1 was expunged: nothing to do
+        "b2 BAD unknown UID command\r\n", transcript);
 }
