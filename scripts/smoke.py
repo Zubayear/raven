@@ -100,8 +100,15 @@ def main():
                 s.close()
 
         with Raven(tmp / "busy", "--max-connections", "1"):
-            first = socket.create_connection((HOST, SMTP_PORT), timeout=5)
-            assert first.recv(64).startswith(b"220 "), "first client should be served"
+            # The readiness probe's session may still hold the only slot briefly.
+            for _ in range(50):
+                first = socket.create_connection((HOST, SMTP_PORT), timeout=5)
+                if first.recv(64).startswith(b"220 "):
+                    break
+                first.close()
+                time.sleep(0.05)
+            else:
+                sys.exit("first client was never served")
             with socket.create_connection((HOST, SMTP_PORT), timeout=5) as second:
                 assert second.recv(64).startswith(b"421 "), "second client should be turned away"
             first.close()
