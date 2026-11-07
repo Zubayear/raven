@@ -179,27 +179,23 @@ pub const Server = struct {
                 const message = try readDataBlock(self.allocator, r);
                 defer self.allocator.free(message);
 
-                const stored_path = try self.storage.writeInboundMessage(fs_io, self.allocator, message);
-                defer self.allocator.free(stored_path);
-
-                for (recipients.items) |recipient| {
-                    const mailbox_path = try self.storage.deliverMailboxMessage(
-                        fs_io,
-                        self.allocator,
-                        recipient.tenant,
-                        recipient.domain,
-                        recipient.user,
-                        message,
-                    );
-                    defer self.allocator.free(mailbox_path);
-
-                    std.debug.print("delivered to {s}@{s} at {s}\n", .{ recipient.user, recipient.domain, mailbox_path });
-                }
+                const delivered = for (recipients.items) |recipient| {
+                    const name = self.storage.deliver(fs_io, self.allocator, recipient.tenant, recipient.domain, recipient.user, message) catch |err| {
+                        std.debug.print("delivery to {s}@{s} failed: {}\n", .{ recipient.user, recipient.domain, err });
+                        break false;
+                    };
+                    defer self.allocator.free(name);
+                    std.debug.print("delivered to {s}@{s} as {s}\n", .{ recipient.user, recipient.domain, name });
+                } else true;
 
                 if (sender) |value| self.allocator.free(value);
                 sender = null;
                 clearRecipients(self.allocator, &recipients);
-                std.debug.print("stored inbound message at {s}\n", .{stored_path});
+                // A temporary failure makes the client retry: a duplicate beats a lost message.
+                if (!delivered) {
+                    try w.writeAll("451 4.3.0 local error in processing\r\n");
+                    continue;
+                }
                 try w.writeAll("250 queued\r\n");
                 continue;
             }
@@ -574,10 +570,10 @@ test "smtp session delivers a pipelined transaction" {
         "250-localhost\r\n250-AUTH PLAIN\r\n250 PIPELINING\r\n" ++
         "250 ok\r\n250 ok\r\n354 end with <CR><LF>.<CR><LF>\r\n250 queued\r\n221 bye\r\n", out.written());
 
-    const messages = try server.storage.listMailboxMessages(std.testing.io, allocator, "acme", "example.com", "alice");
-    defer @import("storage.zig").freeMailboxMessages(allocator, messages);
+    const messages = try server.storage.listMailbox(std.testing.io, allocator, "acme", "example.com", "alice");
+    defer @import("storage.zig").freeMessages(allocator, messages);
     try std.testing.expectEqual(@as(usize, 1), messages.len);
-    const body = try server.storage.readMailboxMessage(std.testing.io, allocator, "acme", "example.com", "alice", messages[0].name);
+    const body = try Storage.readMessage(std.testing.io, allocator, messages[0]);
     defer allocator.free(body);
     try std.testing.expectEqualStrings("Subject: hi\r\n\r\n.dot\r\n", body);
 }

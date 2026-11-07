@@ -1,591 +1,342 @@
+//! Filesystem layout. Mailboxes are standard Maildirs: delivery writes to
+//! `tmp/`, syncs, then renames into `new/`; IMAP moves messages to `cur/`
+//! and keeps flags in the file name (`<base>:2,<flags>`).
 const std = @import("std");
 const Io = std.Io;
 
 pub const Storage = struct {
     root_dir: []const u8,
-    next_inbound_id: u64 = 0,
 
     pub fn init(root_dir: []const u8) Storage {
         return .{ .root_dir = root_dir };
     }
 
     pub fn ensureLayout(self: Storage, io: Io, allocator: std.mem.Allocator) !void {
-        try ensurePath(io, self.root_dir);
-        try ensureJoined(io, allocator, &.{ self.root_dir, "queue" });
-        try ensureJoined(io, allocator, &.{ self.root_dir, "queue", "inbound" });
-        try ensureJoined(io, allocator, &.{ self.root_dir, "queue", "outbound" });
-        try ensureJoined(io, allocator, &.{ self.root_dir, "tenants" });
-    }
-
-    pub fn tenantRoot(self: Storage, allocator: std.mem.Allocator, tenant: []const u8) ![]u8 {
-        return std.fs.path.join(allocator, &.{ self.root_dir, "tenants", tenant });
-    }
-
-    pub fn mailboxRoot(
-        self: Storage,
-        allocator: std.mem.Allocator,
-        tenant: []const u8,
-        domain: []const u8,
-        user: []const u8,
-    ) ![]u8 {
-        return std.fs.path.join(allocator, &.{
-            self.root_dir,
-            "tenants",
-            tenant,
-            "domains",
-            domain,
-            "users",
-            user,
-            "Maildir",
-        });
-    }
-
-    pub fn messageStorePath(
-        self: Storage,
-        allocator: std.mem.Allocator,
-        tenant: []const u8,
-        domain: []const u8,
-        user: []const u8,
-        filename: []const u8,
-    ) ![]u8 {
-        return std.fs.path.join(allocator, &.{
-            self.root_dir,
-            "tenants",
-            tenant,
-            "domains",
-            domain,
-            "users",
-            user,
-            "Maildir",
-            "new",
-            filename,
-        });
-    }
-
-    pub fn mailboxNewDir(
-        self: Storage,
-        allocator: std.mem.Allocator,
-        tenant: []const u8,
-        domain: []const u8,
-        user: []const u8,
-    ) ![]u8 {
-        return std.fs.path.join(allocator, &.{
-            self.root_dir,
-            "tenants",
-            tenant,
-            "domains",
-            domain,
-            "users",
-            user,
-            "Maildir",
-            "new",
-        });
-    }
-
-    pub const MailboxMessage = struct {
-        name: []u8,
-        path: []u8,
-        size: u64,
-        sequence: u64,
-        flags: MessageFlags,
-    };
-
-    pub const MessageFlags = struct {
-        seen: bool = false,
-        answered: bool = false,
-        flagged: bool = false,
-        deleted: bool = false,
-        draft: bool = false,
-
-        pub fn empty() MessageFlags {
-            return .{};
-        }
-
-        pub fn parse(raw: []const u8) MessageFlags {
-            var flags = MessageFlags{};
-            var parts = std.mem.tokenizeAny(u8, raw, " \t\r\n");
-            while (parts.next()) |part| {
-                if (std.mem.eql(u8, part, "\\Seen")) flags.seen = true else if (std.mem.eql(u8, part, "\\Answered")) flags.answered = true else if (std.mem.eql(u8, part, "\\Flagged")) flags.flagged = true else if (std.mem.eql(u8, part, "\\Deleted")) flags.deleted = true else if (std.mem.eql(u8, part, "\\Draft")) flags.draft = true else {}
-            }
-            return flags;
-        }
-
-        pub fn merge(self: MessageFlags, other: MessageFlags) MessageFlags {
-            return .{
-                .seen = self.seen or other.seen,
-                .answered = self.answered or other.answered,
-                .flagged = self.flagged or other.flagged,
-                .deleted = self.deleted or other.deleted,
-                .draft = self.draft or other.draft,
-            };
-        }
-
-        pub fn contains(self: MessageFlags, name: []const u8) bool {
-            if (std.mem.eql(u8, name, "\\Seen")) return self.seen;
-            if (std.mem.eql(u8, name, "\\Answered")) return self.answered;
-            if (std.mem.eql(u8, name, "\\Flagged")) return self.flagged;
-            if (std.mem.eql(u8, name, "\\Deleted")) return self.deleted;
-            if (std.mem.eql(u8, name, "\\Draft")) return self.draft;
-            return false;
-        }
-
-        pub fn format(self: MessageFlags, allocator: std.mem.Allocator) ![]u8 {
-            var list = std.ArrayList(u8).empty;
-            errdefer list.deinit(allocator);
-
-            try list.appendSlice(allocator, "(");
-            var first = true;
-            if (self.seen) {
-                if (!first) try list.append(allocator, ' ');
-                try list.appendSlice(allocator, "\\Seen");
-                first = false;
-            }
-            if (self.answered) {
-                if (!first) try list.append(allocator, ' ');
-                try list.appendSlice(allocator, "\\Answered");
-                first = false;
-            }
-            if (self.flagged) {
-                if (!first) try list.append(allocator, ' ');
-                try list.appendSlice(allocator, "\\Flagged");
-                first = false;
-            }
-            if (self.deleted) {
-                if (!first) try list.append(allocator, ' ');
-                try list.appendSlice(allocator, "\\Deleted");
-                first = false;
-            }
-            if (self.draft) {
-                if (!first) try list.append(allocator, ' ');
-                try list.appendSlice(allocator, "\\Draft");
-                first = false;
-            }
-            try list.appendSlice(allocator, ")");
-            return try list.toOwnedSlice(allocator);
-        }
-    };
-
-    pub fn listMailboxMessages(
-        self: Storage,
-        io: Io,
-        allocator: std.mem.Allocator,
-        tenant: []const u8,
-        domain: []const u8,
-        user: []const u8,
-    ) ![]MailboxMessage {
-        const mailbox_new_dir = try self.mailboxNewDir(allocator, tenant, domain, user);
-        defer allocator.free(mailbox_new_dir);
-
-        var dir = Io.Dir.cwd().openDir(io, mailbox_new_dir, .{ .iterate = true }) catch |err| switch (err) {
-            error.FileNotFound => return &.{},
-            else => return err,
-        };
-        defer dir.close(io);
-
-        var items = std.ArrayList(MailboxMessage).empty;
-        errdefer freeMailboxMessages(allocator, items.items);
-
-        var iter = dir.iterateAssumeFirstIteration();
-        while (try iter.next(io)) |entry| {
-            if (entry.kind != .file) continue;
-            if (!std.mem.endsWith(u8, entry.name, ".eml")) continue;
-
-            const sequence = parseSequence(entry.name) orelse continue;
-            const path = try std.fs.path.join(allocator, &.{ mailbox_new_dir, entry.name });
-            const stat = try dir.statFile(io, entry.name, .{});
-            const flags_name = try messageFlagsFileName(allocator, entry.name);
-            defer allocator.free(flags_name);
-            const flags = readMessageFlags(io, allocator, dir, flags_name) catch MessageFlags.empty();
-
-            try items.append(allocator, .{
-                .name = try allocator.dupe(u8, entry.name),
-                .path = path,
-                .size = stat.size,
-                .sequence = sequence,
-                .flags = flags,
-            });
-        }
-
-        std.sort.insertion(MailboxMessage, items.items, {}, lessThanMailboxMessage);
-        return try items.toOwnedSlice(allocator);
-    }
-
-    pub fn readMailboxMessage(
-        self: Storage,
-        io: Io,
-        allocator: std.mem.Allocator,
-        tenant: []const u8,
-        domain: []const u8,
-        user: []const u8,
-        name: []const u8,
-    ) ![]u8 {
-        const path = try std.fs.path.join(allocator, &.{
-            self.root_dir,
-            "tenants",
-            tenant,
-            "domains",
-            domain,
-            "users",
-            user,
-            "Maildir",
-            "new",
-            name,
-        });
-        defer allocator.free(path);
-
-        return Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
-    }
-
-    pub fn writeMailboxFlags(
-        self: Storage,
-        io: Io,
-        allocator: std.mem.Allocator,
-        tenant: []const u8,
-        domain: []const u8,
-        user: []const u8,
-        message_name: []const u8,
-        flags: MessageFlags,
-    ) !void {
-        const dir_path = try self.mailboxNewDir(allocator, tenant, domain, user);
-        defer allocator.free(dir_path);
-
-        const flags_name = try messageFlagsFileName(allocator, message_name);
-        defer allocator.free(flags_name);
-
-        const path = try std.fs.path.join(allocator, &.{ dir_path, flags_name });
-        defer allocator.free(path);
-
-        const text = try flagsText(allocator, flags);
-        defer allocator.free(text);
-
-        try Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = text });
-    }
-
-    pub fn deleteMailboxMessage(
-        self: Storage,
-        io: Io,
-        allocator: std.mem.Allocator,
-        tenant: []const u8,
-        domain: []const u8,
-        user: []const u8,
-        message_name: []const u8,
-    ) !void {
-        const dir_path = try self.mailboxNewDir(allocator, tenant, domain, user);
-        defer allocator.free(dir_path);
-
-        const message_path = try std.fs.path.join(allocator, &.{ dir_path, message_name });
-        defer allocator.free(message_path);
-        Io.Dir.cwd().deleteFile(io, message_path) catch {};
-
-        const flags_name = try messageFlagsFileName(allocator, message_name);
-        defer allocator.free(flags_name);
-
-        const flags_path = try std.fs.path.join(allocator, &.{ dir_path, flags_name });
-        defer allocator.free(flags_path);
-        Io.Dir.cwd().deleteFile(io, flags_path) catch {};
-    }
-
-    pub fn queueInboundDir(self: Storage, allocator: std.mem.Allocator) ![]u8 {
-        return std.fs.path.join(allocator, &.{ self.root_dir, "queue", "inbound" });
+        const tenants = try std.fs.path.join(allocator, &.{ self.root_dir, "tenants" });
+        defer allocator.free(tenants);
+        try Io.Dir.cwd().createDirPath(io, tenants);
     }
 
     pub fn tenantIndexPath(self: Storage, allocator: std.mem.Allocator) ![]u8 {
         return std.fs.path.join(allocator, &.{ self.root_dir, "tenants", "index.txt" });
     }
 
-    pub fn aliasIndexPath(
-        self: Storage,
-        allocator: std.mem.Allocator,
-        tenant: []const u8,
-        domain: []const u8,
-    ) ![]u8 {
-        return std.fs.path.join(allocator, &.{
-            self.root_dir,
-            "tenants",
-            tenant,
-            "domains",
-            domain,
-            "aliases.txt",
-        });
+    pub fn aliasIndexPath(self: Storage, allocator: std.mem.Allocator, tenant: []const u8, domain: []const u8) ![]u8 {
+        return std.fs.path.join(allocator, &.{ self.root_dir, "tenants", tenant, "domains", domain, "aliases.txt" });
     }
 
-    pub fn accountIndexPathTest(
-        self: Storage,
-        allocator: std.mem.Allocator,
-        tenant: []const u8,
-        domain: []const u8,
-    ) ![]u8 {
-        return self.accountIndexPath(allocator, tenant, domain);
+    pub fn accountIndexPath(self: Storage, allocator: std.mem.Allocator, tenant: []const u8, domain: []const u8) ![]u8 {
+        return std.fs.path.join(allocator, &.{ self.root_dir, "tenants", tenant, "domains", domain, "accounts.txt" });
     }
 
-    pub fn accountIndexPath(
-        self: Storage,
-        allocator: std.mem.Allocator,
-        tenant: []const u8,
-        domain: []const u8,
-    ) ![]u8 {
-        return std.fs.path.join(allocator, &.{
-            self.root_dir,
-            "tenants",
-            tenant,
-            "domains",
-            domain,
-            "accounts.txt",
-        });
+    pub fn maildirPath(self: Storage, allocator: std.mem.Allocator, tenant: []const u8, domain: []const u8, user: []const u8) ![]u8 {
+        return std.fs.path.join(allocator, &.{ self.root_dir, "tenants", tenant, "domains", domain, "users", user, "Maildir" });
     }
 
-    pub fn writeInboundMessage(
-        self: *Storage,
-        io: Io,
-        allocator: std.mem.Allocator,
-        message: []const u8,
-    ) ![]u8 {
-        const queue_dir = try self.queueInboundDir(allocator);
-        defer allocator.free(queue_dir);
+    /// Delivers `message` to the user's Maildir. The message is durable once
+    /// this returns. Returns the new file name; the caller owns it.
+    pub fn deliver(self: Storage, io: Io, allocator: std.mem.Allocator, tenant: []const u8, domain: []const u8, user: []const u8, message: []const u8) ![]u8 {
+        const maildir_path = try self.maildirPath(allocator, tenant, domain, user);
+        defer allocator.free(maildir_path);
+        var maildir = try Io.Dir.cwd().createDirPathOpen(io, maildir_path, .{});
+        defer maildir.close(io);
+        for ([_][]const u8{ "tmp", "new", "cur" }) |sub| try maildir.createDirPath(io, sub);
 
-        try ensurePath(io, queue_dir);
+        const name = try uniqueName(io, allocator);
+        errdefer allocator.free(name);
+        var tmp_buf: [std.fs.max_name_bytes + 4]u8 = undefined;
+        var new_buf: [std.fs.max_name_bytes + 4]u8 = undefined;
+        const tmp_path = try std.fmt.bufPrint(&tmp_buf, "tmp/{s}", .{name});
+        const new_path = try std.fmt.bufPrint(&new_buf, "new/{s}", .{name});
 
-        const id = @atomicRmw(u64, &self.next_inbound_id, .Add, 1, .monotonic);
-
-        var filename_buf: [64]u8 = undefined;
-        const filename = try std.fmt.bufPrint(&filename_buf, "{d}.eml", .{id});
-
-        const full_path = try std.fs.path.join(allocator, &.{ queue_dir, filename });
-        errdefer allocator.free(full_path);
-
-        var file = try Io.Dir.cwd().createFile(io, full_path, .{
-            .exclusive = true,
-            .truncate = false,
-        });
-        defer file.close(io);
-
-        try file.writeStreamingAll(io, message);
-
-        return full_path;
+        const file = try maildir.createFile(io, tmp_path, .{ .exclusive = true });
+        errdefer maildir.deleteFile(io, tmp_path) catch {};
+        {
+            defer file.close(io);
+            try file.writeStreamingAll(io, message);
+            try file.sync(io);
+        }
+        try maildir.rename(tmp_path, maildir, new_path, io);
+        return name;
     }
 
-    pub fn deliverMailboxMessage(
-        self: *Storage,
-        io: Io,
-        allocator: std.mem.Allocator,
-        tenant: []const u8,
-        domain: []const u8,
-        user: []const u8,
-        message: []const u8,
-    ) ![]u8 {
-        const mailbox_new_dir = try self.mailboxNewDir(allocator, tenant, domain, user);
-        defer allocator.free(mailbox_new_dir);
+    /// Lists INBOX oldest first, moving anything in `new/` to `cur/`.
+    pub fn listMailbox(self: Storage, io: Io, allocator: std.mem.Allocator, tenant: []const u8, domain: []const u8, user: []const u8) ![]Message {
+        const maildir_path = try self.maildirPath(allocator, tenant, domain, user);
+        defer allocator.free(maildir_path);
+        var maildir = Io.Dir.cwd().openDir(io, maildir_path, .{}) catch |err| switch (err) {
+            error.FileNotFound => return &.{},
+            else => return err,
+        };
+        defer maildir.close(io);
+        try claimNew(io, allocator, maildir);
 
-        try ensurePath(io, mailbox_new_dir);
+        var cur = maildir.openDir(io, "cur", .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return &.{},
+            else => return err,
+        };
+        defer cur.close(io);
 
-        const id = @atomicRmw(u64, &self.next_inbound_id, .Add, 1, .monotonic);
+        var messages = std.ArrayList(Message).empty;
+        defer messages.deinit(allocator);
+        errdefer for (messages.items) |message| allocator.free(message.path);
 
-        var filename_buf: [64]u8 = undefined;
-        const filename = try std.fmt.bufPrint(&filename_buf, "{d}.eml", .{id});
+        var it = cur.iterate();
+        while (try it.next(io)) |entry| {
+            if (entry.kind != .file) continue;
+            const stat = try cur.statFile(io, entry.name, .{});
+            const path = try std.fs.path.join(allocator, &.{ maildir_path, "cur", entry.name });
+            errdefer allocator.free(path);
+            try messages.append(allocator, .{ .path = path, .size = stat.size, .flags = .fromFileName(entry.name) });
+        }
+        std.sort.pdq(Message, messages.items, {}, olderFirst);
+        return messages.toOwnedSlice(allocator);
+    }
 
-        const full_path = try std.fs.path.join(allocator, &.{ mailbox_new_dir, filename });
-        errdefer allocator.free(full_path);
+    pub fn readMessage(io: Io, allocator: std.mem.Allocator, message: Message) ![]u8 {
+        return Io.Dir.cwd().readFileAlloc(io, message.path, allocator, .limited(1024 * 1024));
+    }
 
-        var file = try Io.Dir.cwd().createFile(io, full_path, .{
-            .exclusive = true,
-            .truncate = false,
-        });
-        defer file.close(io);
+    /// Renames the message so its file name carries `flags`.
+    pub fn setFlags(io: Io, allocator: std.mem.Allocator, message: *Message, flags: MessageFlags) !void {
+        var letters_buf: [5]u8 = undefined;
+        var name_buf: [std.fs.max_name_bytes]u8 = undefined;
+        const name = try std.fmt.bufPrint(&name_buf, "{s}:2,{s}", .{ baseName(message.path), flags.letters(&letters_buf) });
+        const path = try std.fs.path.join(allocator, &.{ std.fs.path.dirname(message.path).?, name });
+        errdefer allocator.free(path);
 
-        try file.writeStreamingAll(io, message);
-        return full_path;
+        try Io.Dir.cwd().rename(message.path, Io.Dir.cwd(), path, io);
+        allocator.free(message.path);
+        message.path = path;
+        message.flags = flags;
+    }
+
+    pub fn deleteMessage(io: Io, message: Message) !void {
+        Io.Dir.cwd().deleteFile(io, message.path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
     }
 };
 
-fn parseSequence(name: []const u8) ?u64 {
-    if (!std.mem.endsWith(u8, name, ".eml")) return null;
-    const stem = name[0 .. name.len - 4];
-    return std.fmt.parseInt(u64, stem, 10) catch null;
+pub const Message = struct {
+    /// Current path of the file in `cur/`; changes when flags change.
+    path: []u8,
+    size: u64,
+    flags: MessageFlags,
+};
+
+pub fn freeMessages(allocator: std.mem.Allocator, messages: []Message) void {
+    for (messages) |message| allocator.free(message.path);
+    allocator.free(messages);
 }
 
-fn readMessageFlags(io: Io, allocator: std.mem.Allocator, dir: Io.Dir, flags_name: []const u8) !Storage.MessageFlags {
-    const raw = dir.readFileAlloc(io, flags_name, allocator, .limited(4 * 1024)) catch |err| switch (err) {
-        error.FileNotFound => return Storage.MessageFlags.empty(),
+pub const MessageFlags = struct {
+    seen: bool = false,
+    answered: bool = false,
+    flagged: bool = false,
+    deleted: bool = false,
+    draft: bool = false,
+
+    /// Reads the Maildir info suffix: `<base>:2,<letters>`.
+    pub fn fromFileName(name: []const u8) MessageFlags {
+        const info = std.mem.indexOf(u8, name, ":2,") orelse return .{};
+        var flags: MessageFlags = .{};
+        for (name[info + 3 ..]) |ch| switch (ch) {
+            'D' => flags.draft = true,
+            'F' => flags.flagged = true,
+            'R' => flags.answered = true,
+            'S' => flags.seen = true,
+            'T' => flags.deleted = true,
+            else => {},
+        };
+        return flags;
+    }
+
+    /// Maildir info letters, in the ASCII order the format requires.
+    fn letters(self: MessageFlags, buf: *[5]u8) []const u8 {
+        var n: usize = 0;
+        for ([_]struct { bool, u8 }{ .{ self.draft, 'D' }, .{ self.flagged, 'F' }, .{ self.answered, 'R' }, .{ self.seen, 'S' }, .{ self.deleted, 'T' } }) |flag| {
+            if (!flag[0]) continue;
+            buf[n] = flag[1];
+            n += 1;
+        }
+        return buf[0..n];
+    }
+
+    pub fn merge(self: MessageFlags, other: MessageFlags) MessageFlags {
+        return .{
+            .seen = self.seen or other.seen,
+            .answered = self.answered or other.answered,
+            .flagged = self.flagged or other.flagged,
+            .deleted = self.deleted or other.deleted,
+            .draft = self.draft or other.draft,
+        };
+    }
+
+    /// IMAP flag list, e.g. `(\Seen \Flagged)`.
+    pub fn format(self: MessageFlags, allocator: std.mem.Allocator) ![]u8 {
+        var list = std.ArrayList(u8).empty;
+        errdefer list.deinit(allocator);
+        try list.append(allocator, '(');
+        for ([_]struct { bool, []const u8 }{ .{ self.seen, "\\Seen" }, .{ self.answered, "\\Answered" }, .{ self.flagged, "\\Flagged" }, .{ self.deleted, "\\Deleted" }, .{ self.draft, "\\Draft" } }) |flag| {
+            if (!flag[0]) continue;
+            if (list.items.len > 1) try list.append(allocator, ' ');
+            try list.appendSlice(allocator, flag[1]);
+        }
+        try list.append(allocator, ')');
+        return list.toOwnedSlice(allocator);
+    }
+};
+
+/// `<seconds>.M<microseconds>R<random>.raven`: unique across processes and
+/// restarts, and sorts in delivery order.
+fn uniqueName(io: Io, allocator: std.mem.Allocator) ![]u8 {
+    const ns = Io.Clock.real.now(io).nanoseconds;
+    var random: [8]u8 = undefined;
+    io.random(&random);
+    return std.fmt.allocPrint(allocator, "{d}.M{d:0>6}R{x:0>16}.raven", .{
+        @divFloor(ns, std.time.ns_per_s),
+        @mod(@divFloor(ns, std.time.ns_per_us), std.time.us_per_s),
+        std.mem.readInt(u64, &random, .little),
+    });
+}
+
+fn claimNew(io: Io, allocator: std.mem.Allocator, maildir: Io.Dir) !void {
+    var new = maildir.openDir(io, "new", .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return,
         else => return err,
     };
-    defer allocator.free(raw);
-    return Storage.MessageFlags.parse(raw);
-}
+    defer new.close(io);
+    try maildir.createDirPath(io, "cur");
 
-fn messageFlagsFileName(allocator: std.mem.Allocator, message_name: []const u8) ![]u8 {
-    const stem = if (std.mem.endsWith(u8, message_name, ".eml")) message_name[0 .. message_name.len - 4] else message_name;
-    return std.fmt.allocPrint(allocator, "{s}.flags", .{stem});
-}
-
-fn flagsText(allocator: std.mem.Allocator, flags: Storage.MessageFlags) ![]u8 {
-    var list = std.ArrayList(u8).empty;
-    errdefer list.deinit(allocator);
-
-    if (flags.seen) {
-        if (list.items.len > 0) try list.append(allocator, ' ');
-        try list.appendSlice(allocator, "\\Seen");
+    // Collect first: renaming entries out of a directory while iterating it is unspecified.
+    var names = std.ArrayList([]u8).empty;
+    defer {
+        for (names.items) |name| allocator.free(name);
+        names.deinit(allocator);
     }
-    if (flags.answered) {
-        if (list.items.len > 0) try list.append(allocator, ' ');
-        try list.appendSlice(allocator, "\\Answered");
-    }
-    if (flags.flagged) {
-        if (list.items.len > 0) try list.append(allocator, ' ');
-        try list.appendSlice(allocator, "\\Flagged");
-    }
-    if (flags.deleted) {
-        if (list.items.len > 0) try list.append(allocator, ' ');
-        try list.appendSlice(allocator, "\\Deleted");
-    }
-    if (flags.draft) {
-        if (list.items.len > 0) try list.append(allocator, ' ');
-        try list.appendSlice(allocator, "\\Draft");
+    var it = new.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .file) continue;
+        const name = try allocator.dupe(u8, entry.name);
+        errdefer allocator.free(name);
+        try names.append(allocator, name);
     }
 
-    return try list.toOwnedSlice(allocator);
-}
-
-fn lessThanMailboxMessage(_: void, lhs: Storage.MailboxMessage, rhs: Storage.MailboxMessage) bool {
-    return lhs.sequence < rhs.sequence;
-}
-
-pub fn freeMailboxMessages(allocator: std.mem.Allocator, items: []Storage.MailboxMessage) void {
-    for (items) |item| {
-        allocator.free(item.name);
-        allocator.free(item.path);
+    var from_buf: [std.fs.max_name_bytes + 4]u8 = undefined;
+    var to_buf: [std.fs.max_name_bytes + 8]u8 = undefined;
+    for (names.items) |name| {
+        const from = try std.fmt.bufPrint(&from_buf, "new/{s}", .{name});
+        const to = try std.fmt.bufPrint(&to_buf, "cur/{s}:2,", .{name});
+        maildir.rename(from, maildir, to, io) catch |err| switch (err) {
+            error.FileNotFound => {}, // claimed by a concurrent session
+            else => return err,
+        };
     }
-    allocator.free(items);
 }
 
-fn ensurePath(io: Io, path: []const u8) !void {
-    try Io.Dir.cwd().createDirPath(io, path);
+fn baseName(path: []const u8) []const u8 {
+    const name = std.fs.path.basename(path);
+    return name[0 .. std.mem.indexOf(u8, name, ":2,") orelse name.len];
 }
 
-fn ensureJoined(io: Io, allocator: std.mem.Allocator, parts: []const []const u8) !void {
-    const path = try std.fs.path.join(allocator, parts);
-    defer allocator.free(path);
-    try ensurePath(io, path);
+fn olderFirst(_: void, a: Message, b: Message) bool {
+    return std.mem.order(u8, baseName(a.path), baseName(b.path)) == .lt;
 }
 
-test "mailbox paths are stable" {
+fn testRoot(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u8 {
+    return std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+}
+
+test "deliver goes through tmp into new and survives a fresh Storage" {
     const allocator = std.testing.allocator;
-    const storage = Storage.init("data");
-
-    const path = try storage.mailboxRoot(allocator, "tenant-a", "example.com", "alice");
-    defer allocator.free(path);
-
-    try std.testing.expectEqualStrings(
-        "data/tenants/tenant-a/domains/example.com/users/alice/Maildir",
-        path,
-    );
-}
-
-test "mailbox new dir path is stable" {
-    const allocator = std.testing.allocator;
-    const storage = Storage.init("data");
-
-    const path = try storage.mailboxNewDir(allocator, "tenant-a", "example.com", "alice");
-    defer allocator.free(path);
-
-    try std.testing.expectEqualStrings(
-        "data/tenants/tenant-a/domains/example.com/users/alice/Maildir/new",
-        path,
-    );
-}
-
-test "mailbox message listing is ordered" {
-    const allocator = std.testing.allocator;
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "tenants/acme/domains/example.com/users/alice/Maildir/new");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tenants/acme/domains/example.com/users/alice/Maildir/new/2.eml", .data = "two" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tenants/acme/domains/example.com/users/alice/Maildir/new/10.eml", .data = "ten" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tenants/acme/domains/example.com/users/alice/Maildir/new/1.eml", .data = "one" });
-
-    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    const root = try testRoot(allocator, &tmp);
     defer allocator.free(root);
 
-    const storage = Storage.init(root);
-    const messages = try storage.listMailboxMessages(std.testing.io, allocator, "acme", "example.com", "alice");
-    defer freeMailboxMessages(allocator, messages);
+    // Separate instances stand in for a restart: names must not collide.
+    for (0..3) |_| allocator.free(try Storage.init(root).deliver(io, allocator, "acme", "example.com", "alice", "hello\r\n"));
 
+    var new = try tmp.dir.openDir(io, "tenants/acme/domains/example.com/users/alice/Maildir/new", .{ .iterate = true });
+    defer new.close(io);
+    var count: usize = 0;
+    var it = new.iterate();
+    while (try it.next(io)) |_| count += 1;
+    try std.testing.expectEqual(@as(usize, 3), count);
+
+    var tmp_dir = try tmp.dir.openDir(io, "tenants/acme/domains/example.com/users/alice/Maildir/tmp", .{ .iterate = true });
+    defer tmp_dir.close(io);
+    var tmp_it = tmp_dir.iterate();
+    try std.testing.expect(try tmp_it.next(io) == null);
+}
+
+test "listing claims new mail into cur, oldest first" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(allocator, &tmp);
+    defer allocator.free(root);
+    const storage = Storage.init(root);
+
+    for ([_][]const u8{ "one", "two", "three" }) |body| allocator.free(try storage.deliver(io, allocator, "acme", "example.com", "alice", body));
+
+    const messages = try storage.listMailbox(io, allocator, "acme", "example.com", "alice");
+    defer freeMessages(allocator, messages);
     try std.testing.expectEqual(@as(usize, 3), messages.len);
-    try std.testing.expectEqualStrings("1.eml", messages[0].name);
-    try std.testing.expectEqualStrings("2.eml", messages[1].name);
-    try std.testing.expectEqualStrings("10.eml", messages[2].name);
+    for (messages, [_][]const u8{ "one", "two", "three" }) |message, expected| {
+        try std.testing.expect(std.mem.indexOf(u8, message.path, "/cur/") != null);
+        try std.testing.expect(std.mem.endsWith(u8, message.path, ":2,"));
+        const body = try Storage.readMessage(io, allocator, message);
+        defer allocator.free(body);
+        try std.testing.expectEqualStrings(expected, body);
+    }
 }
 
-test "mailbox message read returns content" {
+test "flags live in the file name and survive relisting" {
     const allocator = std.testing.allocator;
+    const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "tenants/acme/domains/example.com/users/alice/Maildir/new");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tenants/acme/domains/example.com/users/alice/Maildir/new/1.eml", .data = "hello" });
-
-    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    const root = try testRoot(allocator, &tmp);
     defer allocator.free(root);
-
     const storage = Storage.init(root);
-    const data = try storage.readMailboxMessage(std.testing.io, allocator, "acme", "example.com", "alice", "1.eml");
-    defer allocator.free(data);
 
-    try std.testing.expectEqualStrings("hello", data);
+    allocator.free(try storage.deliver(io, allocator, "acme", "example.com", "alice", "hello"));
+    {
+        const messages = try storage.listMailbox(io, allocator, "acme", "example.com", "alice");
+        defer freeMessages(allocator, messages);
+        try Storage.setFlags(io, allocator, &messages[0], .{ .seen = true, .flagged = true, .deleted = true });
+        try std.testing.expect(std.mem.endsWith(u8, messages[0].path, ":2,FST"));
+    }
+
+    const messages = try storage.listMailbox(io, allocator, "acme", "example.com", "alice");
+    defer freeMessages(allocator, messages);
+    try std.testing.expectEqual(MessageFlags{ .seen = true, .flagged = true, .deleted = true }, messages[0].flags);
+
+    try Storage.deleteMessage(io, messages[0]);
+    const after = try storage.listMailbox(io, allocator, "acme", "example.com", "alice");
+    defer freeMessages(allocator, after);
+    try std.testing.expectEqual(@as(usize, 0), after.len);
 }
 
-test "message flags round trip through filesystem" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+test "maildir flags parse and format" {
+    try std.testing.expectEqual(MessageFlags{ .draft = true, .answered = true, .seen = true }, MessageFlags.fromFileName("1.M1R1.raven:2,DRS"));
+    try std.testing.expectEqual(MessageFlags{}, MessageFlags.fromFileName("1.M1R1.raven"));
+    var buf: [5]u8 = undefined;
+    try std.testing.expectEqualStrings("DFRST", (MessageFlags{ .seen = true, .answered = true, .flagged = true, .deleted = true, .draft = true }).letters(&buf));
 
-    try tmp.dir.createDirPath(std.testing.io, "tenants/acme/domains/example.com/users/alice/Maildir/new");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tenants/acme/domains/example.com/users/alice/Maildir/new/1.eml", .data = "hello" });
-
-    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
-    defer allocator.free(root);
-
-    const storage = Storage.init(root);
-    try storage.writeMailboxFlags(std.testing.io, allocator, "acme", "example.com", "alice", "1.eml", .{ .seen = true, .flagged = true });
-
-    const messages = try storage.listMailboxMessages(std.testing.io, allocator, "acme", "example.com", "alice");
-    defer freeMailboxMessages(allocator, messages);
-
-    try std.testing.expectEqual(@as(usize, 1), messages.len);
-    try std.testing.expect(messages[0].flags.seen);
-    try std.testing.expect(messages[0].flags.flagged);
-}
-
-test "delete mailbox message removes payload and flags" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    try tmp.dir.createDirPath(std.testing.io, "tenants/acme/domains/example.com/users/alice/Maildir/new");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tenants/acme/domains/example.com/users/alice/Maildir/new/1.eml", .data = "hello" });
-
-    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
-    defer allocator.free(root);
-
-    const storage = Storage.init(root);
-    try storage.writeMailboxFlags(std.testing.io, allocator, "acme", "example.com", "alice", "1.eml", .{ .seen = true });
-    try storage.deleteMailboxMessage(std.testing.io, allocator, "acme", "example.com", "alice", "1.eml");
-
-    const messages = try storage.listMailboxMessages(std.testing.io, allocator, "acme", "example.com", "alice");
-    defer freeMailboxMessages(allocator, messages);
-
-    try std.testing.expectEqual(@as(usize, 0), messages.len);
+    const text = try (MessageFlags{ .seen = true, .flagged = true }).format(std.testing.allocator);
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("(\\Seen \\Flagged)", text);
 }
 
 test "account index path is stable" {
     const allocator = std.testing.allocator;
-    const storage = Storage.init("data");
-
-    const path = try storage.accountIndexPath(allocator, "tenant-a", "example.com");
+    const path = try Storage.init("data").accountIndexPath(allocator, "tenant-a", "example.com");
     defer allocator.free(path);
-
-    try std.testing.expectEqualStrings(
-        "data/tenants/tenant-a/domains/example.com/accounts.txt",
-        path,
-    );
+    try std.testing.expectEqualStrings("data/tenants/tenant-a/domains/example.com/accounts.txt", path);
 }
