@@ -68,6 +68,7 @@ def check_delivery(smtp, imap, expected=1, sender="bob@external.test"):
     fetched = imap.fetch(str(expected), "(BODY.PEEK[])")[1][0][1]
     assert b"Subject: smoke %d" % expected in fetched
     assert b"Return-Path: <%s>" % sender.encode() in fetched and b"([127.0.0.1])" in fetched, fetched  # #11
+    assert imap.search(None, "SUBJECT", '"smoke %d"' % expected)[1][0] == b"%d" % expected  # #17
     summary = imap.fetch(str(expected), "(FLAGS ENVELOPE BODYSTRUCTURE)")[1][0]  # #14
     assert b'"smoke %d"' % expected in summary and b'BODYSTRUCTURE ("text" "plain"' in summary, summary
     # Nothing is expunged in these runs, so the newest message has UID == count (#13).
