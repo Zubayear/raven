@@ -2,6 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 
 const Storage = @import("storage.zig").Storage;
+const address = @import("address.zig");
 
 pub const TenantCatalog = struct {
     entries: []Entry = &.{},
@@ -94,10 +95,13 @@ fn parse(allocator: std.mem.Allocator, raw: []const u8) !TenantCatalog {
         if (!std.ascii.eqlIgnoreCase(keyword, "tenant")) return error.InvalidTenantIndex;
 
         const tenant_name = tokens.next() orelse return error.InvalidTenantIndex;
+        // Tenant names and domains become directory names.
+        if (!address.isLocalPart(tenant_name)) return error.InvalidTenantIndex;
         var domains = std.ArrayList([]u8).empty;
         errdefer domains.deinit(allocator);
 
         while (tokens.next()) |domain| {
+            if (!address.isDomain(domain)) return error.InvalidTenantIndex;
             try domains.append(allocator, try allocator.dupe(u8, domain));
         }
 
@@ -182,4 +186,10 @@ test "tenant catalog loads from filesystem" {
 
     try std.testing.expectEqualStrings("acme", try catalog.resolveTenant(null, "example.com"));
     try std.testing.expectEqualStrings("beta", try catalog.resolveTenant(null, "beta.com"));
+}
+
+test "tenant catalog rejects unsafe names" {
+    const allocator = std.testing.allocator;
+    try std.testing.expectError(error.InvalidTenantIndex, parse(allocator, "tenant ../escape example.com\n"));
+    try std.testing.expectError(error.InvalidTenantIndex, parse(allocator, "tenant acme ../../tmp\n"));
 }

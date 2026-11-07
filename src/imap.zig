@@ -3,6 +3,7 @@ const std = @import("std");
 const Io = std.Io;
 const Config = @import("config.zig").Config;
 const AccountStore = @import("account_index.zig").AccountStore;
+const address = @import("address.zig");
 const Storage = @import("storage.zig").Storage;
 const TenantCatalog = @import("tenant_index.zig").TenantCatalog;
 const TlsServer = @import("tls.zig").TlsServer;
@@ -28,9 +29,9 @@ pub const ImapServer = struct {
     }
 
     pub fn listen(self: *ImapServer, io: Io) !std.Io.net.Server {
-        const address = try std.Io.net.IpAddress.parse(self.config.listen_address, self.config.imap_port);
-        const listener = try address.listen(io, .{ .reuse_address = true });
-        std.debug.print("imap listening on {any}\n", .{address});
+        const ip = try std.Io.net.IpAddress.parse(self.config.listen_address, self.config.imap_port);
+        const listener = try ip.listen(io, .{ .reuse_address = true });
+        std.debug.print("imap listening on {any}\n", .{ip});
         return listener;
     }
 
@@ -109,6 +110,10 @@ pub const ImapServer = struct {
                 const identity = resolveLoginIdentity(self.allocator, self.tenant_catalog, login_arg) catch |err| switch (err) {
                     error.InvalidLogin => {
                         try taggedBad(w, tag, "invalid login");
+                        continue;
+                    },
+                    error.UnknownTenant, error.DomainNotHosted => {
+                        try taggedNo(w, tag, "auth failed");
                         continue;
                     },
                     else => return err,
@@ -377,45 +382,20 @@ const LoginIdentity = struct {
 };
 
 fn resolveLoginIdentity(allocator: std.mem.Allocator, catalog: *const TenantCatalog, raw: []const u8) !LoginIdentity {
-    const address = extractAddress(raw);
-    const at_index = std.mem.indexOfScalar(u8, address, '@') orelse return error.InvalidLogin;
+    const addr = address.parse(raw) catch return error.InvalidLogin;
+    const tenant_name = try catalog.resolveTenant(addr.tag, addr.domain);
 
-    const local_part = std.mem.trim(u8, address[0..at_index], " <>\"");
-    const domain_text = std.mem.trim(u8, address[at_index + 1 ..], " <>\"");
-    if (local_part.len == 0 or domain_text.len == 0) return error.InvalidLogin;
-
-    const split = splitTenantSuffix(local_part);
-    const tenant_name = try catalog.resolveTenant(split.tenant, domain_text);
-
-    return .{
-        .tenant = try allocator.dupe(u8, tenant_name),
-        .domain = try allocator.dupe(u8, domain_text),
-        .user = try allocator.dupe(u8, split.user),
-    };
+    const tenant = try allocator.dupe(u8, tenant_name);
+    errdefer allocator.free(tenant);
+    const domain = try allocator.dupe(u8, addr.domain);
+    errdefer allocator.free(domain);
+    return .{ .tenant = tenant, .domain = domain, .user = try allocator.dupe(u8, addr.user) };
 }
 
 fn freeLoginIdentity(allocator: std.mem.Allocator, identity: LoginIdentity) void {
     allocator.free(identity.tenant);
     allocator.free(identity.domain);
     allocator.free(identity.user);
-}
-
-fn splitTenantSuffix(local_part: []const u8) struct { user: []const u8, tenant: ?[]const u8 } {
-    if (std.mem.lastIndexOfScalar(u8, local_part, '+')) |plus_index| {
-        if (plus_index > 0 and plus_index + 1 < local_part.len) {
-            return .{ .user = local_part[0..plus_index], .tenant = local_part[plus_index + 1 ..] };
-        }
-    }
-    return .{ .user = local_part, .tenant = null };
-}
-
-fn extractAddress(raw: []const u8) []const u8 {
-    if (std.mem.indexOfScalar(u8, raw, '<')) |open| {
-        if (std.mem.lastIndexOfScalar(u8, raw, '>')) |close| {
-            if (close > open + 1) return raw[open + 1 .. close];
-        }
-    }
-    return raw;
 }
 
 fn parseFlagsList(raw: []const u8) Storage.MessageFlags {
@@ -563,4 +543,13 @@ test "imap session logs in, selects and fetches" {
             return error.TestExpectedEqual;
         }
     }
+}
+
+test "resolveLoginIdentity rejects traversal" {
+    const allocator = std.testing.allocator;
+    var catalog = try @import("tenant_index.zig").parseForTest(allocator, "tenant acme example.com\n");
+    defer catalog.deinit(allocator);
+
+    try std.testing.expectError(error.InvalidLogin, resolveLoginIdentity(allocator, &catalog, "../../x@example.com"));
+    try std.testing.expectError(error.InvalidLogin, resolveLoginIdentity(allocator, &catalog, "x@../../tmp"));
 }

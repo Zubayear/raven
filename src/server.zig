@@ -2,6 +2,7 @@ const std = @import("std");
 
 const Io = std.Io;
 const AccountStore = @import("account_index.zig").AccountStore;
+const address = @import("address.zig");
 const Config = @import("config.zig").Config;
 const AliasTable = @import("alias_index.zig").AliasTable;
 const Storage = @import("storage.zig").Storage;
@@ -23,9 +24,9 @@ pub const Server = struct {
     }
 
     pub fn listen(self: *Server, io: Io) !std.Io.net.Server {
-        const address = try std.Io.net.IpAddress.parse(self.config.listen_address, self.config.listen_port);
-        const listener = try address.listen(io, .{ .reuse_address = true });
-        std.debug.print("smtp listening on {any}\n", .{address});
+        const ip = try std.Io.net.IpAddress.parse(self.config.listen_address, self.config.listen_port);
+        const listener = try ip.listen(io, .{ .reuse_address = true });
+        std.debug.print("smtp listening on {any}\n", .{ip});
         return listener;
     }
 
@@ -364,32 +365,8 @@ fn readDataBlock(allocator: std.mem.Allocator, reader: *Io.Reader) ![]u8 {
 }
 
 fn parseRecipient(raw: []const u8) !RecipientRequest {
-    const address = extractAddress(raw);
-    const at_index = std.mem.indexOfScalar(u8, address, '@') orelse return error.InvalidRecipient;
-
-    const local_part = std.mem.trim(u8, address[0..at_index], " <>\"");
-    if (local_part.len == 0) return error.InvalidRecipient;
-
-    const split = splitTenantSuffix(local_part);
-
-    const domain_text = std.mem.trim(u8, address[at_index + 1 ..], " <>\"");
-    if (domain_text.len == 0) return error.InvalidRecipient;
-
-    return .{
-        .tenant_hint = split.tenant,
-        .domain = domain_text,
-        .user = split.user,
-    };
-}
-
-fn splitTenantSuffix(local_part: []const u8) struct { user: []const u8, tenant: ?[]const u8 } {
-    if (std.mem.lastIndexOfScalar(u8, local_part, '+')) |plus_index| {
-        if (plus_index > 0 and plus_index + 1 < local_part.len) {
-            return .{ .user = local_part[0..plus_index], .tenant = local_part[plus_index + 1 ..] };
-        }
-    }
-
-    return .{ .user = local_part, .tenant = null };
+    const addr = address.parse(raw) catch return error.InvalidRecipient;
+    return .{ .tenant_hint = addr.tag, .domain = addr.domain, .user = addr.user };
 }
 
 fn resolveRecipient(
@@ -415,15 +392,6 @@ fn resolveRecipient(
     errdefer allocator.free(user);
 
     return .{ .tenant = tenant, .domain = domain, .user = user };
-}
-
-fn extractAddress(raw: []const u8) []const u8 {
-    if (std.mem.indexOfScalar(u8, raw, '<')) |open| {
-        if (std.mem.lastIndexOfScalar(u8, raw, '>')) |close| {
-            if (close > open + 1) return raw[open + 1 .. close];
-        }
-    }
-    return raw;
 }
 
 fn clearRecipients(allocator: std.mem.Allocator, recipients: *std.ArrayList(Recipient)) void {
@@ -645,4 +613,28 @@ test "smtp session delivers a pipelined transaction" {
     const body = try server.storage.readMailboxMessage(std.testing.io, allocator, "acme", "example.com", "alice", messages[0].name);
     defer allocator.free(body);
     try std.testing.expectEqualStrings("Subject: hi\r\n\r\n.dot\r\n", body);
+}
+
+test "smtp session rejects path traversal in addresses" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..], "data" });
+    defer allocator.free(root);
+
+    var catalog = try TenantIndex.parseForTest(allocator, "tenant acme example.com\n");
+    defer catalog.deinit(allocator);
+
+    var server = Server.init(allocator, .{ .data_dir = root });
+    var in: Io.Reader = .fixed("MAIL FROM:<../../x@external.test>\r\nMAIL FROM:<bob@external.test>\r\n" ++
+        "RCPT TO:<../../../../../escape@example.com>\r\nRCPT TO:<alice@../../../escape>\r\nDATA\r\nQUIT\r\n");
+    var out: Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    try server.handleClient(std.testing.io, &in, &out.writer, &catalog);
+
+    try std.testing.expectEqualStrings("220 localhost ESMTP raven ready\r\n501 bad sender\r\n250 ok\r\n" ++
+        "501 bad recipient\r\n501 bad recipient\r\n503 need rcpt first\r\n221 bye\r\n", out.written());
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "escape", .{}));
+    try std.testing.expectError(error.FileNotFound, tmp.dir.access(std.testing.io, "data", .{}));
 }
