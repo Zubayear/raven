@@ -2,6 +2,42 @@ const std = @import("std");
 const Io = std.Io;
 
 const Storage = @import("storage.zig").Storage;
+const TenantCatalog = @import("tenant_index.zig").TenantCatalog;
+const address = @import("address.zig");
+
+/// A mailbox owner. All names come from the index files, never from client
+/// input, so they are safe to use in paths.
+pub const Identity = struct {
+    tenant: []u8,
+    domain: []u8,
+    user: []u8,
+
+    pub fn init(allocator: std.mem.Allocator, tenant: []const u8, domain: []const u8, user: []const u8) !Identity {
+        const owned_tenant = try allocator.dupe(u8, tenant);
+        errdefer allocator.free(owned_tenant);
+        const owned_domain = try allocator.dupe(u8, domain);
+        errdefer allocator.free(owned_domain);
+        return .{ .tenant = owned_tenant, .domain = owned_domain, .user = try allocator.dupe(u8, user) };
+    }
+
+    pub fn deinit(self: Identity, allocator: std.mem.Allocator) void {
+        allocator.free(self.tenant);
+        allocator.free(self.domain);
+        allocator.free(self.user);
+    }
+};
+
+/// Checks `login` (`user@domain`) and `password` against the domain's
+/// accounts. Every failure is `error.AuthFailed`, so callers can't leak why.
+pub fn authenticate(allocator: std.mem.Allocator, io: Io, storage: Storage, catalog: *const TenantCatalog, login: []const u8, password: []const u8) !Identity {
+    const addr = address.parse(login) catch return error.AuthFailed;
+    const hosted = catalog.find(addr.domain) orelse return error.AuthFailed;
+    var accounts = try AccountStore.load(allocator, io, storage, hosted.tenant, hosted.domain);
+    defer accounts.deinit(allocator);
+    const account = accounts.find(addr.user) orelse return error.AuthFailed;
+    if (!account.verify(password)) return error.AuthFailed;
+    return Identity.init(allocator, hosted.tenant, hosted.domain, account.user);
+}
 
 pub const AccountStore = struct {
     entries: []Entry = &.{},
@@ -9,6 +45,11 @@ pub const AccountStore = struct {
     pub const Entry = struct {
         user: []u8,
         password_hash: []u8,
+
+        pub fn verify(self: Entry, password: []const u8) bool {
+            var hash_buf: [64]u8 = undefined;
+            return std.ascii.eqlIgnoreCase(self.password_hash, passwordHashHex(password, &hash_buf));
+        }
     };
 
     pub fn load(allocator: std.mem.Allocator, io: Io, storage: Storage, tenant: []const u8, domain: []const u8) !AccountStore {
@@ -31,14 +72,13 @@ pub const AccountStore = struct {
 
     pub fn verify(self: *const AccountStore, user: []const u8, password: []const u8) bool {
         const entry = self.find(user) orelse return false;
-        var hash_buf: [64]u8 = undefined;
-        const computed = passwordHashHex(password, &hash_buf);
-        return std.ascii.eqlIgnoreCase(entry.password_hash, computed);
+        return entry.verify(password);
     }
 
-    fn find(self: *const AccountStore, user: []const u8) ?Entry {
+    /// Local parts are matched case-insensitively.
+    pub fn find(self: *const AccountStore, user: []const u8) ?Entry {
         for (self.entries) |entry| {
-            if (std.mem.eql(u8, entry.user, user)) return entry;
+            if (std.ascii.eqlIgnoreCase(entry.user, user)) return entry;
         }
         return null;
     }
@@ -144,4 +184,37 @@ test "account store loads from filesystem" {
     defer store.deinit(allocator);
 
     try std.testing.expect(store.verify("alice", "secret"));
+}
+
+test "authenticate checks domain, user and password" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var hash_buf: [64]u8 = undefined;
+    const accounts = try std.fmt.allocPrint(allocator, "alice {s}\n", .{passwordHashHex("secret", &hash_buf)});
+    defer allocator.free(accounts);
+    try tmp.dir.createDirPath(std.testing.io, "tenants/acme/domains/example.com");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tenants/acme/domains/example.com/accounts.txt", .data = accounts });
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(root);
+
+    var catalog = try @import("tenant_index.zig").parseForTest(allocator, "tenant acme example.com\n");
+    defer catalog.deinit(allocator);
+    const storage = Storage.init(root);
+
+    const identity = try authenticate(allocator, std.testing.io, storage, &catalog, "Alice@EXAMPLE.com", "secret");
+    defer identity.deinit(allocator);
+    try std.testing.expectEqualStrings("acme", identity.tenant);
+    try std.testing.expectEqualStrings("example.com", identity.domain);
+    try std.testing.expectEqualStrings("alice", identity.user);
+
+    for ([_][2][]const u8{
+        .{ "alice@example.com", "wrong" },
+        .{ "bob@example.com", "secret" },
+        .{ "alice@other.com", "secret" },
+        .{ "../alice@example.com", "secret" },
+    }) |attempt| {
+        try std.testing.expectError(error.AuthFailed, authenticate(allocator, std.testing.io, storage, &catalog, attempt[0], attempt[1]));
+    }
 }

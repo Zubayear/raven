@@ -192,12 +192,13 @@ pub const MessageFlags = struct {
 /// `<seconds>.M<microseconds>R<random>.raven`: unique across processes and
 /// restarts, and sorts in delivery order.
 fn uniqueName(io: Io, allocator: std.mem.Allocator) ![]u8 {
-    const ns = Io.Clock.real.now(io).nanoseconds;
+    // Unsigned on purpose: a signed value formatted with a width gets a '+'.
+    const ns: u96 = @intCast(Io.Clock.real.now(io).nanoseconds);
     var random: [8]u8 = undefined;
     io.random(&random);
     return std.fmt.allocPrint(allocator, "{d}.M{d:0>6}R{x:0>16}.raven", .{
-        @divFloor(ns, std.time.ns_per_s),
-        @mod(@divFloor(ns, std.time.ns_per_us), std.time.us_per_s),
+        ns / std.time.ns_per_s,
+        ns / std.time.ns_per_us % std.time.us_per_s,
         std.mem.readInt(u64, &random, .little),
     });
 }
@@ -321,6 +322,14 @@ test "flags live in the file name and survive relisting" {
     const after = try storage.listMailbox(io, allocator, "acme", "example.com", "alice");
     defer freeMessages(allocator, after);
     try std.testing.expectEqual(@as(usize, 0), after.len);
+}
+
+test "unique names are well formed" {
+    const name = try uniqueName(std.testing.io, std.testing.allocator);
+    defer std.testing.allocator.free(name);
+    try std.testing.expect(std.mem.indexOfAny(u8, name, "+-/: ") == null);
+    try std.testing.expect(std.mem.endsWith(u8, name, ".raven"));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, name, ".M"));
 }
 
 test "maildir flags parse and format" {

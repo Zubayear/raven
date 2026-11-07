@@ -30,11 +30,12 @@ pub const AliasTable = struct {
         self.* = .{};
     }
 
-    pub fn resolve(self: *const AliasTable, local_part: []const u8) []const u8 {
+    /// Returns the target user if `local_part` is an alias (case-insensitive).
+    pub fn find(self: *const AliasTable, local_part: []const u8) ?[]const u8 {
         for (self.entries) |entry| {
-            if (std.mem.eql(u8, entry.alias, local_part)) return entry.target;
+            if (std.ascii.eqlIgnoreCase(entry.alias, local_part)) return entry.target;
         }
-        return local_part;
+        return null;
     }
 };
 
@@ -107,8 +108,8 @@ test "alias table resolves or falls back" {
     var table = try parse(allocator, raw);
     defer table.deinit(allocator);
 
-    try std.testing.expectEqualStrings("team-sales", table.resolve("sales"));
-    try std.testing.expectEqualStrings("alice", table.resolve("alice"));
+    try std.testing.expectEqualStrings("team-sales", table.find("Sales").?);
+    try std.testing.expect(table.find("alice") == null);
 }
 
 test "alias table loads from filesystem" {
@@ -131,7 +132,7 @@ test "alias table loads from filesystem" {
     var table = try AliasTable.load(allocator, std.testing.io, Storage.init(root), "acme", "example.com");
     defer table.deinit(allocator);
 
-    try std.testing.expectEqualStrings("team-sales", table.resolve("sales"));
+    try std.testing.expectEqualStrings("team-sales", table.find("sales").?);
 }
 
 test "alias table rejects unsafe targets" {

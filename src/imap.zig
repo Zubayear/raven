@@ -2,8 +2,8 @@ const std = @import("std");
 
 const Io = std.Io;
 const Config = @import("config.zig").Config;
-const AccountStore = @import("account_index.zig").AccountStore;
-const address = @import("address.zig");
+const account_index = @import("account_index.zig");
+const Identity = account_index.Identity;
 const Storage = @import("storage.zig").Storage;
 const Message = @import("storage.zig").Message;
 const MessageFlags = @import("storage.zig").MessageFlags;
@@ -80,27 +80,13 @@ pub const ImapServer = struct {
                     continue;
                 };
 
-                const identity = resolveLoginIdentity(self.allocator, self.tenant_catalog, login_arg) catch |err| switch (err) {
-                    error.InvalidLogin => {
-                        try taggedBad(w, tag, "invalid login");
-                        continue;
-                    },
-                    error.UnknownTenant, error.DomainNotHosted => {
+                const identity = account_index.authenticate(self.allocator, fs_io, self.storage, self.tenant_catalog, login_arg, password) catch |err| switch (err) {
+                    error.AuthFailed => {
                         try taggedNo(w, tag, "auth failed");
                         continue;
                     },
                     else => return err,
                 };
-
-                var account_store = try AccountStore.load(self.allocator, fs_io, self.storage, identity.tenant, identity.domain);
-                defer account_store.deinit(self.allocator);
-
-                if (!account_store.verify(identity.user, password)) {
-                    freeLoginIdentity(self.allocator, identity);
-                    try taggedNo(w, tag, "auth failed");
-                    continue;
-                }
-
                 try session.setIdentity(self.allocator, identity);
                 try taggedOk(w, tag, "LOGIN completed");
                 continue;
@@ -285,7 +271,7 @@ const Session = struct {
         return self.tenant != null and self.domain != null and self.user != null;
     }
 
-    fn setIdentity(self: *Session, allocator: std.mem.Allocator, identity: LoginIdentity) !void {
+    fn setIdentity(self: *Session, allocator: std.mem.Allocator, identity: Identity) !void {
         self.clearSelected(allocator);
         self.clearIdentity(allocator);
         self.tenant = identity.tenant;
@@ -330,29 +316,6 @@ const Session = struct {
     }
 };
 
-const LoginIdentity = struct {
-    tenant: []u8,
-    domain: []u8,
-    user: []u8,
-};
-
-fn resolveLoginIdentity(allocator: std.mem.Allocator, catalog: *const TenantCatalog, raw: []const u8) !LoginIdentity {
-    const addr = address.parse(raw) catch return error.InvalidLogin;
-    const tenant_name = try catalog.resolveTenant(addr.tag, addr.domain);
-
-    const tenant = try allocator.dupe(u8, tenant_name);
-    errdefer allocator.free(tenant);
-    const domain = try allocator.dupe(u8, addr.domain);
-    errdefer allocator.free(domain);
-    return .{ .tenant = tenant, .domain = domain, .user = try allocator.dupe(u8, addr.user) };
-}
-
-fn freeLoginIdentity(allocator: std.mem.Allocator, identity: LoginIdentity) void {
-    allocator.free(identity.tenant);
-    allocator.free(identity.domain);
-    allocator.free(identity.user);
-}
-
 fn parseFlagsList(raw: []const u8) MessageFlags {
     var flags = MessageFlags{};
     const trimmed = std.mem.trim(u8, raw, " \t");
@@ -395,46 +358,6 @@ fn taggedBad(w: *Io.Writer, tag: []const u8, msg: []const u8) !void {
     try w.writeAll(" BAD ");
     try w.writeAll(msg);
     try w.writeAll("\r\n");
-}
-
-test "resolveLoginIdentity defaults tenant to domain" {
-    const allocator = std.testing.allocator;
-    var catalog = try @import("tenant_index.zig").parseForTest(allocator, "tenant acme example.com\n");
-    defer catalog.deinit(allocator);
-
-    const identity = try resolveLoginIdentity(allocator, &catalog, "alice@example.com");
-    defer allocator.free(identity.tenant);
-    defer allocator.free(identity.domain);
-    defer allocator.free(identity.user);
-
-    try std.testing.expectEqualStrings("acme", identity.tenant);
-    try std.testing.expectEqualStrings("example.com", identity.domain);
-    try std.testing.expectEqualStrings("alice", identity.user);
-}
-
-test "resolveLoginIdentity supports tenant suffix" {
-    const allocator = std.testing.allocator;
-    var catalog = try @import("tenant_index.zig").parseForTest(allocator, "tenant acme example.com\n");
-    defer catalog.deinit(allocator);
-
-    const identity = try resolveLoginIdentity(allocator, &catalog, "alice+acme@example.com");
-    defer allocator.free(identity.tenant);
-    defer allocator.free(identity.domain);
-    defer allocator.free(identity.user);
-
-    try std.testing.expectEqualStrings("acme", identity.tenant);
-    try std.testing.expectEqualStrings("example.com", identity.domain);
-    try std.testing.expectEqualStrings("alice", identity.user);
-}
-
-test "login identity helper frees cleanly" {
-    const allocator = std.testing.allocator;
-    const identity = LoginIdentity{
-        .tenant = try allocator.dupe(u8, "acme"),
-        .domain = try allocator.dupe(u8, "example.com"),
-        .user = try allocator.dupe(u8, "alice"),
-    };
-    freeLoginIdentity(allocator, identity);
 }
 
 test "parseFlagsList reads standard flags" {
@@ -498,13 +421,4 @@ test "imap session logs in, selects and fetches" {
             return error.TestExpectedEqual;
         }
     }
-}
-
-test "resolveLoginIdentity rejects traversal" {
-    const allocator = std.testing.allocator;
-    var catalog = try @import("tenant_index.zig").parseForTest(allocator, "tenant acme example.com\n");
-    defer catalog.deinit(allocator);
-
-    try std.testing.expectError(error.InvalidLogin, resolveLoginIdentity(allocator, &catalog, "../../x@example.com"));
-    try std.testing.expectError(error.InvalidLogin, resolveLoginIdentity(allocator, &catalog, "x@../../tmp"));
 }
