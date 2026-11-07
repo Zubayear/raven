@@ -3,7 +3,7 @@
 Raven is a small mail server written in Zig.
 It currently provides SMTP, IMAP, filesystem-backed storage, tenant-aware routing, and optional TLS.
 
-![Zig](https://img.shields.io/badge/Zig-0.16-%23f7a41d)
+![Zig](https://img.shields.io/badge/Zig-0.17-%23f7a41d)
 ![License](https://img.shields.io/badge/License-MIT-blue)
 ![TLS](https://img.shields.io/badge/TLS-OpenSSL-2d7ff9)
 
@@ -19,9 +19,11 @@ It currently provides SMTP, IMAP, filesystem-backed storage, tenant-aware routin
 
 ## Requirements
 
-- Zig 0.16
-- OpenSSL 3
-- macOS build support currently expects Homebrew OpenSSL at `/opt/homebrew/opt/openssl@3`
+- Zig 0.17
+- OpenSSL 3 or newer, discoverable through `pkg-config`
+  - macOS: `brew install openssl pkg-config`
+  - Debian/Ubuntu: `apt install libssl-dev pkg-config`
+- Python 3 and the `openssl` CLI for the smoke test
 
 ## Build
 
@@ -117,8 +119,8 @@ tls_key_file = key.pem
 
 ## Testing
 
-- `zig build test` runs the unit test suite.
-- For a manual smoke test, connect to the SMTP and IMAP ports and verify the greeting banners.
+- `zig build test` runs the unit tests, including SMTP and IMAP session transcripts.
+- `zig build smoke` starts the real binary (plain and TLS), delivers a message over SMTP, and reads it back over IMAP.
 
 ## Architecture
 

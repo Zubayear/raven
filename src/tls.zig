@@ -1,37 +1,26 @@
 const std = @import("std");
-
-const c = @cImport({
-    @cInclude("openssl/err.h");
-    @cInclude("openssl/pem.h");
-    @cInclude("openssl/ssl.h");
-});
+const Io = std.Io;
+const c = @import("openssl");
 
 pub const TlsServer = struct {
-    allocator: std.mem.Allocator,
     ctx: *c.SSL_CTX,
-    vtable: std.Io.VTable,
 
     pub fn init(allocator: std.mem.Allocator, cert_file: []const u8, key_file: []const u8) !TlsServer {
-        const ctx = c.SSL_CTX_new(c.TLS_server_method()) orelse return error.TlsInitFailed;
+        const ctx = c.SSL_CTX_new(c.TLS_server_method()) orelse return sslError("SSL_CTX_new");
         errdefer c.SSL_CTX_free(ctx);
 
-        _ = c.SSL_CTX_set_min_proto_version(ctx, c.TLS1_2_VERSION);
+        if (c.SSL_CTX_set_min_proto_version(ctx, c.TLS1_2_VERSION) != 1) return sslError("set min TLS version");
 
-        try useCertificateFile(ctx, allocator, cert_file);
-        try usePrivateKeyFile(ctx, allocator, key_file);
-        if (c.SSL_CTX_check_private_key(ctx) != 1) return error.TlsInitFailed;
+        const cert_z = try allocator.dupeSentinel(u8, cert_file, 0);
+        defer allocator.free(cert_z);
+        if (c.SSL_CTX_use_certificate_chain_file(ctx, cert_z.ptr) != 1) return sslError("load certificate");
 
-        var vtable = std.Options.debug_io.vtable.*;
-        vtable.netRead = netRead;
-        vtable.netWrite = netWrite;
-        vtable.netClose = netClose;
-        vtable.netShutdown = netShutdown;
+        const key_z = try allocator.dupeSentinel(u8, key_file, 0);
+        defer allocator.free(key_z);
+        if (c.SSL_CTX_use_PrivateKey_file(ctx, key_z.ptr, c.SSL_FILETYPE_PEM) != 1) return sslError("load private key");
+        if (c.SSL_CTX_check_private_key(ctx) != 1) return sslError("certificate/key mismatch");
 
-        return .{
-            .allocator = allocator,
-            .ctx = ctx,
-            .vtable = vtable,
-        };
+        return .{ .ctx = ctx };
     }
 
     pub fn deinit(self: *TlsServer) void {
@@ -39,143 +28,78 @@ pub const TlsServer = struct {
         self.* = undefined;
     }
 
-    pub fn accept(self: *TlsServer, socket_handle: std.posix.fd_t) !TlsConnection {
+    /// Performs the server-side handshake on `fd`. The returned connection
+    /// must not be moved once its `reader`/`writer` are in use.
+    pub fn accept(self: *TlsServer, fd: std.posix.fd_t, read_buffer: []u8, write_buffer: []u8) !Connection {
         const ssl = c.SSL_new(self.ctx) orelse return error.TlsHandshakeFailed;
         errdefer c.SSL_free(ssl);
 
-        if (c.SSL_set_fd(ssl, @intCast(socket_handle)) != 1) return error.TlsHandshakeFailed;
-        _ = c.SSL_set_accept_state(ssl);
+        if (c.SSL_set_fd(ssl, fd) != 1) return error.TlsHandshakeFailed;
+        if (c.SSL_accept(ssl) != 1) return error.TlsHandshakeFailed;
 
-        while (true) {
-            const rc = c.SSL_accept(ssl);
-            if (rc == 1) break;
-            const err = c.SSL_get_error(ssl, rc);
-            std.debug.print("tls accept rc={d} err={d}\n", .{ rc, err });
-            switch (err) {
-                c.SSL_ERROR_WANT_READ, c.SSL_ERROR_WANT_WRITE => continue,
-                else => return error.TlsHandshakeFailed,
-            }
-        }
-
-        return .{ .server = self, .ssl = ssl, .socket_handle = socket_handle };
+        return .{
+            .ssl = ssl,
+            .reader = .{ .vtable = &.{ .stream = stream }, .buffer = read_buffer, .seek = 0, .end = 0 },
+            .writer = .{ .vtable = &.{ .drain = drain }, .buffer = write_buffer },
+        };
     }
 };
 
-pub const TlsConnection = struct {
-    server: *TlsServer,
-    ssl: ?*c.SSL,
-    socket_handle: ?std.posix.fd_t,
+/// A TLS session over a socket owned by the caller; `deinit` does not close
+/// the socket.
+pub const Connection = struct {
+    ssl: *c.SSL,
+    reader: Io.Reader,
+    writer: Io.Writer,
 
-    pub fn io(self: *TlsConnection) std.Io {
-        return .{ .userdata = self, .vtable = &self.server.vtable };
-    }
-
-    pub fn deinit(self: *TlsConnection) void {
-        self.close();
+    pub fn deinit(self: *Connection) void {
+        _ = c.SSL_shutdown(self.ssl);
+        c.SSL_free(self.ssl);
         self.* = undefined;
     }
 
-    pub fn close(self: *TlsConnection) void {
-        const ssl = self.ssl orelse return;
-        self.ssl = null;
-        _ = c.SSL_shutdown(ssl);
-        if (self.socket_handle) |fd| {
-            self.socket_handle = null;
-            _ = std.posix.system.close(fd);
+    fn writeAll(self: *Connection, bytes: []const u8) Io.Writer.Error!void {
+        var rest = bytes;
+        while (rest.len > 0) {
+            const n = c.SSL_write(self.ssl, rest.ptr, @intCast(@min(rest.len, std.math.maxInt(c_int))));
+            if (n <= 0) return error.WriteFailed;
+            rest = rest[@intCast(n)..];
         }
-        c.SSL_free(ssl);
     }
 };
 
-fn useCertificateFile(ctx: *c.SSL_CTX, allocator: std.mem.Allocator, path: []const u8) !void {
-    const z = try allocator.dupeZ(u8, path);
-    defer allocator.free(z);
-    if (c.SSL_CTX_use_certificate_file(ctx, z.ptr, c.SSL_FILETYPE_PEM) != 1) return error.TlsInitFailed;
+fn stream(r: *Io.Reader, w: *Io.Writer, limit: Io.Limit) Io.Reader.StreamError!usize {
+    const conn: *Connection = @alignCast(@fieldParentPtr("reader", r));
+    const dest = limit.slice(try w.writableSliceGreedy(1));
+    const n = c.SSL_read(conn.ssl, dest.ptr, @intCast(@min(dest.len, std.math.maxInt(c_int))));
+    if (n <= 0) return switch (c.SSL_get_error(conn.ssl, n)) {
+        c.SSL_ERROR_ZERO_RETURN => error.EndOfStream,
+        else => error.ReadFailed,
+    };
+    w.advance(@intCast(n));
+    return @intCast(n);
 }
 
-fn usePrivateKeyFile(ctx: *c.SSL_CTX, allocator: std.mem.Allocator, path: []const u8) !void {
-    const z = try allocator.dupeZ(u8, path);
-    defer allocator.free(z);
-    if (c.SSL_CTX_use_PrivateKey_file(ctx, z.ptr, c.SSL_FILETYPE_PEM) != 1) return error.TlsInitFailed;
-}
+fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!usize {
+    const conn: *Connection = @alignCast(@fieldParentPtr("writer", w));
+    try conn.writeAll(w.buffered());
+    w.end = 0;
 
-fn netRead(userdata: ?*anyopaque, src: std.Io.net.Socket.Handle, data: [][]u8) std.Io.net.Stream.Reader.Error!usize {
-    const conn: *TlsConnection = @ptrCast(@alignCast(userdata));
-    _ = src;
-    const ssl = conn.ssl orelse return error.ConnectionResetByPeer;
-
-    var total: usize = 0;
-    for (data) |buf| {
-        if (buf.len == 0) continue;
-
-        while (true) {
-            const n = c.SSL_read(ssl, buf.ptr, @intCast(buf.len));
-            if (n > 0) {
-                total += @intCast(n);
-                break;
-            }
-
-            const err = c.SSL_get_error(ssl, n);
-            switch (err) {
-                c.SSL_ERROR_ZERO_RETURN => return total,
-                c.SSL_ERROR_WANT_READ, c.SSL_ERROR_WANT_WRITE => continue,
-                c.SSL_ERROR_SYSCALL, c.SSL_ERROR_SSL => return error.ConnectionResetByPeer,
-                else => return error.ConnectionResetByPeer,
-            }
-        }
+    var written: usize = 0;
+    for (data[0 .. data.len - 1]) |bytes| {
+        try conn.writeAll(bytes);
+        written += bytes.len;
     }
-
-    return total;
-}
-
-fn netWrite(userdata: ?*anyopaque, dest: std.Io.net.Socket.Handle, header: []const u8, data: []const []const u8, splat: usize) std.Io.net.Stream.Writer.Error!usize {
-    const conn: *TlsConnection = @ptrCast(@alignCast(userdata));
-    _ = dest;
-    const ssl = conn.ssl orelse return error.Unexpected;
-
-    var total: usize = 0;
-    total += try writeChunk(ssl, header);
-    if (data.len == 0) return total;
-
-    for (data[0 .. data.len - 1]) |chunk| {
-        total += try writeChunk(ssl, chunk);
-    }
-    const last = data[data.len - 1];
     for (0..splat) |_| {
-        total += try writeChunk(ssl, last);
+        try conn.writeAll(data[data.len - 1]);
+        written += data[data.len - 1].len;
     }
-
-    return total;
+    return written;
 }
 
-fn netClose(userdata: ?*anyopaque, handles: []const std.Io.net.Socket.Handle) void {
-    const conn: *TlsConnection = @ptrCast(@alignCast(userdata));
-    _ = handles;
-    conn.close();
-}
-
-fn netShutdown(userdata: ?*anyopaque, handle: std.Io.net.Socket.Handle, how: std.Io.net.ShutdownHow) std.Io.net.ShutdownError!void {
-    const conn: *TlsConnection = @ptrCast(@alignCast(userdata));
-    _ = handle;
-    _ = how;
-    if (conn.ssl) |ssl| _ = c.SSL_shutdown(ssl);
-}
-
-fn writeChunk(ssl: *c.SSL, bytes: []const u8) std.Io.net.Stream.Writer.Error!usize {
-    var offset: usize = 0;
-    while (offset < bytes.len) {
-        const n = c.SSL_write(ssl, bytes[offset..].ptr, @intCast(bytes.len - offset));
-        if (n > 0) {
-            offset += @intCast(n);
-            continue;
-        }
-
-        const err = c.SSL_get_error(ssl, n);
-        switch (err) {
-            c.SSL_ERROR_WANT_READ, c.SSL_ERROR_WANT_WRITE => continue,
-            c.SSL_ERROR_SYSCALL, c.SSL_ERROR_SSL => return error.Unexpected,
-            else => return error.Unexpected,
-        }
-    }
-    return bytes.len;
+fn sslError(what: []const u8) error{TlsInitFailed} {
+    var buf: [256]u8 = undefined;
+    c.ERR_error_string_n(c.ERR_get_error(), &buf, buf.len);
+    std.debug.print("tls: {s} failed: {s}\n", .{ what, std.mem.sliceTo(&buf, 0) });
+    return error.TlsInitFailed;
 }

@@ -4,7 +4,6 @@ const Io = std.Io;
 const Config = @import("config.zig").Config;
 const AccountStore = @import("account_index.zig").AccountStore;
 const Storage = @import("storage.zig").Storage;
-const freeMailboxMessages = @import("storage.zig").freeMailboxMessages;
 const TenantCatalog = @import("tenant_index.zig").TenantCatalog;
 const TlsServer = @import("tls.zig").TlsServer;
 
@@ -28,15 +27,6 @@ pub const ImapServer = struct {
         };
     }
 
-    pub fn run(self: *ImapServer) !void {
-        const io = std.Options.debug_io;
-        var listener = try self.listen(io);
-        defer listener.deinit(io);
-
-        var shutdown = std.atomic.Value(bool).init(false);
-        try self.serve(io, &listener, &shutdown, null);
-    }
-
     pub fn listen(self: *ImapServer, io: Io) !std.Io.net.Server {
         const address = try std.Io.net.IpAddress.parse(self.config.listen_address, self.config.imap_port);
         const listener = try address.listen(io, .{ .reuse_address = true });
@@ -44,46 +34,35 @@ pub const ImapServer = struct {
         return listener;
     }
 
-    pub fn serve(self: *ImapServer, fs_io: Io, listener: *std.Io.net.Server, shutdown: *const std.atomic.Value(bool), tls_server: ?*TlsServer) !void {
-        while (!shutdown.load(.seq_cst)) {
-            var stream = listener.accept(fs_io) catch |err| switch (err) {
-                error.SocketNotListening => return,
+    pub fn serve(self: *ImapServer, io: Io, listener: *std.Io.net.Server, shutdown: *const std.atomic.Value(bool), tls_server: ?*TlsServer) !void {
+        while (!shutdown.load(.acquire)) {
+            const stream = listener.accept(io) catch |err| switch (err) {
+                error.SocketNotListening, error.Canceled => return,
                 else => {
                     std.debug.print("imap accept error: {}\n", .{err});
                     continue;
                 },
             };
-
-            if (tls_server) |server| {
-                var tls_conn = server.accept(stream.socket.handle) catch |err| {
-                    std.debug.print("imap tls handshake error: {}\n", .{err});
-                    stream.close(fs_io);
-                    continue;
-                };
-                defer tls_conn.deinit();
-                const net_io = tls_conn.io();
-                defer stream.close(net_io);
-                self.handleClient(fs_io, net_io, stream) catch |err| {
-                    std.debug.print("imap session error: {}\n", .{err});
-                };
-                continue;
-            }
-
-            defer stream.close(fs_io);
-            self.handleClient(fs_io, fs_io, stream) catch |err| {
+            defer stream.close(io);
+            self.serveConnection(io, stream, tls_server) catch |err| {
                 std.debug.print("imap session error: {}\n", .{err});
             };
         }
     }
 
-    fn handleClient(self: *ImapServer, fs_io: Io, net_io: Io, stream: std.Io.net.Stream) !void {
+    fn serveConnection(self: *ImapServer, io: Io, stream: std.Io.net.Stream, tls_server: ?*TlsServer) !void {
         var read_buf: [1024]u8 = undefined;
-        var write_buf: [0]u8 = undefined;
-        var reader = stream.reader(net_io, &read_buf);
-        var writer = stream.writer(net_io, &write_buf);
-        const r = &reader.interface;
-        const w = &writer.interface;
+        if (tls_server) |server| {
+            var conn = try server.accept(stream.socket.handle, &read_buf, &.{});
+            defer conn.deinit();
+            return self.handleClient(io, &conn.reader, &conn.writer);
+        }
+        var reader = stream.reader(io, &read_buf);
+        var writer = stream.writer(io, &.{});
+        return self.handleClient(io, &reader.interface, &writer.interface);
+    }
 
+    fn handleClient(self: *ImapServer, fs_io: Io, r: *Io.Reader, w: *Io.Writer) !void {
         try w.writeAll("* OK IMAP4rev1 raven ready\r\n");
 
         var session = Session{};
@@ -183,7 +162,7 @@ pub const ImapServer = struct {
                 try w.writeAll("* FLAGS ");
                 try w.writeAll(flags_line);
                 try w.writeAll("\r\n");
-                try w.print("* {d} EXISTS\r\n", .{session.messages.len});
+                try w.print("* {d} EXISTS\r\n", .{session.messages.items.len});
                 try w.writeAll("* 0 RECENT\r\n");
                 try w.writeAll("* OK [UIDVALIDITY 1] stable\r\n");
                 try taggedOk(w, tag, if (std.ascii.eqlIgnoreCase(command, "EXAMINE")) "READ-ONLY selected" else "READ-WRITE selected");
@@ -196,7 +175,7 @@ pub const ImapServer = struct {
                     continue;
                 }
 
-                if (session.messages.len == 0) {
+                if (session.messages.items.len == 0) {
                     try taggedNo(w, tag, "select mailbox first");
                     continue;
                 }
@@ -211,12 +190,12 @@ pub const ImapServer = struct {
                     continue;
                 };
 
-                if (number == 0 or number > session.messages.len) {
+                if (number == 0 or number > session.messages.items.len) {
                     try taggedNo(w, tag, "no such message");
                     continue;
                 }
 
-                const message = session.messages[number - 1];
+                const message = session.messages.items[number - 1];
                 const flags_text = try message.flags.format(self.allocator);
                 defer self.allocator.free(flags_text);
 
@@ -230,7 +209,7 @@ pub const ImapServer = struct {
                 );
                 defer self.allocator.free(data);
 
-                try w.print("* {d} FETCH (FLAGS {s} BODY[] {d}\r\n", .{ number, flags_text, data.len });
+                try w.print("* {d} FETCH (FLAGS {s} BODY[] {{{d}}}\r\n", .{ number, flags_text, data.len });
                 try w.writeAll(data);
                 try w.writeAll("\r\n)\r\n");
                 try taggedOk(w, tag, "FETCH completed");
@@ -243,7 +222,7 @@ pub const ImapServer = struct {
                     continue;
                 }
 
-                if (session.messages.len == 0) {
+                if (session.messages.items.len == 0) {
                     try taggedNo(w, tag, "select mailbox first");
                     continue;
                 }
@@ -271,13 +250,13 @@ pub const ImapServer = struct {
                     continue;
                 };
 
-                if (number == 0 or number > session.messages.len) {
+                if (number == 0 or number > session.messages.items.len) {
                     try taggedNo(w, tag, "no such message");
                     continue;
                 }
 
                 const added = parseFlagsList(flags_text);
-                var message = &session.messages[number - 1];
+                var message = &session.messages.items[number - 1];
                 message.flags = message.flags.merge(added);
 
                 try self.storage.writeMailboxFlags(
@@ -300,15 +279,15 @@ pub const ImapServer = struct {
                     continue;
                 }
 
-                if (session.messages.len == 0) {
+                if (session.messages.items.len == 0) {
                     try taggedOk(w, tag, "EXPUNGE completed");
                     continue;
                 }
 
-                var i: usize = session.messages.len;
+                var i: usize = session.messages.items.len;
                 while (i > 0) : (i -= 1) {
                     const idx = i - 1;
-                    if (!session.messages[idx].flags.deleted) continue;
+                    if (!session.messages.items[idx].flags.deleted) continue;
 
                     try self.storage.deleteMailboxMessage(
                         fs_io,
@@ -316,7 +295,7 @@ pub const ImapServer = struct {
                         session.tenant.?,
                         session.domain.?,
                         session.user.?,
-                        session.messages[idx].name,
+                        session.messages.items[idx].name,
                     );
 
                     try w.print("* {d} EXPUNGE\r\n", .{idx + 1});
@@ -335,7 +314,7 @@ const Session = struct {
     tenant: ?[]u8 = null,
     domain: ?[]u8 = null,
     user: ?[]u8 = null,
-    messages: []Storage.MailboxMessage = &.{},
+    messages: std.ArrayList(Storage.MailboxMessage) = .empty,
 
     fn isAuthenticated(self: Session) bool {
         return self.tenant != null and self.domain != null and self.user != null;
@@ -351,7 +330,7 @@ const Session = struct {
 
     fn loadMailbox(self: *Session, allocator: std.mem.Allocator, fs_io: Io, storage: Storage) !void {
         self.clearSelected(allocator);
-        self.messages = try storage.listMailboxMessages(fs_io, allocator, self.tenant.?, self.domain.?, self.user.?);
+        self.messages = .fromOwnedSlice(try storage.listMailboxMessages(fs_io, allocator, self.tenant.?, self.domain.?, self.user.?));
     }
 
     fn supportedFlags(self: Session, allocator: std.mem.Allocator) ![]u8 {
@@ -361,19 +340,18 @@ const Session = struct {
     }
 
     fn clearSelected(self: *Session, allocator: std.mem.Allocator) void {
-        if (self.messages.len > 0) freeMailboxMessages(allocator, self.messages);
-        self.messages = &.{};
+        for (self.messages.items) |message| {
+            allocator.free(message.name);
+            allocator.free(message.path);
+        }
+        self.messages.deinit(allocator);
+        self.messages = .empty;
     }
 
     fn removeMessage(self: *Session, index: usize, allocator: std.mem.Allocator) void {
-        allocator.free(self.messages[index].name);
-        allocator.free(self.messages[index].path);
-
-        if (index + 1 < self.messages.len) {
-            std.mem.copyForwards(Storage.MailboxMessage, self.messages[index..], self.messages[index + 1 ..]);
-        }
-
-        self.messages.len -= 1;
+        const removed = self.messages.orderedRemove(index);
+        allocator.free(removed.name);
+        allocator.free(removed.path);
     }
 
     fn clearIdentity(self: *Session, allocator: std.mem.Allocator) void {
@@ -458,10 +436,7 @@ fn parseFlagsList(raw: []const u8) Storage.MessageFlags {
 }
 
 fn nextLine(reader: *Io.Reader) !?[]const u8 {
-    const line = reader.takeDelimiterExclusive('\n') catch |err| switch (err) {
-        error.EndOfStream => return null,
-        else => return err,
-    };
+    const line = try reader.takeDelimiter('\n') orelse return null;
     return trimCr(line);
 }
 
@@ -541,16 +516,55 @@ test "parseFlagsList reads standard flags" {
 test "session removeMessage compacts mailbox" {
     const allocator = std.testing.allocator;
     var session = Session{};
-    session.messages = try allocator.alloc(Storage.MailboxMessage, 3);
-    session.messages[0] = .{ .name = try allocator.dupe(u8, "1.eml"), .path = try allocator.dupe(u8, "p1"), .size = 1, .sequence = 1, .flags = .{} };
-    session.messages[1] = .{ .name = try allocator.dupe(u8, "2.eml"), .path = try allocator.dupe(u8, "p2"), .size = 1, .sequence = 2, .flags = .{ .deleted = true } };
-    session.messages[2] = .{ .name = try allocator.dupe(u8, "3.eml"), .path = try allocator.dupe(u8, "p3"), .size = 1, .sequence = 3, .flags = .{} };
+    try session.messages.append(allocator, .{ .name = try allocator.dupe(u8, "1.eml"), .path = try allocator.dupe(u8, "p1"), .size = 1, .sequence = 1, .flags = .{} });
+    try session.messages.append(allocator, .{ .name = try allocator.dupe(u8, "2.eml"), .path = try allocator.dupe(u8, "p2"), .size = 1, .sequence = 2, .flags = .{ .deleted = true } });
+    try session.messages.append(allocator, .{ .name = try allocator.dupe(u8, "3.eml"), .path = try allocator.dupe(u8, "p3"), .size = 1, .sequence = 3, .flags = .{} });
 
     session.removeMessage(1, allocator);
 
-    try std.testing.expectEqual(@as(usize, 2), session.messages.len);
-    try std.testing.expectEqualStrings("1.eml", session.messages[0].name);
-    try std.testing.expectEqualStrings("3.eml", session.messages[1].name);
+    try std.testing.expectEqual(@as(usize, 2), session.messages.items.len);
+    try std.testing.expectEqualStrings("1.eml", session.messages.items[0].name);
+    try std.testing.expectEqualStrings("3.eml", session.messages.items[1].name);
 
     session.clearSelected(allocator);
+}
+
+test "imap session logs in, selects and fetches" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(root);
+
+    var hash_buf: [64]u8 = undefined;
+    const accounts = try std.fmt.allocPrint(allocator, "alice {s}\n", .{@import("account_index.zig").passwordHashHex("secret", &hash_buf)});
+    defer allocator.free(accounts);
+    try tmp.dir.createDirPath(std.testing.io, "tenants/acme/domains/example.com/users/alice/Maildir/new");
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tenants/acme/domains/example.com/accounts.txt", .data = accounts });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tenants/acme/domains/example.com/users/alice/Maildir/new/1.eml", .data = "Subject: hi\r\n\r\nhello\r\n" });
+
+    var catalog = try @import("tenant_index.zig").parseForTest(allocator, "tenant acme example.com\n");
+    defer catalog.deinit(allocator);
+
+    var server = ImapServer.init(allocator, .{ .data_dir = root }, Storage.init(root), &catalog);
+    var in: Io.Reader = .fixed("a1 LOGIN alice@example.com wrong\r\na2 LOGIN alice@example.com secret\r\n" ++
+        "a3 SELECT INBOX\r\na4 FETCH 1 BODY[]\r\na5 LOGOUT\r\n");
+    var out: Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    try server.handleClient(std.testing.io, &in, &out.writer);
+
+    const transcript = out.written();
+    for ([_][]const u8{
+        "a1 NO auth failed\r\n",
+        "a2 OK LOGIN completed\r\n",
+        "* 1 EXISTS\r\n",
+        "* 1 FETCH (FLAGS () BODY[] {22}\r\nSubject: hi\r\n\r\nhello\r\n\r\n)\r\na4 OK FETCH completed\r\n",
+        "a5 OK LOGOUT completed\r\n",
+    }) |expected| {
+        if (std.mem.indexOf(u8, transcript, expected) == null) {
+            std.debug.print("missing \"{s}\" in:\n{s}\n", .{ expected, transcript });
+            return error.TestExpectedEqual;
+        }
+    }
 }
