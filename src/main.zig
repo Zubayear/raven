@@ -56,6 +56,7 @@ pub fn main(process: std.process.Init) !void {
 
 test {
     _ = @import("account_index.zig");
+    _ = @import("address.zig");
     _ = @import("alias_index.zig");
     _ = @import("config.zig");
     _ = @import("imap.zig");

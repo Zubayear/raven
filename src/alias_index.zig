@@ -2,6 +2,7 @@ const std = @import("std");
 const Io = std.Io;
 
 const Storage = @import("storage.zig").Storage;
+const address = @import("address.zig");
 
 pub const AliasTable = struct {
     entries: []Entry = &.{},
@@ -53,6 +54,8 @@ fn parse(allocator: std.mem.Allocator, raw: []const u8) !AliasTable {
         var tokens = std.mem.tokenizeAny(u8, trimmed, " \t=");
         const alias = tokens.next() orelse return error.InvalidAliasIndex;
         const target = tokens.next() orelse return error.InvalidAliasIndex;
+        // The target is used as a mailbox directory name.
+        if (!address.isLocalPart(target)) return error.InvalidAliasIndex;
 
         try entries.append(allocator, .{
             .alias = try allocator.dupe(u8, alias),
@@ -129,4 +132,8 @@ test "alias table loads from filesystem" {
     defer table.deinit(allocator);
 
     try std.testing.expectEqualStrings("team-sales", table.resolve("sales"));
+}
+
+test "alias table rejects unsafe targets" {
+    try std.testing.expectError(error.InvalidAliasIndex, parse(std.testing.allocator, "sales ../../etc\n"));
 }
