@@ -498,13 +498,13 @@ test "resolveRecipient applies domain alias" {
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "tenants/index.txt",
         .data =
-            \\tenant acme example.com
+        \\tenant acme example.com
         ,
     });
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "tenants/acme/domains/example.com/aliases.txt",
         .data =
-            \\sales team-sales
+        \\sales team-sales
         ,
     });
 

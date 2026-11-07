@@ -105,11 +105,7 @@ pub const Storage = struct {
             var flags = MessageFlags{};
             var parts = std.mem.tokenizeAny(u8, raw, " \t\r\n");
             while (parts.next()) |part| {
-                if (std.mem.eql(u8, part, "\\Seen")) flags.seen = true else
-                if (std.mem.eql(u8, part, "\\Answered")) flags.answered = true else
-                if (std.mem.eql(u8, part, "\\Flagged")) flags.flagged = true else
-                if (std.mem.eql(u8, part, "\\Deleted")) flags.deleted = true else
-                if (std.mem.eql(u8, part, "\\Draft")) flags.draft = true else {}
+                if (std.mem.eql(u8, part, "\\Seen")) flags.seen = true else if (std.mem.eql(u8, part, "\\Answered")) flags.answered = true else if (std.mem.eql(u8, part, "\\Flagged")) flags.flagged = true else if (std.mem.eql(u8, part, "\\Deleted")) flags.deleted = true else if (std.mem.eql(u8, part, "\\Draft")) flags.draft = true else {}
             }
             return flags;
         }
@@ -139,11 +135,31 @@ pub const Storage = struct {
 
             try list.appendSlice(allocator, "(");
             var first = true;
-            if (self.seen) { if (!first) try list.append(allocator, ' '); try list.appendSlice(allocator, "\\Seen"); first = false; }
-            if (self.answered) { if (!first) try list.append(allocator, ' '); try list.appendSlice(allocator, "\\Answered"); first = false; }
-            if (self.flagged) { if (!first) try list.append(allocator, ' '); try list.appendSlice(allocator, "\\Flagged"); first = false; }
-            if (self.deleted) { if (!first) try list.append(allocator, ' '); try list.appendSlice(allocator, "\\Deleted"); first = false; }
-            if (self.draft) { if (!first) try list.append(allocator, ' '); try list.appendSlice(allocator, "\\Draft"); first = false; }
+            if (self.seen) {
+                if (!first) try list.append(allocator, ' ');
+                try list.appendSlice(allocator, "\\Seen");
+                first = false;
+            }
+            if (self.answered) {
+                if (!first) try list.append(allocator, ' ');
+                try list.appendSlice(allocator, "\\Answered");
+                first = false;
+            }
+            if (self.flagged) {
+                if (!first) try list.append(allocator, ' ');
+                try list.appendSlice(allocator, "\\Flagged");
+                first = false;
+            }
+            if (self.deleted) {
+                if (!first) try list.append(allocator, ' ');
+                try list.appendSlice(allocator, "\\Deleted");
+                first = false;
+            }
+            if (self.draft) {
+                if (!first) try list.append(allocator, ' ');
+                try list.appendSlice(allocator, "\\Draft");
+                first = false;
+            }
             try list.appendSlice(allocator, ")");
             return try list.toOwnedSlice(allocator);
         }
@@ -407,11 +423,26 @@ fn flagsText(allocator: std.mem.Allocator, flags: Storage.MessageFlags) ![]u8 {
     var list = std.ArrayList(u8).empty;
     errdefer list.deinit(allocator);
 
-    if (flags.seen) { if (list.items.len > 0) try list.append(allocator, ' '); try list.appendSlice(allocator, "\\Seen"); }
-    if (flags.answered) { if (list.items.len > 0) try list.append(allocator, ' '); try list.appendSlice(allocator, "\\Answered"); }
-    if (flags.flagged) { if (list.items.len > 0) try list.append(allocator, ' '); try list.appendSlice(allocator, "\\Flagged"); }
-    if (flags.deleted) { if (list.items.len > 0) try list.append(allocator, ' '); try list.appendSlice(allocator, "\\Deleted"); }
-    if (flags.draft) { if (list.items.len > 0) try list.append(allocator, ' '); try list.appendSlice(allocator, "\\Draft"); }
+    if (flags.seen) {
+        if (list.items.len > 0) try list.append(allocator, ' ');
+        try list.appendSlice(allocator, "\\Seen");
+    }
+    if (flags.answered) {
+        if (list.items.len > 0) try list.append(allocator, ' ');
+        try list.appendSlice(allocator, "\\Answered");
+    }
+    if (flags.flagged) {
+        if (list.items.len > 0) try list.append(allocator, ' ');
+        try list.appendSlice(allocator, "\\Flagged");
+    }
+    if (flags.deleted) {
+        if (list.items.len > 0) try list.append(allocator, ' ');
+        try list.appendSlice(allocator, "\\Deleted");
+    }
+    if (flags.draft) {
+        if (list.items.len > 0) try list.append(allocator, ' ');
+        try list.appendSlice(allocator, "\\Draft");
+    }
 
     return try list.toOwnedSlice(allocator);
 }

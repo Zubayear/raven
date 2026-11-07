@@ -117,8 +117,8 @@ test "alias table loads from filesystem" {
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "tenants/acme/domains/example.com/aliases.txt",
         .data =
-            \\sales team-sales
-            \\support helpdesk
+        \\sales team-sales
+        \\support helpdesk
         ,
     });
 

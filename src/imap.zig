@@ -425,11 +425,7 @@ fn parseFlagsList(raw: []const u8) Storage.MessageFlags {
 
     var parts = std.mem.tokenizeAny(u8, inner, " \t");
     while (parts.next()) |part| {
-        if (std.mem.eql(u8, part, "\\Seen")) flags.seen = true else
-        if (std.mem.eql(u8, part, "\\Answered")) flags.answered = true else
-        if (std.mem.eql(u8, part, "\\Flagged")) flags.flagged = true else
-        if (std.mem.eql(u8, part, "\\Deleted")) flags.deleted = true else
-        if (std.mem.eql(u8, part, "\\Draft")) flags.draft = true else {}
+        if (std.mem.eql(u8, part, "\\Seen")) flags.seen = true else if (std.mem.eql(u8, part, "\\Answered")) flags.answered = true else if (std.mem.eql(u8, part, "\\Flagged")) flags.flagged = true else if (std.mem.eql(u8, part, "\\Deleted")) flags.deleted = true else if (std.mem.eql(u8, part, "\\Draft")) flags.draft = true else {}
     }
 
     return flags;
