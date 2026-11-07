@@ -6,7 +6,6 @@ const AccountStore = @import("account_index.zig").AccountStore;
 const address = @import("address.zig");
 const Storage = @import("storage.zig").Storage;
 const TenantCatalog = @import("tenant_index.zig").TenantCatalog;
-const TlsServer = @import("tls.zig").TlsServer;
 
 pub const ImapServer = struct {
     allocator: std.mem.Allocator,
@@ -35,35 +34,7 @@ pub const ImapServer = struct {
         return listener;
     }
 
-    pub fn serve(self: *ImapServer, io: Io, listener: *std.Io.net.Server, shutdown: *const std.atomic.Value(bool), tls_server: ?*TlsServer) !void {
-        while (!shutdown.load(.acquire)) {
-            const stream = listener.accept(io) catch |err| switch (err) {
-                error.SocketNotListening, error.Canceled => return,
-                else => {
-                    std.debug.print("imap accept error: {}\n", .{err});
-                    continue;
-                },
-            };
-            defer stream.close(io);
-            self.serveConnection(io, stream, tls_server) catch |err| {
-                std.debug.print("imap session error: {}\n", .{err});
-            };
-        }
-    }
-
-    fn serveConnection(self: *ImapServer, io: Io, stream: std.Io.net.Stream, tls_server: ?*TlsServer) !void {
-        var read_buf: [1024]u8 = undefined;
-        if (tls_server) |server| {
-            var conn = try server.accept(stream.socket.handle, &read_buf, &.{});
-            defer conn.deinit();
-            return self.handleClient(io, &conn.reader, &conn.writer);
-        }
-        var reader = stream.reader(io, &read_buf);
-        var writer = stream.writer(io, &.{});
-        return self.handleClient(io, &reader.interface, &writer.interface);
-    }
-
-    fn handleClient(self: *ImapServer, fs_io: Io, r: *Io.Reader, w: *Io.Writer) !void {
+    pub fn handleClient(self: *ImapServer, fs_io: Io, r: *Io.Reader, w: *Io.Writer) !void {
         try w.writeAll("* OK IMAP4rev1 raven ready\r\n");
 
         var session = Session{};

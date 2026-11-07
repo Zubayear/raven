@@ -15,6 +15,7 @@ It currently provides SMTP, IMAP, filesystem-backed storage, tenant-aware routin
 - Tenant/domain routing and alias lookup
 - Account authentication from local storage
 - Optional TLS via OpenSSL
+- Concurrent sessions with idle timeouts (SMTP 5 min, IMAP 30 min) and a connection cap
 - Graceful shutdown on signal
 
 ## Requirements
@@ -93,6 +94,7 @@ Common options:
 - `--data-dir`
 - `--tls-cert`
 - `--tls-key`
+- `--max-connections` (per listener, default 100)
 
 Environment variables use the `RAVEN_` prefix:
 
@@ -104,6 +106,7 @@ Environment variables use the `RAVEN_` prefix:
 - `RAVEN_DATA_DIR`
 - `RAVEN_TLS_CERT`
 - `RAVEN_TLS_KEY`
+- `RAVEN_MAX_CONNECTIONS`
 
 Example config file:
 
@@ -115,6 +118,7 @@ hostname = localhost
 data_dir = data
 tls_cert_file = cert.pem
 tls_key_file = key.pem
+max_connections = 100
 ```
 
 ## Testing
@@ -129,7 +133,9 @@ tls_key_file = key.pem
 - `src/imap.zig` handles mailbox access and IMAP commands.
 - `src/storage.zig` manages the filesystem layout and message files.
 - `src/config.zig` loads CLI, environment, and config-file settings.
-- `src/tls.zig` wraps OpenSSL for server-side TLS.
+- `src/conn.zig` runs the accept loop and gives each connection socket I/O with an idle timeout.
+- `src/tls.zig` wraps OpenSSL for server-side TLS on top of that socket I/O.
+- `src/address.zig` validates mail addresses before they reach the filesystem.
 - `src/tenant_index.zig`, `src/alias_index.zig`, and `src/account_index.zig` provide routing and identity lookup.
 
 ## Contributing
