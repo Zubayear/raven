@@ -2,6 +2,7 @@ const std = @import("std");
 
 const Io = std.Io;
 const Config = @import("config.zig").Config;
+const conn = @import("conn.zig");
 const account_index = @import("account_index.zig");
 const Identity = account_index.Identity;
 const Storage = @import("storage.zig").Storage;
@@ -36,7 +37,9 @@ pub const ImapServer = struct {
         return listener;
     }
 
-    pub fn handleClient(self: *ImapServer, fs_io: Io, r: *Io.Reader, w: *Io.Writer) !void {
+    pub fn handleClient(self: *ImapServer, fs_io: Io, client: *conn.Client) !void {
+        const r = client.reader;
+        const w = client.writer;
         try w.writeAll("* OK IMAP4rev1 raven ready\r\n");
 
         var session = Session{};
@@ -406,7 +409,8 @@ test "imap session logs in, selects and fetches" {
     var out: Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
 
-    try server.handleClient(std.testing.io, &in, &out.writer);
+    var client: conn.Client = .{ .reader = &in, .writer = &out.writer };
+    try server.handleClient(std.testing.io, &client);
 
     const transcript = out.written();
     for ([_][]const u8{

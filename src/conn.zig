@@ -3,7 +3,8 @@
 const std = @import("std");
 const Io = std.Io;
 const net = Io.net;
-const TlsServer = @import("tls.zig").TlsServer;
+const tls = @import("tls.zig");
+const TlsServer = tls.TlsServer;
 
 pub const Options = struct {
     max_connections: u32,
@@ -11,10 +12,45 @@ pub const Options = struct {
     idle_timeout: Io.Duration,
     /// Sent to clients turned away because `max_connections` is reached.
     busy_reply: []const u8,
+    /// Enables TLS: STARTTLS, or the whole connection when `implicit_tls`.
     tls: ?*TlsServer,
+    implicit_tls: bool = false,
 };
 
-/// A protocol server: `Handler.handleClient(*Handler, Io, *Io.Reader, *Io.Writer)`.
+/// What a protocol handler talks to. `startTls` upgrades it in place.
+pub const Client = struct {
+    reader: *Io.Reader,
+    writer: *Io.Writer,
+    /// True once the connection is encrypted.
+    secure: bool = false,
+    /// Null in unit tests, which drive handlers over fixed buffers.
+    transport: ?*Transport = null,
+
+    pub fn canStartTls(self: Client) bool {
+        return !self.secure and self.transport != null and self.transport.?.tls_server != null;
+    }
+
+    /// Runs the TLS handshake and switches `reader`/`writer` to it. Plaintext
+    /// already buffered is dropped: commands pipelined after STARTTLS must
+    /// not run as if they had arrived encrypted (CVE-2011-0411).
+    pub fn startTls(self: *Client) !void {
+        const t = self.transport.?;
+        self.reader.tossBuffered();
+        t.tls = try t.tls_server.?.accept(&t.socket, &t.tls_buf, &.{});
+        self.reader = &t.tls.?.reader;
+        self.writer = &t.tls.?.writer;
+        self.secure = true;
+    }
+};
+
+pub const Transport = struct {
+    socket: Socket,
+    tls_server: ?*TlsServer,
+    tls: ?tls.Connection = null,
+    tls_buf: [1024]u8 = undefined,
+};
+
+/// A protocol server: `Handler.handleClient(*Handler, Io, *Client)`.
 pub fn Listener(comptime Handler: type) type {
     return struct {
         /// Accepts connections until canceled and serves each one
@@ -53,16 +89,24 @@ pub fn Listener(comptime Handler: type) type {
                 _ = active.fetchSub(1, .monotonic);
             }
             var read_buf: [1024]u8 = undefined;
-            var socket: Socket = .init(io, stream, options.idle_timeout, &read_buf);
+            var transport: Transport = .{
+                .socket = .init(io, stream, options.idle_timeout, &read_buf),
+                .tls_server = options.tls,
+            };
+            defer if (transport.tls) |*conn| conn.deinit();
+            var client: Client = .{
+                .reader = &transport.socket.reader,
+                .writer = &transport.socket.writer.interface,
+                .transport = &transport,
+            };
 
-            const result = if (options.tls) |tls| tls: {
-                var tls_buf: [1024]u8 = undefined;
-                var conn = tls.accept(&socket, &tls_buf, &.{}) catch |err| break :tls err;
-                defer conn.deinit();
-                break :tls handler.handleClient(io, &conn.reader, &conn.writer);
-            } else handler.handleClient(io, &socket.reader, &socket.writer.interface);
-
-            result catch |err| std.debug.print("session ended: {} ({?})\n", .{ err, socket.err });
+            if (options.implicit_tls) client.startTls() catch |err| {
+                std.debug.print("tls handshake failed: {} ({?})\n", .{ err, transport.socket.err });
+                return;
+            };
+            handler.handleClient(io, &client) catch |err| {
+                std.debug.print("session ended: {} ({?})\n", .{ err, transport.socket.err });
+            };
         }
     };
 }

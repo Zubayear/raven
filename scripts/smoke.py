@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 """End-to-end smoke test against a real raven binary. Run with `zig build smoke`."""
+import base64
 import hashlib
 import imaplib
 import mailbox
@@ -14,7 +15,7 @@ import time
 from pathlib import Path
 
 BIN = os.environ.get("RAVEN_BIN", "zig-out/bin/raven")
-HOST, SMTP_PORT, IMAP_PORT = "127.0.0.1", 2525, 2143
+HOST, SMTP_PORT, IMAP_PORT, SMTPS_PORT = "127.0.0.1", 2525, 2143, 2465
 
 
 class Raven:
@@ -75,8 +76,8 @@ def setup_accounts(root):
     (domain / "accounts.txt").write_text(f"alice {hashlib.sha256(b'secret').hexdigest()}\n")
 
 
-def check_delivery(smtp, imap_sock, expected=1):
-    smtp.sendmail("bob@external.test", ["alice+smoke@example.com"], f"Subject: smoke {expected}\r\n\r\nhello raven\r\n")
+def check_delivery(smtp, imap_sock, expected=1, sender="bob@external.test"):
+    smtp.sendmail(sender, ["alice+smoke@example.com"], f"Subject: smoke {expected}\r\n\r\nhello raven\r\n")
     smtp.quit()
 
     imap = Imap(imap_sock)
@@ -135,9 +136,27 @@ def main():
 
         data = tmp / "tls"
         setup_accounts(data)
-        with Raven(data, "--tls-cert", str(cert), "--tls-key", str(key)):
-            check_delivery(smtplib.SMTP_SSL(HOST, SMTP_PORT, timeout=5, context=ctx),
-                           ctx.wrap_socket(socket.create_connection((HOST, IMAP_PORT), timeout=5)))
+        with Raven(data, "--tls-cert", str(cert), "--tls-key", str(key), "--smtps-port", str(SMTPS_PORT)):
+            # Passwords never travel in the clear: no AUTH before STARTTLS (#9).
+            smtp = smtplib.SMTP(HOST, SMTP_PORT, timeout=5)
+            smtp.ehlo()
+            assert smtp.has_extn("starttls") and not smtp.has_extn("auth"), smtp.esmtp_features
+            credentials = base64.b64encode(b"\0alice@example.com\0secret").decode()
+            assert smtp.docmd("AUTH", "PLAIN " + credentials)[0] == 538
+            smtp.starttls(context=ctx)
+            smtp.login("alice@example.com", "secret")
+            check_delivery(smtp, ctx.wrap_socket(socket.create_connection((HOST, IMAP_PORT), timeout=5)),
+                           sender="alice@example.com")
+
+            smtps = smtplib.SMTP_SSL(HOST, SMTPS_PORT, timeout=5, context=ctx)
+            smtps.login("alice@example.com", "secret")
+            check_delivery(smtps, ctx.wrap_socket(socket.create_connection((HOST, IMAP_PORT), timeout=5)),
+                           expected=2, sender="alice@example.com")
+
+            s_client = subprocess.run(["openssl", "s_client", "-starttls", "smtp", "-connect", f"{HOST}:{SMTP_PORT}",
+                                       "-CAfile", cert, "-quiet"], input=b"EHLO client\r\nQUIT\r\n",
+                                      capture_output=True, timeout=10)
+            assert b"250-AUTH PLAIN" in s_client.stdout, s_client.stdout + s_client.stderr
             # Left open across shutdown: SIGTERM must still stop raven promptly.
             idle_tls = ctx.wrap_socket(socket.create_connection((HOST, IMAP_PORT), timeout=5))
             assert idle_tls.recv(64).startswith(b"* OK")
