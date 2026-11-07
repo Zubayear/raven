@@ -32,21 +32,24 @@ pub fn loadKey(allocator: std.mem.Allocator, io: Io, key_dir: []const u8) !?Key 
     };
     defer dir.close(io);
 
+    // Holds "<selector>.pem" for the newest selector so far.
     var name_buf: [std.fs.max_name_bytes]u8 = undefined;
     var newest: ?[]const u8 = null;
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
         // Any kind: Kubernetes secret mounts are symlinks.
         if (!std.mem.endsWith(u8, entry.name, ".pem")) continue;
+        const selector = entry.name[0 .. entry.name.len - ".pem".len];
         // The selector goes into the header and DNS: LDH labels only.
-        if (!address.isDomain(entry.name[0 .. entry.name.len - ".pem".len])) continue;
-        if (newest != null and std.mem.order(u8, entry.name, newest.?) != .gt) continue;
+        if (!address.isDomain(selector)) continue;
+        // Compare selectors, not file names: "mail-2" must beat "mail".
+        if (newest != null and std.mem.order(u8, selector, newest.?) != .gt) continue;
         @memcpy(name_buf[0..entry.name.len], entry.name);
-        newest = name_buf[0..entry.name.len];
+        newest = name_buf[0..selector.len];
     }
-    const name = newest orelse return null;
+    const selector = newest orelse return null;
 
-    const pem = try dir.readFileAlloc(io, name, allocator, .limited(64 * 1024));
+    const pem = try dir.readFileAlloc(io, name_buf[0 .. selector.len + ".pem".len], allocator, .limited(64 * 1024));
     defer {
         std.crypto.secureZero(u8, pem);
         allocator.free(pem);
@@ -59,7 +62,7 @@ pub fn loadKey(allocator: std.mem.Allocator, io: Io, key_dir: []const u8) !?Key 
     errdefer c.EVP_PKEY_free(pkey);
     // RFC 8301: verifiers reject RSA keys under 1024 bits.
     if (c.EVP_PKEY_is_a(pkey, "RSA") != 1 or c.EVP_PKEY_get_bits(pkey) < 1024) return error.DkimKeyUnsupported;
-    return .{ .pkey = pkey, .selector = try allocator.dupe(u8, name[0 .. name.len - ".pem".len]) };
+    return .{ .pkey = pkey, .selector = try allocator.dupe(u8, selector) };
 }
 
 /// The folded `DKIM-Signature:` header field (with its CRLF) that signs
@@ -198,6 +201,31 @@ test "the last instance of a field is signed" {
     const header = "From: a@x\r\nSubject: one\r\nSubject: two\r\n  folded\r\nTo: b@y\r\n";
     try std.testing.expectEqualStrings("Subject: two\r\n  folded", lastField(header, "subject").?);
     try std.testing.expect(lastField(header, "Cc") == null);
+}
+
+test "the alphabetically last valid selector signs" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const pkey = c.EVP_PKEY_Q_keygen(null, null, "RSA", @as(usize, 2048)) orelse return error.KeyGenFailed;
+    defer c.EVP_PKEY_free(pkey);
+    const bio = c.BIO_new(c.BIO_s_mem()) orelse return error.OutOfMemory;
+    defer _ = c.BIO_free(bio);
+    try std.testing.expectEqual(1, c.PEM_write_bio_PrivateKey(bio, pkey, null, null, 0, null, null));
+    var pem_buf: [4096]u8 = undefined;
+    const pem = pem_buf[0..@intCast(c.BIO_read(bio, &pem_buf, pem_buf.len))];
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const key_dir = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(key_dir);
+    try std.testing.expect(try loadKey(allocator, io, key_dir) == null);
+    // "zz_top" is not a valid selector and "zzz.txt" is not a key.
+    for ([_][]const u8{ "mail.pem", "mail-2.pem", "zz_top.pem", "zzz.txt" }) |name| {
+        try tmp.dir.writeFile(io, .{ .sub_path = name, .data = pem });
+    }
+    const key = (try loadKey(allocator, io, key_dir)).?;
+    defer key.deinit(allocator);
+    try std.testing.expectEqualStrings("mail-2", key.selector);
 }
 
 test "signatures verify with the public key" {
