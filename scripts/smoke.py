@@ -105,6 +105,21 @@ def main():
         maildir = mailbox.Maildir(data / "tenants/acme/domains/example.com/users/alice/Maildir", create=False)
         assert sorted(m.get_flags() for m in maildir) == ["", "S"], [m.get_flags() for m in maildir]
 
+        data = tmp / "folders"
+        setup_accounts(data)
+        with Raven(data):  # #16
+            smtplib.SMTP(HOST, SMTP_PORT, timeout=5).sendmail("bob@external.test", ["alice@example.com"], "Subject: hi\r\n\r\nx\r\n")
+            imap = imap_plain()
+            imap.login("alice@example.com", PASSWORD)
+            assert imap.create("Projects")[0] == "OK"
+            assert imap.append("Projects", "(\\Seen)", None, b"Subject: appended\r\n\r\nhi\r\n")[0] == "OK"
+            imap.select("INBOX")
+            imaplib.Commands.setdefault("MOVE", ("SELECTED",))
+            assert imap._simple_command("MOVE", "1", "Projects")[0] == "OK"
+            assert imap.status("Projects", "(MESSAGES UNSEEN)")[1][0] == b'"Projects" (MESSAGES 2 UNSEEN 1)'
+            assert b"\\Sent" in b"".join(imap.list()[1])
+            imap.logout()
+
         with Raven(tmp / "busy", "--max-connections", "1"):
             # The readiness probe's session may still hold the only slot briefly.
             for _ in range(50):

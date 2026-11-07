@@ -560,7 +560,9 @@ const TestDir = struct {
     }
 
     fn inbox(self: *TestDir, allocator: std.mem.Allocator) ![]@import("storage.zig").Message {
-        return (try Storage.init(self.root).openMailbox(std.testing.io, allocator, "acme", "example.com", "alice")).messages;
+        const path = try Storage.init(self.root).maildirPath(allocator, "acme", "example.com", "alice");
+        defer allocator.free(path);
+        return (try Storage.openMailbox(std.testing.io, allocator, path)).messages;
     }
 };
 

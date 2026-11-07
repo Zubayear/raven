@@ -33,40 +33,18 @@ pub const Storage = struct {
         return std.fs.path.join(allocator, &.{ self.root_dir, "tenants", tenant, "domains", domain, "users", user, "Maildir" });
     }
 
-    /// Delivers `header` followed by `body` to the user's Maildir. The message
+    /// Delivers `header` followed by `body` to the user's INBOX. The message
     /// is durable once this returns. Returns the new file name; the caller
     /// owns it.
     pub fn deliver(self: Storage, io: Io, allocator: std.mem.Allocator, tenant: []const u8, domain: []const u8, user: []const u8, header: []const u8, body: []const u8) ![]u8 {
         const maildir_path = try self.maildirPath(allocator, tenant, domain, user);
         defer allocator.free(maildir_path);
-        var maildir = try Io.Dir.cwd().createDirPathOpen(io, maildir_path, .{});
-        defer maildir.close(io);
-        for ([_][]const u8{ "tmp", "new", "cur" }) |sub| try maildir.createDirPath(io, sub);
-
-        const name = try uniqueName(io, allocator);
-        errdefer allocator.free(name);
-        var tmp_buf: [std.fs.max_name_bytes + 4]u8 = undefined;
-        var new_buf: [std.fs.max_name_bytes + 4]u8 = undefined;
-        const tmp_path = try std.fmt.bufPrint(&tmp_buf, "tmp/{s}", .{name});
-        const new_path = try std.fmt.bufPrint(&new_buf, "new/{s}", .{name});
-
-        const file = try maildir.createFile(io, tmp_path, .{ .exclusive = true });
-        errdefer maildir.deleteFile(io, tmp_path) catch {};
-        {
-            defer file.close(io);
-            try file.writeStreamingAll(io, header);
-            try file.writeStreamingAll(io, body);
-            try file.sync(io);
-        }
-        try maildir.rename(tmp_path, maildir, new_path, io);
-        return name;
+        return deliverTo(io, allocator, maildir_path, header, body, .{});
     }
 
-    /// Opens INBOX for IMAP: moves `new/` mail to `cur/`, assigns UIDs to
+    /// Opens a Maildir for IMAP: moves `new/` mail to `cur/`, assigns UIDs to
     /// messages seen for the first time, and returns everything in UID order.
-    pub fn openMailbox(self: Storage, io: Io, allocator: std.mem.Allocator, tenant: []const u8, domain: []const u8, user: []const u8) !Mailbox {
-        const maildir_path = try self.maildirPath(allocator, tenant, domain, user);
-        defer allocator.free(maildir_path);
+    pub fn openMailbox(io: Io, allocator: std.mem.Allocator, maildir_path: []const u8) !Mailbox {
         var maildir = try Io.Dir.cwd().createDirPathOpen(io, maildir_path, .{});
         defer maildir.close(io);
         for ([_][]const u8{ "tmp", "new", "cur" }) |sub| try maildir.createDirPath(io, sub);
@@ -282,6 +260,166 @@ pub const MessageFlags = struct {
     }
 };
 
+/// The Maildir of `folder`, where INBOX is the user's top-level Maildir
+/// and `Work/Projects` lives in `.Work.Projects` (Maildir++).
+pub fn folderPath(allocator: std.mem.Allocator, maildir_path: []const u8, folder: []const u8) ![]u8 {
+    if (std.ascii.eqlIgnoreCase(folder, "INBOX")) return allocator.dupe(u8, maildir_path);
+    std.debug.assert(isFolderName(folder));
+    const dir = try std.mem.concat(allocator, u8, &.{ ".", folder });
+    defer allocator.free(dir);
+    std.mem.replaceScalar(u8, dir, '/', '.');
+    return std.fs.path.join(allocator, &.{ maildir_path, dir });
+}
+
+pub const DeliverOptions = struct {
+    /// Given flags put the message straight into `cur/` (APPEND, COPY).
+    flags: ?MessageFlags = null,
+    /// Arrival time to record instead of now (APPEND date, COPY), stored as
+    /// the file's mtime like Dovecot does.
+    date: ?u64 = null,
+};
+
+/// Writes a message into the Maildir at `maildir_path` (tmp, sync, rename).
+/// Returns the file name; the caller owns it.
+pub fn deliverTo(io: Io, allocator: std.mem.Allocator, maildir_path: []const u8, header: []const u8, body: []const u8, options: DeliverOptions) ![]u8 {
+    var maildir = try Io.Dir.cwd().createDirPathOpen(io, maildir_path, .{});
+    defer maildir.close(io);
+    for ([_][]const u8{ "tmp", "new", "cur" }) |sub| try maildir.createDirPath(io, sub);
+
+    const unique = try uniqueName(io, allocator);
+    defer allocator.free(unique);
+    var letters_buf: [5]u8 = undefined;
+    const name = if (options.flags) |flags| try std.fmt.allocPrint(allocator, "{s}:2,{s}", .{ unique, flags.letters(&letters_buf) }) else try allocator.dupe(u8, unique);
+    errdefer allocator.free(name);
+    var tmp_buf: [std.fs.max_name_bytes + 4]u8 = undefined;
+    var final_buf: [std.fs.max_name_bytes + 4]u8 = undefined;
+    const tmp_path = try std.fmt.bufPrint(&tmp_buf, "tmp/{s}", .{unique});
+    const final_path = try std.fmt.bufPrint(&final_buf, "{s}/{s}", .{ if (options.flags != null) "cur" else "new", name });
+
+    const file = try maildir.createFile(io, tmp_path, .{ .exclusive = true });
+    errdefer maildir.deleteFile(io, tmp_path) catch {};
+    {
+        defer file.close(io);
+        try file.writeStreamingAll(io, header);
+        try file.writeStreamingAll(io, body);
+        if (options.date) |seconds| try file.setTimestamps(io, .{ .modify_timestamp = .{ .new = .{ .nanoseconds = @as(i96, seconds) * std.time.ns_per_s } } });
+        try file.sync(io);
+    }
+    try maildir.rename(tmp_path, maildir, final_path, io);
+    return name;
+}
+
+/// Folder names map to directory names, so they get an allow-list: `/`
+/// separates levels; `.` (the Maildir++ separator), wildcards, quotes,
+/// backslashes and control characters are refused.
+pub fn isFolderName(name: []const u8) bool {
+    if (name.len == 0 or name.len > 200) return false;
+    var levels = std.mem.splitScalar(u8, name, '/');
+    while (levels.next()) |level| {
+        if (level.len == 0) return false;
+        for (level) |ch| {
+            if (ch < 0x20 or ch > 0x7e or std.mem.indexOfScalar(u8, ".%*\"\\", ch) != null) return false;
+        }
+    }
+    return true;
+}
+
+/// Folder names under `maildir_path` (not INBOX), `/`-separated.
+pub fn listFolders(io: Io, arena: std.mem.Allocator, maildir_path: []const u8) ![]const []const u8 {
+    var maildir = Io.Dir.cwd().openDir(io, maildir_path, .{ .iterate = true }) catch |err| switch (err) {
+        error.FileNotFound => return &.{},
+        else => return err,
+    };
+    defer maildir.close(io);
+    var names = std.ArrayList([]const u8).empty;
+    var it = maildir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind != .directory or entry.name.len < 2 or entry.name[0] != '.') continue;
+        const name = try arena.dupe(u8, entry.name[1..]);
+        std.mem.replaceScalar(u8, name, '.', '/');
+        if (isFolderName(name)) try names.append(arena, name);
+    }
+    std.sort.pdq([]const u8, names.items, {}, lessThanString);
+    return names.items;
+}
+
+pub fn createFolder(io: Io, allocator: std.mem.Allocator, maildir_path: []const u8, folder: []const u8) !void {
+    const path = try folderPath(allocator, maildir_path, folder);
+    defer allocator.free(path);
+    Io.Dir.cwd().createDir(io, path, .default_dir) catch |err| switch (err) {
+        error.PathAlreadyExists => return error.FolderExists,
+        error.FileNotFound => {
+            try Io.Dir.cwd().createDirPath(io, maildir_path);
+            try Io.Dir.cwd().createDir(io, path, .default_dir);
+        },
+        else => return err,
+    };
+    var dir = try Io.Dir.cwd().openDir(io, path, .{});
+    defer dir.close(io);
+    for ([_][]const u8{ "tmp", "new", "cur" }) |sub| try dir.createDirPath(io, sub);
+}
+
+pub fn deleteFolder(io: Io, allocator: std.mem.Allocator, maildir_path: []const u8, folder: []const u8) !void {
+    const path = try folderPath(allocator, maildir_path, folder);
+    defer allocator.free(path);
+    Io.Dir.cwd().access(io, path, .{}) catch return error.NoSuchFolder;
+    try Io.Dir.cwd().deleteTree(io, path);
+}
+
+/// Renames `from` and every folder below it.
+pub fn renameFolder(io: Io, allocator: std.mem.Allocator, maildir_path: []const u8, from: []const u8, to: []const u8) !void {
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+    const folders = try listFolders(io, arena, maildir_path);
+    var found = false;
+    for (folders) |folder| {
+        if (std.mem.eql(u8, folder, to)) return error.FolderExists;
+        found = found or std.mem.eql(u8, folder, from);
+    }
+    if (!found) return error.NoSuchFolder;
+    for (folders) |folder| {
+        const below = std.mem.startsWith(u8, folder, from) and folder.len > from.len and folder[from.len] == '/';
+        if (!std.mem.eql(u8, folder, from) and !below) continue;
+        const renamed = try std.mem.concat(arena, u8, &.{ to, folder[from.len..] });
+        if (!isFolderName(renamed)) return error.InvalidFolderName;
+        try Io.Dir.cwd().rename(try folderPath(arena, maildir_path, folder), Io.Dir.cwd(), try folderPath(arena, maildir_path, renamed), io);
+    }
+}
+
+/// Subscribed folder names, one per line in `subscriptions`.
+pub fn readSubscriptions(io: Io, arena: std.mem.Allocator, maildir_path: []const u8) ![]const []const u8 {
+    const path = try std.fs.path.join(arena, &.{ maildir_path, "subscriptions" });
+    const raw = Io.Dir.cwd().readFileAlloc(io, path, arena, .limited(1024 * 1024)) catch |err| switch (err) {
+        error.FileNotFound => return &.{},
+        else => return err,
+    };
+    var names = std.ArrayList([]const u8).empty;
+    var lines = std.mem.tokenizeScalar(u8, raw, '\n');
+    while (lines.next()) |line| {
+        const name = std.mem.trimEnd(u8, line, "\r");
+        if (isFolderName(name) or std.ascii.eqlIgnoreCase(name, "INBOX")) try names.append(arena, name);
+    }
+    return names.items;
+}
+
+pub fn writeSubscriptions(io: Io, allocator: std.mem.Allocator, maildir_path: []const u8, names: []const []const u8) !void {
+    try Io.Dir.cwd().createDirPath(io, maildir_path);
+    var text: Io.Writer.Allocating = .init(allocator);
+    defer text.deinit();
+    for (names) |name| try text.writer.print("{s}\n", .{name});
+    const tmp = try std.fs.path.join(allocator, &.{ maildir_path, "subscriptions.tmp" });
+    defer allocator.free(tmp);
+    const path = try std.fs.path.join(allocator, &.{ maildir_path, "subscriptions" });
+    defer allocator.free(path);
+    try Io.Dir.cwd().writeFile(io, .{ .sub_path = tmp, .data = text.written() });
+    try Io.Dir.cwd().rename(tmp, Io.Dir.cwd(), path, io);
+}
+
+fn lessThanString(_: void, a: []const u8, b: []const u8) bool {
+    return std.mem.order(u8, a, b) == .lt;
+}
+
 /// `<seconds>.M<microseconds>R<random>.raven`: unique across processes and
 /// restarts, and sorts in delivery order.
 fn uniqueName(io: Io, allocator: std.mem.Allocator) ![]u8 {
@@ -339,6 +477,10 @@ fn lowerUid(_: void, a: Message, b: Message) bool {
     return a.uid < b.uid;
 }
 
+fn testInbox(allocator: std.mem.Allocator, root: []const u8) ![]u8 {
+    return Storage.init(root).maildirPath(allocator, "acme", "example.com", "alice");
+}
+
 fn testRoot(allocator: std.mem.Allocator, tmp: *std.testing.TmpDir) ![]u8 {
     return std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
 }
@@ -374,11 +516,13 @@ test "opening claims new mail into cur, oldest first" {
     defer tmp.cleanup();
     const root = try testRoot(allocator, &tmp);
     defer allocator.free(root);
+    const inbox = try testInbox(allocator, root);
+    defer allocator.free(inbox);
     const storage = Storage.init(root);
 
     for ([_][]const u8{ "one", "two", "three" }) |body| allocator.free(try storage.deliver(io, allocator, "acme", "example.com", "alice", "", body));
 
-    const mailbox = try storage.openMailbox(io, allocator, "acme", "example.com", "alice");
+    const mailbox = try Storage.openMailbox(io, allocator, inbox);
     defer freeMessages(allocator, mailbox.messages);
     try std.testing.expectEqual(@as(usize, 3), mailbox.messages.len);
     for (mailbox.messages, [_][]const u8{ "one", "two", "three" }, 1..) |message, expected, uid| {
@@ -398,15 +542,17 @@ test "UIDs survive restarts and expunges and are never reused" {
     defer tmp.cleanup();
     const root = try testRoot(allocator, &tmp);
     defer allocator.free(root);
+    const inbox = try testInbox(allocator, root);
+    defer allocator.free(inbox);
 
     for (0..3) |_| allocator.free(try Storage.init(root).deliver(io, allocator, "acme", "example.com", "alice", "", "x"));
-    const first = try Storage.init(root).openMailbox(io, allocator, "acme", "example.com", "alice");
+    const first = try Storage.openMailbox(io, allocator, inbox);
     defer freeMessages(allocator, first.messages);
     try Storage.deleteMessage(io, first.messages[1]); // UID 2
 
     // A fresh Storage stands in for a restart.
     allocator.free(try Storage.init(root).deliver(io, allocator, "acme", "example.com", "alice", "", "y"));
-    const second = try Storage.init(root).openMailbox(io, allocator, "acme", "example.com", "alice");
+    const second = try Storage.openMailbox(io, allocator, inbox);
     defer freeMessages(allocator, second.messages);
     try std.testing.expectEqual(first.uid_validity, second.uid_validity);
     try std.testing.expectEqual(@as(usize, 3), second.messages.len);
@@ -421,11 +567,13 @@ test "a damaged UID list resets UIDVALIDITY" {
     defer tmp.cleanup();
     const root = try testRoot(allocator, &tmp);
     defer allocator.free(root);
+    const inbox = try testInbox(allocator, root);
+    defer allocator.free(inbox);
     const storage = Storage.init(root);
 
     allocator.free(try storage.deliver(io, allocator, "acme", "example.com", "alice", "", "x"));
     try tmp.dir.writeFile(io, .{ .sub_path = "tenants/acme/domains/example.com/users/alice/Maildir/raven-uidlist", .data = "7 3\n9 bogus\n" });
-    const mailbox = try storage.openMailbox(io, allocator, "acme", "example.com", "alice");
+    const mailbox = try Storage.openMailbox(io, allocator, inbox);
     defer freeMessages(allocator, mailbox.messages);
     try std.testing.expect(mailbox.uid_validity != 7);
     try std.testing.expectEqual(@as(u32, 1), mailbox.messages[0].uid);
@@ -438,23 +586,25 @@ test "flags live in the file name and survive reopening" {
     defer tmp.cleanup();
     const root = try testRoot(allocator, &tmp);
     defer allocator.free(root);
+    const inbox = try testInbox(allocator, root);
+    defer allocator.free(inbox);
     const storage = Storage.init(root);
 
     allocator.free(try storage.deliver(io, allocator, "acme", "example.com", "alice", "Subject: x\r\n", "hello"));
     {
-        const mailbox = try storage.openMailbox(io, allocator, "acme", "example.com", "alice");
+        const mailbox = try Storage.openMailbox(io, allocator, inbox);
         defer freeMessages(allocator, mailbox.messages);
         try Storage.setFlags(io, allocator, &mailbox.messages[0], .{ .seen = true, .flagged = true, .deleted = true });
         try std.testing.expect(std.mem.endsWith(u8, mailbox.messages[0].path, ":2,FST"));
     }
 
-    const mailbox = try storage.openMailbox(io, allocator, "acme", "example.com", "alice");
+    const mailbox = try Storage.openMailbox(io, allocator, inbox);
     defer freeMessages(allocator, mailbox.messages);
     try std.testing.expectEqual(MessageFlags{ .seen = true, .flagged = true, .deleted = true }, mailbox.messages[0].flags);
     try std.testing.expectEqual(@as(u32, 1), mailbox.messages[0].uid); // renames keep the UID
 
     try Storage.deleteMessage(io, mailbox.messages[0]);
-    const after = try storage.openMailbox(io, allocator, "acme", "example.com", "alice");
+    const after = try Storage.openMailbox(io, allocator, inbox);
     defer freeMessages(allocator, after.messages);
     try std.testing.expectEqual(@as(usize, 0), after.messages.len);
 }
@@ -479,4 +629,67 @@ test "account index path is stable" {
     const path = try Storage.init("data").accountIndexPath(allocator, "tenant-a", "example.com");
     defer allocator.free(path);
     try std.testing.expectEqualStrings("data/tenants/tenant-a/domains/example.com/accounts.txt", path);
+}
+
+test "folder names are allow-listed" {
+    for ([_][]const u8{ "Sent", "Work/Projects", "Caf&AOk-", "a-b_c d" }) |name| try std.testing.expect(isFolderName(name));
+    for ([_][]const u8{ "", ".hidden", "a.b", "../x", "a//b", "/a", "a/", "*", "a%b", "a\\b", "a\"b", "a\x00b" }) |name| try std.testing.expect(!isFolderName(name));
+}
+
+test "folders: create, list, rename with children, delete, subscribe" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(allocator, &tmp);
+    defer allocator.free(root);
+    const inbox = try testInbox(allocator, root);
+    defer allocator.free(inbox);
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const arena = arena_state.allocator();
+
+    try createFolder(io, allocator, inbox, "Work");
+    try createFolder(io, allocator, inbox, "Work/Projects");
+    try createFolder(io, allocator, inbox, "Sent");
+    try std.testing.expectError(error.FolderExists, createFolder(io, allocator, inbox, "Sent"));
+    try tmp.dir.access(io, "tenants/acme/domains/example.com/users/alice/Maildir/.Work.Projects/cur", .{});
+
+    try renameFolder(io, allocator, inbox, "Work", "Archive");
+    try std.testing.expectError(error.NoSuchFolder, renameFolder(io, allocator, inbox, "Work", "Other"));
+    try std.testing.expectError(error.FolderExists, renameFolder(io, allocator, inbox, "Archive", "Sent"));
+    const folders = try listFolders(io, arena, inbox);
+    try std.testing.expectEqual(@as(usize, 3), folders.len);
+    try std.testing.expectEqualStrings("Archive", folders[0]);
+    try std.testing.expectEqualStrings("Archive/Projects", folders[1]);
+    try std.testing.expectEqualStrings("Sent", folders[2]);
+
+    try deleteFolder(io, allocator, inbox, "Archive/Projects");
+    try std.testing.expectError(error.NoSuchFolder, deleteFolder(io, allocator, inbox, "Archive/Projects"));
+
+    try writeSubscriptions(io, allocator, inbox, &.{ "INBOX", "Sent" });
+    const subscribed = try readSubscriptions(io, arena, inbox);
+    try std.testing.expectEqual(@as(usize, 2), subscribed.len);
+    try std.testing.expectEqualStrings("Sent", subscribed[1]);
+}
+
+test "deliverTo with flags and a date lands in cur" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(allocator, &tmp);
+    defer allocator.free(root);
+    const inbox = try testInbox(allocator, root);
+    defer allocator.free(inbox);
+
+    const sent = try folderPath(allocator, inbox, "Sent");
+    defer allocator.free(sent);
+    allocator.free(try deliverTo(io, allocator, sent, "", "draft", .{ .flags = .{ .seen = true }, .date = 951782400 }));
+    const mailbox = try Storage.openMailbox(io, allocator, sent);
+    defer freeMessages(allocator, mailbox.messages);
+    try std.testing.expectEqual(@as(usize, 1), mailbox.messages.len);
+    try std.testing.expect(mailbox.messages[0].flags.seen);
+    try std.testing.expect(!mailbox.messages[0].recent); // went straight to cur/
+    try std.testing.expectEqual(@as(u64, 951782400), mailbox.messages[0].internal_date);
 }
