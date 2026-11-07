@@ -218,6 +218,7 @@ const Context = struct {
             _ = arena_state.reset(.retain_capacity);
             ctx.fetchOne(arena_state.allocator(), message, number, items, by) catch |err| switch (err) {
                 error.FileNotFound => return ctx.no("message no longer available"),
+                error.TooManyParts => return ctx.no("[LIMIT] message structure too complex"),
                 else => return err,
             };
         }
@@ -226,6 +227,7 @@ const Context = struct {
 
     fn fetchOne(ctx: Context, arena: std.mem.Allocator, message: *Message, number: usize, items: []const FetchItem, by: Addressing) !void {
         var needs_content = false;
+        var needs_tree = false; // the full MIME tree, not just header and body
         var marks_seen = false;
         var wants_flags = false;
         var wants_uid = false;
@@ -237,15 +239,20 @@ const Context = struct {
                 needs_content = true;
                 marks_seen = true;
             },
-            .rfc822_header, .envelope, .body_structure, .body => needs_content = true,
+            .rfc822_header, .envelope => needs_content = true,
+            .body_structure, .body => {
+                needs_content = true;
+                needs_tree = true;
+            },
             .section => |sec| {
                 needs_content = true;
+                needs_tree = needs_tree or sec.path.len != 0;
                 if (!sec.peek) marks_seen = true;
             },
         };
 
         const raw = if (needs_content) try Storage.readMessage(ctx.io, arena, message.*) else "";
-        const root = if (needs_content) try mime.parse(arena, raw) else undefined;
+        const root = if (!needs_content) undefined else if (needs_tree) try mime.parse(arena, raw) else try mime.parseShallow(arena, raw);
 
         // Reading a body sets \Seen, and the new flags go in this response.
         const flags_changed = marks_seen and !message.flags.seen and !ctx.session.read_only;
@@ -634,6 +641,14 @@ fn testSession(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     try tmp.dir.createDirPath(std.testing.io, "tenants/acme/domains/example.com/users/alice/Maildir/new");
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tenants/acme/domains/example.com/users/alice/Maildir/new/1.eml", .data = "Subject: hi\r\n\r\nhello\r\n" });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tenants/acme/domains/example.com/users/alice/Maildir/new/2.eml", .data = "Subject: two\r\n\r\n" });
+    // INTERNALDATE comes from the mtime: pin it to 1970-01-01 00:00:01.
+    for ([_][]const u8{ "1.eml", "2.eml" }) |name| {
+        const path = try std.fmt.allocPrint(allocator, "tenants/acme/domains/example.com/users/alice/Maildir/new/{s}", .{name});
+        defer allocator.free(path);
+        const file = try tmp.dir.openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer file.close(std.testing.io);
+        try file.setTimestamps(std.testing.io, .{ .modify_timestamp = .{ .new = .{ .nanoseconds = std.time.ns_per_s } } });
+    }
     // A fixed UIDVALIDITY keeps transcripts deterministic.
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tenants/acme/domains/example.com/users/alice/Maildir/raven-uidlist", .data = "1234567890 1\n" });
 

@@ -95,9 +95,9 @@ pub const Storage = struct {
             const stat = try cur.statFile(io, entry.name, .{});
             const path = try std.fs.path.join(allocator, &.{ maildir_path, "cur", entry.name });
             errdefer allocator.free(path);
-            // Maildir names start with the delivery time; fall back to mtime.
-            const seconds = std.fmt.parseInt(u64, entry.name[0 .. std.mem.indexOfScalar(u8, entry.name, '.') orelse 0], 10) catch
-                @as(u64, @intCast(@max(0, @divFloor(stat.mtime.nanoseconds, std.time.ns_per_s))));
+            // INTERNALDATE is the file's mtime, as in Dovecot, so imported
+            // Maildirs keep their dates.
+            const seconds: u64 = @intCast(@max(0, @divFloor(stat.mtime.nanoseconds, std.time.ns_per_s)));
             try messages.append(allocator, .{ .path = path, .size = stat.size, .flags = .fromFileName(entry.name), .uid = 0, .internal_date = seconds });
         }
 
@@ -124,7 +124,8 @@ pub const Storage = struct {
     }
 
     pub fn readMessage(io: Io, allocator: std.mem.Allocator, message: Message) ![]u8 {
-        return Io.Dir.cwd().readFileAlloc(io, message.path, allocator, .limited(256 * 1024 * 1024));
+        // No cap of its own: SMTP's max_message_size bounds what gets stored.
+        return Io.Dir.cwd().readFileAlloc(io, message.path, allocator, .unlimited);
     }
 
     /// Renames the message so its file name carries `flags`.
@@ -155,7 +156,7 @@ pub const Message = struct {
     size: u64,
     flags: MessageFlags,
     uid: u32,
-    /// Arrival time in Unix seconds (IMAP INTERNALDATE).
+    /// Arrival time in Unix seconds (IMAP INTERNALDATE), from the mtime.
     internal_date: u64 = 0,
 };
 

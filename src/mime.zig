@@ -25,12 +25,25 @@ pub const Part = struct {
 /// Deeper nesting is treated as opaque data, so hostile messages can't
 /// exhaust the stack.
 const max_depth = 16;
+/// A 25 MiB message can hold millions of empty parts; refuse instead of
+/// allocating a tree for all of them.
+const max_parts = 1000;
 
-pub fn parse(arena: std.mem.Allocator, raw: []const u8) !Part {
-    return parseDepth(arena, raw, .{ "text", "plain" }, 0);
+pub const Error = error{ OutOfMemory, TooManyParts };
+
+/// The whole part tree, for BODYSTRUCTURE and numbered sections.
+pub fn parse(arena: std.mem.Allocator, raw: []const u8) Error!Part {
+    var budget: usize = max_parts;
+    return parseDepth(arena, raw, .{ "text", "plain" }, 0, &budget);
 }
 
-fn parseDepth(arena: std.mem.Allocator, raw: []const u8, default_type: [2][]const u8, depth: usize) error{OutOfMemory}!Part {
+/// Only the top-level header and body: enough for ENVELOPE, HEADER, TEXT.
+pub fn parseShallow(arena: std.mem.Allocator, raw: []const u8) Error!Part {
+    var budget: usize = max_parts;
+    return parseDepth(arena, raw, .{ "text", "plain" }, max_depth, &budget);
+}
+
+fn parseDepth(arena: std.mem.Allocator, raw: []const u8, default_type: [2][]const u8, depth: usize, budget: *usize) Error!Part {
     const split = splitHeader(raw);
     var part: Part = .{ .header = split[0], .body = split[1], .media_type = default_type[0], .subtype = default_type[1], .params = "" };
     if (try field(arena, part.header, "Content-Type")) |value| {
@@ -47,13 +60,13 @@ fn parseDepth(arena: std.mem.Allocator, raw: []const u8, default_type: [2][]cons
     if (std.ascii.eqlIgnoreCase(part.media_type, "multipart")) {
         const boundary = param(part.params, "boundary") orelse return part;
         const child_default: [2][]const u8 = if (std.ascii.eqlIgnoreCase(part.subtype, "digest")) .{ "message", "rfc822" } else .{ "text", "plain" };
-        const raw_children = try splitParts(arena, part.body, boundary);
+        const raw_children = try splitParts(arena, part.body, boundary, budget);
         const children = try arena.alloc(Part, raw_children.len);
-        for (children, raw_children) |*child, child_raw| child.* = try parseDepth(arena, child_raw, child_default, depth + 1);
+        for (children, raw_children) |*child, child_raw| child.* = try parseDepth(arena, child_raw, child_default, depth + 1, budget);
         part.children = children;
     } else if (part.is("message", "rfc822")) {
         const inner = try arena.create(Part);
-        inner.* = try parseDepth(arena, part.body, .{ "text", "plain" }, depth + 1);
+        inner.* = try parseDepth(arena, part.body, .{ "text", "plain" }, depth + 1, budget);
         part.message = inner;
     }
     return part;
@@ -69,7 +82,7 @@ fn splitHeader(raw: []const u8) [2][]const u8 {
 
 /// Splits a multipart body on `--boundary` delimiter lines (RFC 2046
 /// §5.1.1). The CRLF before a delimiter belongs to the delimiter.
-fn splitParts(arena: std.mem.Allocator, body: []const u8, boundary: []const u8) ![]const []const u8 {
+fn splitParts(arena: std.mem.Allocator, body: []const u8, boundary: []const u8, budget: *usize) Error![]const []const u8 {
     var parts = std.ArrayList([]const u8).empty;
     var part_start: ?usize = null;
     var pos: usize = 0;
@@ -81,6 +94,8 @@ fn splitParts(arena: std.mem.Allocator, body: []const u8, boundary: []const u8) 
             const close = std.mem.eql(u8, rest, "--");
             if (rest.len == 0 or close) {
                 if (part_start) |begin| {
+                    if (budget.* == 0) return error.TooManyParts;
+                    budget.* -= 1;
                     var stop = pos;
                     if (stop > begin and body[stop - 1] == '\n') stop -= 1;
                     if (stop > begin and body[stop - 1] == '\r') stop -= 1;
@@ -92,7 +107,11 @@ fn splitParts(arena: std.mem.Allocator, body: []const u8, boundary: []const u8) 
         }
         pos = line_end + 1;
     }
-    if (part_start) |begin| try parts.append(arena, body[begin..]); // unterminated: keep what we have
+    if (part_start) |begin| {
+        if (budget.* == 0) return error.TooManyParts;
+        budget.* -= 1;
+        try parts.append(arena, body[begin..]); // unterminated: keep what we have
+    }
     return parts.items;
 }
 
@@ -476,4 +495,16 @@ test "nesting deeper than the limit stays opaque" {
     defer raw.deinit();
     for (0..max_depth + 4) |_| try raw.writer.writeAll("Content-Type: message/rfc822\r\n\r\n");
     _ = try parse(arena_state.allocator(), raw.written());
+}
+
+test "part count is bounded" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    var raw: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer raw.deinit();
+    try raw.writer.writeAll("Content-Type: multipart/mixed; boundary=b\r\n\r\n");
+    for (0..max_parts + 1) |_| try raw.writer.writeAll("--b\r\n");
+    try std.testing.expectError(error.TooManyParts, parse(arena_state.allocator(), raw.written()));
+    // A shallow parse never splits, so it is unaffected.
+    _ = try parseShallow(arena_state.allocator(), raw.written());
 }
