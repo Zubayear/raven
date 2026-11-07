@@ -90,7 +90,9 @@ def check_delivery(smtp, imap_sock, expected=1, sender="bob@external.test"):
     imap = Imap(imap_sock)
     imap.cmd("LOGIN alice@example.com secret")
     assert b"* %d EXISTS" % expected in imap.cmd("SELECT INBOX")
-    assert b"Subject: smoke %d" % expected in imap.cmd("FETCH %d BODY[]" % expected)
+    fetched = imap.cmd("FETCH %d BODY[]" % expected)
+    assert b"Subject: smoke %d" % expected in fetched
+    assert b"Return-Path: <%s>" % sender.encode() in fetched and b"([127.0.0.1])" in fetched, fetched  # #11
     imap.cmd("LOGOUT")
 
 

@@ -47,7 +47,10 @@ pub const Server = struct {
         const catalog = self.tenant_catalog;
         try w.print("220 {s} ESMTP raven ready\r\n", .{self.config.hostname});
 
-        var greeted = false;
+        // Client's HELO/EHLO name, for Received headers; null until greeted.
+        var helo: ?[]u8 = null;
+        defer if (helo) |name| allocator.free(name);
+        var extended = false; // EHLO rather than HELO
         var auth_identity: ?Identity = null;
         defer if (auth_identity) |value| value.deinit(allocator);
         var tx: Transaction = .{};
@@ -85,8 +88,11 @@ pub const Server = struct {
                     continue;
                 }
                 tx.reset(allocator);
-                greeted = true;
-                if (std.ascii.eqlIgnoreCase(verb, "HELO")) {
+                const name = try allocator.dupe(u8, args);
+                if (helo) |old| allocator.free(old);
+                helo = name;
+                extended = std.ascii.eqlIgnoreCase(verb, "EHLO");
+                if (!extended) {
                     try w.print("250 {s}\r\n", .{self.config.hostname});
                 } else {
                     try w.print("250-{s}\r\n250-PIPELINING\r\n250-SIZE {d}\r\n250-8BITMIME\r\n", .{ self.config.hostname, self.config.max_message_size });
@@ -109,11 +115,12 @@ pub const Server = struct {
                 r = client.reader;
                 w = client.writer;
                 // RFC 3207 §4.2: forget everything learned before the upgrade.
-                greeted = false;
+                if (helo) |name| allocator.free(name);
+                helo = null;
                 tx.reset(allocator);
                 if (auth_identity) |value| value.deinit(allocator);
                 auth_identity = null;
-            } else if (!greeted and isTransactionVerb(verb)) {
+            } else if (helo == null and isTransactionVerb(verb)) {
                 try w.writeAll("503 5.5.1 send EHLO first\r\n");
             } else if (std.ascii.eqlIgnoreCase(verb, "AUTH")) {
                 if (!self.authAllowed(client)) {
@@ -252,8 +259,25 @@ pub const Server = struct {
                 };
                 defer allocator.free(message);
 
+                var id_bytes: [6]u8 = undefined;
+                fs_io.random(&id_bytes);
+                const trace: Trace = .{
+                    .reverse_path = tx.sender.?,
+                    .helo = helo.?,
+                    .remote = client.remote,
+                    .hostname = self.config.hostname,
+                    // RFC 3848 protocol names.
+                    .protocol = if (!extended) "SMTP" else if (client.secure and auth_identity != null) "ESMTPSA" else if (client.secure) "ESMTPS" else if (auth_identity != null) "ESMTPA" else "ESMTP",
+                    .id = std.fmt.bytesToHex(id_bytes, .lower),
+                    .seconds = @intCast(@divFloor(Io.Clock.real.now(fs_io).nanoseconds, std.time.ns_per_s)),
+                };
+                var header: Io.Writer.Allocating = .init(allocator);
+                defer header.deinit();
+
                 for (tx.recipients.items) |recipient| {
-                    const name = self.storage.deliver(fs_io, allocator, recipient.tenant, recipient.domain, recipient.user, message) catch |err| {
+                    header.clearRetainingCapacity();
+                    try writeTrace(&header.writer, trace, recipient);
+                    const name = self.storage.deliver(fs_io, allocator, recipient.tenant, recipient.domain, recipient.user, header.written(), message) catch |err| {
                         std.debug.print("delivery to {s}@{s} failed: {}\n", .{ recipient.user, recipient.domain, err });
                         // A temporary failure makes the client retry: a duplicate beats a lost message.
                         try w.writeAll("451 4.3.0 local error in processing\r\n");
@@ -299,6 +323,51 @@ const Transaction = struct {
         self.recipients.deinit(allocator);
     }
 };
+
+/// Facts for the trace headers of one transaction.
+const Trace = struct {
+    reverse_path: []const u8,
+    helo: []const u8,
+    remote: ?std.Io.net.IpAddress,
+    hostname: []const u8,
+    protocol: []const u8,
+    id: [12]u8,
+    seconds: u64,
+};
+
+/// Return-Path and Received headers (RFC 5321 §4.4) for one delivered copy.
+fn writeTrace(w: *Io.Writer, t: Trace, recipient: Identity) !void {
+    try w.print("Return-Path: <{s}>\r\nReceived: from ", .{t.reverse_path});
+    // The HELO name is client-supplied: keep only printable characters.
+    for (t.helo) |ch| try w.writeByte(if (std.ascii.isPrint(ch) and ch != '(' and ch != ')') ch else '?');
+    if (t.remote) |ip| switch (ip) {
+        .ip4 => |a| try w.print(" ([{d}.{d}.{d}.{d}])", .{ a.bytes[0], a.bytes[1], a.bytes[2], a.bytes[3] }),
+        .ip6 => |a| try w.print(" ([IPv6:{f}])", .{std.Io.net.Ip6Address.Unresolved{ .bytes = a.bytes, .interface_name = null }}),
+    };
+    try w.print("\r\n\tby {s} with {s} id {s}\r\n\tfor <{s}@{s}>; ", .{ t.hostname, t.protocol, &t.id, recipient.user, recipient.domain });
+    try writeDate(w, t.seconds);
+    try w.writeAll("\r\n");
+}
+
+/// RFC 5322 date-time in UTC, e.g. `Sat, 07 Nov 2026 09:15:47 +0000`.
+fn writeDate(w: *Io.Writer, seconds: u64) !void {
+    const epoch: std.time.epoch.EpochSeconds = .{ .secs = seconds };
+    const day = epoch.getEpochDay();
+    const year_day = day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const time = epoch.getDaySeconds();
+    const weekdays = [_][]const u8{ "Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed" }; // 1970-01-01 was a Thursday
+    const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    try w.print("{s}, {d:0>2} {s} {d} {d:0>2}:{d:0>2}:{d:0>2} +0000", .{
+        weekdays[day.day % 7],
+        @as(u8, month_day.day_index) + 1,
+        months[@backingInt(month_day.month) - 1],
+        year_day.year,
+        time.getHoursIntoDay(),
+        time.getMinutesIntoHour(),
+        time.getSecondsIntoMinute(),
+    });
+}
 
 fn isTransactionVerb(verb: []const u8) bool {
     for ([_][]const u8{ "MAIL", "RCPT", "DATA", "AUTH" }) |name| {
@@ -563,7 +632,49 @@ test "smtp session delivers a pipelined transaction" {
     try std.testing.expectEqual(@as(usize, 1), messages.len);
     const body = try Storage.readMessage(std.testing.io, allocator, messages[0]);
     defer allocator.free(body);
-    try std.testing.expectEqualStrings("Subject: hi\r\n\r\n.dot\r\n", body);
+    try std.testing.expectStringStartsWith(body, "Return-Path: <bob@external.test>\r\nReceived: from client\r\n\tby localhost with ESMTPS id ");
+    try std.testing.expect(std.mem.indexOf(u8, body, "\r\n\tfor <alice@example.com>; ") != null);
+    try std.testing.expectStringEndsWith(body, " +0000\r\nSubject: hi\r\n\r\n.dot\r\n");
+}
+
+test "dates are RFC 5322" {
+    for ([_]struct { u64, []const u8 }{
+        .{ 0, "Thu, 01 Jan 1970 00:00:00 +0000" },
+        .{ 951782400, "Tue, 29 Feb 2000 00:00:00 +0000" },
+        .{ 1794044147, "Sat, 07 Nov 2026 09:35:47 +0000" },
+        .{ 4102444799, "Thu, 31 Dec 2099 23:59:59 +0000" },
+    }) |case| {
+        var buf: [64]u8 = undefined;
+        var w: Io.Writer = .fixed(&buf);
+        try writeDate(&w, case[0]);
+        try std.testing.expectEqualStrings(case[1], w.buffered());
+    }
+}
+
+test "trace headers record sender, client and recipient" {
+    const allocator = std.testing.allocator;
+    const recipient = try Identity.init(allocator, "acme", "example.com", "alice");
+    defer recipient.deinit(allocator);
+
+    var out: Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var trace: Trace = .{
+        .reverse_path = "",
+        .helo = "evil\x01(host)",
+        .remote = try std.Io.net.IpAddress.parse("192.0.2.7", 25),
+        .hostname = "mx.example.com",
+        .protocol = "ESMTPSA",
+        .id = "0123456789ab".*,
+        .seconds = 1794044147,
+    };
+    try writeTrace(&out.writer, trace, recipient);
+    try std.testing.expectEqualStrings("Return-Path: <>\r\nReceived: from evil??host? ([192.0.2.7])\r\n" ++
+        "\tby mx.example.com with ESMTPSA id 0123456789ab\r\n\tfor <alice@example.com>; Sat, 07 Nov 2026 09:35:47 +0000\r\n", out.written());
+
+    out.clearRetainingCapacity();
+    trace.remote = try std.Io.net.IpAddress.parse("2001:db8::1", 25);
+    try writeTrace(&out.writer, trace, recipient);
+    try std.testing.expect(std.mem.indexOf(u8, out.written(), " ([IPv6:2001:db8::1])\r\n") != null);
 }
 
 test "smtp session accepts the null sender" {

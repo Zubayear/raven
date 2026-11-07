@@ -33,9 +33,10 @@ pub const Storage = struct {
         return std.fs.path.join(allocator, &.{ self.root_dir, "tenants", tenant, "domains", domain, "users", user, "Maildir" });
     }
 
-    /// Delivers `message` to the user's Maildir. The message is durable once
-    /// this returns. Returns the new file name; the caller owns it.
-    pub fn deliver(self: Storage, io: Io, allocator: std.mem.Allocator, tenant: []const u8, domain: []const u8, user: []const u8, message: []const u8) ![]u8 {
+    /// Delivers `header` followed by `body` to the user's Maildir. The message
+    /// is durable once this returns. Returns the new file name; the caller
+    /// owns it.
+    pub fn deliver(self: Storage, io: Io, allocator: std.mem.Allocator, tenant: []const u8, domain: []const u8, user: []const u8, header: []const u8, body: []const u8) ![]u8 {
         const maildir_path = try self.maildirPath(allocator, tenant, domain, user);
         defer allocator.free(maildir_path);
         var maildir = try Io.Dir.cwd().createDirPathOpen(io, maildir_path, .{});
@@ -53,7 +54,8 @@ pub const Storage = struct {
         errdefer maildir.deleteFile(io, tmp_path) catch {};
         {
             defer file.close(io);
-            try file.writeStreamingAll(io, message);
+            try file.writeStreamingAll(io, header);
+            try file.writeStreamingAll(io, body);
             try file.sync(io);
         }
         try maildir.rename(tmp_path, maildir, new_path, io);
@@ -259,7 +261,7 @@ test "deliver goes through tmp into new and survives a fresh Storage" {
     defer allocator.free(root);
 
     // Separate instances stand in for a restart: names must not collide.
-    for (0..3) |_| allocator.free(try Storage.init(root).deliver(io, allocator, "acme", "example.com", "alice", "hello\r\n"));
+    for (0..3) |_| allocator.free(try Storage.init(root).deliver(io, allocator, "acme", "example.com", "alice", "", "hello\r\n"));
 
     var new = try tmp.dir.openDir(io, "tenants/acme/domains/example.com/users/alice/Maildir/new", .{ .iterate = true });
     defer new.close(io);
@@ -283,7 +285,7 @@ test "listing claims new mail into cur, oldest first" {
     defer allocator.free(root);
     const storage = Storage.init(root);
 
-    for ([_][]const u8{ "one", "two", "three" }) |body| allocator.free(try storage.deliver(io, allocator, "acme", "example.com", "alice", body));
+    for ([_][]const u8{ "one", "two", "three" }) |body| allocator.free(try storage.deliver(io, allocator, "acme", "example.com", "alice", "", body));
 
     const messages = try storage.listMailbox(io, allocator, "acme", "example.com", "alice");
     defer freeMessages(allocator, messages);
@@ -306,7 +308,7 @@ test "flags live in the file name and survive relisting" {
     defer allocator.free(root);
     const storage = Storage.init(root);
 
-    allocator.free(try storage.deliver(io, allocator, "acme", "example.com", "alice", "hello"));
+    allocator.free(try storage.deliver(io, allocator, "acme", "example.com", "alice", "Subject: x\r\n", "hello"));
     {
         const messages = try storage.listMailbox(io, allocator, "acme", "example.com", "alice");
         defer freeMessages(allocator, messages);
