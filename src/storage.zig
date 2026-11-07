@@ -95,7 +95,10 @@ pub const Storage = struct {
             const stat = try cur.statFile(io, entry.name, .{});
             const path = try std.fs.path.join(allocator, &.{ maildir_path, "cur", entry.name });
             errdefer allocator.free(path);
-            try messages.append(allocator, .{ .path = path, .size = stat.size, .flags = .fromFileName(entry.name), .uid = 0 });
+            // Maildir names start with the delivery time; fall back to mtime.
+            const seconds = std.fmt.parseInt(u64, entry.name[0 .. std.mem.indexOfScalar(u8, entry.name, '.') orelse 0], 10) catch
+                @as(u64, @intCast(@max(0, @divFloor(stat.mtime.nanoseconds, std.time.ns_per_s))));
+            try messages.append(allocator, .{ .path = path, .size = stat.size, .flags = .fromFileName(entry.name), .uid = 0, .internal_date = seconds });
         }
 
         // New mail gets UIDs in delivery order; names sort that way.
@@ -121,7 +124,7 @@ pub const Storage = struct {
     }
 
     pub fn readMessage(io: Io, allocator: std.mem.Allocator, message: Message) ![]u8 {
-        return Io.Dir.cwd().readFileAlloc(io, message.path, allocator, .limited(1024 * 1024));
+        return Io.Dir.cwd().readFileAlloc(io, message.path, allocator, .limited(256 * 1024 * 1024));
     }
 
     /// Renames the message so its file name carries `flags`.
@@ -152,6 +155,8 @@ pub const Message = struct {
     size: u64,
     flags: MessageFlags,
     uid: u32,
+    /// Arrival time in Unix seconds (IMAP INTERNALDATE).
+    internal_date: u64 = 0,
 };
 
 pub const Mailbox = struct {

@@ -10,6 +10,7 @@ const Message = @import("storage.zig").Message;
 const MessageFlags = @import("storage.zig").MessageFlags;
 const TenantCatalog = @import("tenant_index.zig").TenantCatalog;
 const proto = @import("imap_proto.zig");
+const mime = @import("mime.zig");
 
 pub const ImapServer = struct {
     allocator: std.mem.Allocator,
@@ -206,28 +207,100 @@ const Context = struct {
         try p.space();
         const set = try p.sequenceSet();
         try p.space();
-        _ = p.text[p.pos..]; // data items: always FLAGS and BODY[] until #14
-        p.pos = p.text.len;
+        const items = try parseFetchItems(p);
+        try p.end();
 
-        const s = ctx.server;
-        const messages = ctx.session.messages.items;
-        for (messages, 1..) |message, number| {
+        const allocator = ctx.server.allocator;
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        for (ctx.session.messages.items, 1..) |*message, number| {
             if (!ctx.session.inSet(set, by, number)) continue;
-            const data = Storage.readMessage(ctx.io, s.allocator, message) catch |err| switch (err) {
+            _ = arena_state.reset(.retain_capacity);
+            ctx.fetchOne(arena_state.allocator(), message, number, items, by) catch |err| switch (err) {
                 error.FileNotFound => return ctx.no("message no longer available"),
                 else => return err,
             };
-            defer s.allocator.free(data);
-            const flags = try message.flags.format(s.allocator);
-            defer s.allocator.free(flags);
-            try ctx.w.print("* {d} FETCH (", .{number});
-            // UID FETCH responses always carry the UID (RFC 3501 §6.4.8).
-            if (by == .uid) try ctx.w.print("UID {d} ", .{message.uid});
-            try ctx.w.print("FLAGS {s} BODY[] {{{d}}}\r\n", .{ flags, data.len });
-            try ctx.w.writeAll(data);
-            try ctx.w.writeAll(")\r\n");
         }
         try ctx.ok("FETCH completed");
+    }
+
+    fn fetchOne(ctx: Context, arena: std.mem.Allocator, message: *Message, number: usize, items: []const FetchItem, by: Addressing) !void {
+        var needs_content = false;
+        var marks_seen = false;
+        var wants_flags = false;
+        var wants_uid = false;
+        for (items) |item| switch (item) {
+            .flags => wants_flags = true,
+            .uid => wants_uid = true,
+            .internal_date, .rfc822_size => {},
+            .rfc822, .rfc822_text => {
+                needs_content = true;
+                marks_seen = true;
+            },
+            .rfc822_header, .envelope, .body_structure, .body => needs_content = true,
+            .section => |sec| {
+                needs_content = true;
+                if (!sec.peek) marks_seen = true;
+            },
+        };
+
+        const raw = if (needs_content) try Storage.readMessage(ctx.io, arena, message.*) else "";
+        const root = if (needs_content) try mime.parse(arena, raw) else undefined;
+
+        // Reading a body sets \Seen, and the new flags go in this response.
+        const flags_changed = marks_seen and !message.flags.seen and !ctx.session.read_only;
+        if (flags_changed) {
+            var flags = message.flags;
+            flags.seen = true;
+            try Storage.setFlags(ctx.io, ctx.server.allocator, message, flags);
+        }
+
+        const w = ctx.w;
+        try w.print("* {d} FETCH (", .{number});
+        var first = true;
+        // UID FETCH responses always carry the UID (RFC 3501 §6.4.8).
+        if (by == .uid and !wants_uid) try ctx.fetchItem(arena, &first, message, raw, &root, .uid);
+        for (items) |item| try ctx.fetchItem(arena, &first, message, raw, &root, item);
+        if (flags_changed and !wants_flags) try ctx.fetchItem(arena, &first, message, raw, &root, .flags);
+        try w.writeAll(")\r\n");
+    }
+
+    fn fetchItem(ctx: Context, arena: std.mem.Allocator, first: *bool, message: *const Message, raw: []const u8, root: *const mime.Part, item: FetchItem) !void {
+        const w = ctx.w;
+        if (!first.*) try w.writeByte(' ');
+        first.* = false;
+        switch (item) {
+            .flags => try w.print("FLAGS {s}", .{try message.flags.format(arena)}),
+            .uid => try w.print("UID {d}", .{message.uid}),
+            .internal_date => {
+                try w.writeAll("INTERNALDATE \"");
+                try writeInternalDate(w, message.internal_date);
+                try w.writeByte('"');
+            },
+            .rfc822_size => try w.print("RFC822.SIZE {d}", .{message.size}),
+            .envelope => {
+                try w.writeAll("ENVELOPE ");
+                try mime.writeEnvelope(arena, w, root.header);
+            },
+            .body_structure, .body => {
+                try w.writeAll(if (item == .body) "BODY " else "BODYSTRUCTURE ");
+                try mime.writeBodyStructure(arena, w, root, item == .body_structure);
+            },
+            .rfc822 => try writeLiteral(w, "RFC822", raw),
+            .rfc822_header => try writeLiteral(w, "RFC822.HEADER", root.header),
+            .rfc822_text => try writeLiteral(w, "RFC822.TEXT", root.body),
+            .section => |sec| {
+                var data = try sectionData(arena, raw, root, sec);
+                try w.print("BODY[{s}]", .{sec.spec});
+                if (sec.partial) |partial| {
+                    try w.print("<{d}>", .{partial.origin});
+                    data = data[@min(partial.origin, data.len)..];
+                    data = data[0..@min(partial.count, data.len)];
+                }
+                try w.print(" {{{d}}}\r\n", .{data.len});
+                try w.writeAll(data);
+            },
+        }
     }
 
     fn store(ctx: Context, p: *proto.Parser, by: Addressing) !void {
@@ -277,6 +350,183 @@ const Context = struct {
         try ctx.w.print("{s} BAD {s}\r\n", .{ ctx.tag, text });
     }
 };
+
+const FetchItem = union(enum) {
+    flags,
+    uid,
+    internal_date,
+    rfc822_size,
+    envelope,
+    body_structure,
+    /// BODY without a section: the non-extensible body structure.
+    body,
+    rfc822,
+    rfc822_header,
+    rfc822_text,
+    section: Section,
+};
+
+/// `BODY[...]` / `BODY.PEEK[...]` (RFC 3501 §6.4.5).
+const Section = struct {
+    /// Text between the brackets, echoed back in the response.
+    spec: []const u8,
+    /// Part numbers, e.g. 1.2; empty for the whole message.
+    path: []const u32,
+    text: enum { all, header, fields, fields_not, text, mime },
+    fields: []const []const u8 = &.{},
+    peek: bool,
+    partial: ?struct { origin: u32, count: u32 } = null,
+};
+
+/// A data item, a parenthesized list, or ALL / FAST / FULL.
+fn parseFetchItems(p: *proto.Parser) ![]const FetchItem {
+    const fast: []const FetchItem = &.{ .flags, .internal_date, .rfc822_size };
+    const all: []const FetchItem = &.{ .flags, .internal_date, .rfc822_size, .envelope };
+    const full: []const FetchItem = &.{ .flags, .internal_date, .rfc822_size, .envelope, .body };
+    if (!p.take('(')) {
+        const start = p.pos;
+        const word = fetchWord(p);
+        if (std.ascii.eqlIgnoreCase(word, "ALL") and p.peek() != '[') return all;
+        if (std.ascii.eqlIgnoreCase(word, "FAST")) return fast;
+        if (std.ascii.eqlIgnoreCase(word, "FULL")) return full;
+        p.pos = start;
+        const items = try p.arena.alloc(FetchItem, 1);
+        items[0] = try parseFetchItem(p);
+        return items;
+    }
+    var items = std.ArrayList(FetchItem).empty;
+    while (true) {
+        try items.append(p.arena, try parseFetchItem(p));
+        if (p.take(')')) return items.items;
+        try p.space();
+    }
+}
+
+fn fetchWord(p: *proto.Parser) []const u8 {
+    const start = p.pos;
+    while (p.peek()) |ch| : (p.pos += 1) if (!std.ascii.isAlphanumeric(ch) and ch != '.') break;
+    return p.text[start..p.pos];
+}
+
+fn parseFetchItem(p: *proto.Parser) !FetchItem {
+    const word = fetchWord(p);
+    const simple = [_]struct { []const u8, FetchItem }{
+        .{ "FLAGS", .flags },             .{ "UID", .uid },                     .{ "INTERNALDATE", .internal_date },
+        .{ "RFC822.SIZE", .rfc822_size }, .{ "ENVELOPE", .envelope },           .{ "BODYSTRUCTURE", .body_structure },
+        .{ "RFC822", .rfc822 },           .{ "RFC822.HEADER", .rfc822_header }, .{ "RFC822.TEXT", .rfc822_text },
+    };
+    for (simple) |entry| if (std.ascii.eqlIgnoreCase(word, entry[0])) return entry[1];
+
+    const peek = std.ascii.eqlIgnoreCase(word, "BODY.PEEK");
+    if (!peek and !std.ascii.eqlIgnoreCase(word, "BODY")) return error.Syntax;
+    if (!p.take('[')) return if (peek) error.Syntax else .body;
+
+    const spec_start = p.pos;
+    var path = std.ArrayList(u32).empty;
+    var text: @FieldType(Section, "text") = .all;
+    var fields = std.ArrayList([]const u8).empty;
+    while (p.peek()) |ch| {
+        if (!std.ascii.isDigit(ch)) break;
+        const n = try p.number();
+        if (n == 0) return error.Syntax;
+        try path.append(p.arena, n);
+        if (!p.take('.')) break;
+    }
+    if (p.peek() != ']') {
+        const name = fetchWord(p);
+        if (std.ascii.eqlIgnoreCase(name, "HEADER")) {
+            text = .header;
+        } else if (std.ascii.eqlIgnoreCase(name, "TEXT")) {
+            text = .text;
+        } else if (std.ascii.eqlIgnoreCase(name, "MIME") and path.items.len != 0) {
+            text = .mime;
+        } else if (std.ascii.eqlIgnoreCase(name, "HEADER.FIELDS") or std.ascii.eqlIgnoreCase(name, "HEADER.FIELDS.NOT")) {
+            text = if (name.len == "HEADER.FIELDS".len) .fields else .fields_not;
+            try p.space();
+            try p.expect('(');
+            while (true) {
+                try fields.append(p.arena, try p.astring());
+                if (p.take(')')) break;
+                try p.space();
+            }
+        } else return error.Syntax;
+    }
+    const spec = p.text[spec_start..p.pos];
+    try p.expect(']');
+
+    var section: Section = .{ .spec = spec, .path = path.items, .text = text, .fields = fields.items, .peek = peek };
+    if (p.take('<')) {
+        const origin = try p.number();
+        try p.expect('.');
+        const count = try p.number();
+        if (count == 0) return error.Syntax;
+        try p.expect('>');
+        section.partial = .{ .origin = origin, .count = count };
+    }
+    return .{ .section = section };
+}
+
+fn sectionData(arena: std.mem.Allocator, raw: []const u8, root: *const mime.Part, sec: Section) ![]const u8 {
+    if (sec.path.len == 0) return switch (sec.text) {
+        .all => raw,
+        .header => root.header,
+        .text => root.body,
+        .fields, .fields_not => filterFields(arena, root.header, sec.fields, sec.text == .fields_not),
+        .mime => unreachable, // rejected while parsing
+    };
+    const part = mime.findPart(root, sec.path) orelse return "";
+    // HEADER/TEXT below a part number address an attached message/rfc822.
+    const message = part.message;
+    return switch (sec.text) {
+        .all => part.body,
+        .mime => part.header,
+        .header => if (message) |m| m.header else "",
+        .text => if (message) |m| m.body else "",
+        .fields, .fields_not => if (message) |m| filterFields(arena, m.header, sec.fields, sec.text == .fields_not) else "",
+    };
+}
+
+/// The header fields named in `names` (or all others), ending with the
+/// blank line, as HEADER.FIELDS[.NOT] requires.
+fn filterFields(arena: std.mem.Allocator, header: []const u8, names: []const []const u8, exclude: bool) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    var keep = false;
+    var lines = std.mem.splitScalar(u8, header, '\n');
+    while (lines.next()) |line| {
+        const content = std.mem.trimEnd(u8, line, "\r");
+        if (content.len == 0) continue;
+        if (content[0] != ' ' and content[0] != '\t') {
+            const colon = std.mem.indexOfScalar(u8, content, ':') orelse content.len;
+            var listed = false;
+            for (names) |name| listed = listed or std.ascii.eqlIgnoreCase(name, content[0..colon]);
+            keep = listed != exclude;
+        }
+        if (keep) {
+            try out.appendSlice(arena, content);
+            try out.appendSlice(arena, "\r\n");
+        }
+    }
+    try out.appendSlice(arena, "\r\n");
+    return out.items;
+}
+
+fn writeLiteral(w: *Io.Writer, name: []const u8, data: []const u8) !void {
+    try w.print("{s} {{{d}}}\r\n", .{ name, data.len });
+    try w.writeAll(data);
+}
+
+/// IMAP date-time, e.g. `07-Nov-2026 09:35:47 +0000`.
+fn writeInternalDate(w: *Io.Writer, seconds: u64) !void {
+    const epoch: std.time.epoch.EpochSeconds = .{ .secs = seconds };
+    const year_day = epoch.getEpochDay().calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+    const time = epoch.getDaySeconds();
+    const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    try w.print("{d:0>2}-{s}-{d} {d:0>2}:{d:0>2}:{d:0>2} +0000", .{
+        @as(u8, month_day.day_index) + 1, months[@backingInt(month_day.month) - 1], year_day.year,
+        time.getHoursIntoDay(),           time.getMinutesIntoHour(),                time.getSecondsIntoMinute(),
+    });
+}
 
 /// Whether a set names messages by sequence number or by UID.
 const Addressing = enum { sequence, uid };
@@ -445,11 +695,38 @@ test "imap session: select, fetch, store and expunge" {
         select ++ "* OK [PERMANENTFLAGS ()] read-only\r\n* 2 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 1234567890] UIDs valid\r\n* OK [UIDNEXT 3] predicted next UID\r\na2 OK [READ-ONLY] EXAMINE completed\r\n" ++
         "a3 NO [READ-ONLY] mailbox is read-only\r\n" ++
         select ++ "* OK [PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)] limited\r\n* 2 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 1234567890] UIDs valid\r\n* OK [UIDNEXT 3] predicted next UID\r\na4 OK [READ-WRITE] SELECT completed\r\n" ++
-        "* 1 FETCH (FLAGS () BODY[] {22}\r\nSubject: hi\r\n\r\nhello\r\n)\r\n* 2 FETCH (FLAGS () BODY[] {16}\r\nSubject: two\r\n\r\n)\r\na5 OK FETCH completed\r\n" ++
+        // Reading a body sets \\Seen and reports the new flags.
+        "* 1 FETCH (BODY[] {22}\r\nSubject: hi\r\n\r\nhello\r\n FLAGS (\\Seen))\r\n* 2 FETCH (BODY[] {16}\r\nSubject: two\r\n\r\n FLAGS (\\Seen))\r\na5 OK FETCH completed\r\n" ++
         "a6 OK STORE completed\r\n" ++
         "* 1 EXPUNGE\r\na7 OK EXPUNGE completed\r\n" ++
-        "* 1 FETCH (FLAGS () BODY[] {16}\r\nSubject: two\r\n\r\n)\r\na8 OK FETCH completed\r\n" ++
-        "* 1 FETCH (UID 2 FLAGS () BODY[] {16}\r\nSubject: two\r\n\r\n)\r\na9 OK FETCH completed\r\n" ++
+        "* 1 FETCH (BODY[] {16}\r\nSubject: two\r\n\r\n)\r\na8 OK FETCH completed\r\n" ++
+        "* 1 FETCH (UID 2 BODY[] {16}\r\nSubject: two\r\n\r\n)\r\na9 OK FETCH completed\r\n" ++
         "b1 OK STORE completed\r\n" ++ // UID 1 was expunged: nothing to do
         "b2 BAD unknown UID command\r\n", transcript);
+}
+
+test "imap session: fetch data items and sections" {
+    const allocator = std.testing.allocator;
+    const transcript = try testSession(allocator, "a1 LOGIN alice@example.com \"pass word\"\r\n" ++
+        "a2 SELECT INBOX\r\n" ++
+        "a3 FETCH 1 (UID FLAGS RFC822.SIZE INTERNALDATE ENVELOPE BODYSTRUCTURE)\r\n" ++
+        "a4 FETCH 1 FAST\r\n" ++
+        "a5 FETCH 1 (BODY.PEEK[HEADER.FIELDS (subject)] BODY.PEEK[TEXT] BODY.PEEK[1]<0.3> RFC822.HEADER)\r\n" ++
+        "a6 FETCH 1 FLAGS\r\n" ++
+        "a7 UID FETCH 1 (BODY[1.MIME] BODY.PEEK[2])\r\n" ++
+        "a8 FETCH 1 BODY.PEEK\r\n" ++
+        "a9 FETCH 1 (FLAGS\r\n");
+    defer allocator.free(transcript);
+    const end = std.mem.indexOf(u8, transcript, "a2 OK").?;
+    try std.testing.expectEqualStrings("a2 OK [READ-WRITE] SELECT completed\r\n" ++
+        "* 1 FETCH (UID 1 FLAGS () RFC822.SIZE 22 INTERNALDATE \"01-Jan-1970 00:00:01 +0000\" " ++
+        "ENVELOPE (NIL \"hi\" NIL NIL NIL NIL NIL NIL NIL NIL) BODYSTRUCTURE (\"text\" \"plain\" (\"charset\" \"us-ascii\") NIL NIL \"7bit\" 7 1 NIL NIL NIL NIL))\r\n" ++
+        "a3 OK FETCH completed\r\n" ++
+        "* 1 FETCH (FLAGS () INTERNALDATE \"01-Jan-1970 00:00:01 +0000\" RFC822.SIZE 22)\r\na4 OK FETCH completed\r\n" ++
+        "* 1 FETCH (BODY[HEADER.FIELDS (subject)] {15}\r\nSubject: hi\r\n\r\n BODY[TEXT] {7}\r\nhello\r\n BODY[1]<0> {3}\r\nhel RFC822.HEADER {15}\r\nSubject: hi\r\n\r\n)\r\n" ++
+        "a5 OK FETCH completed\r\n" ++
+        "* 1 FETCH (FLAGS ())\r\na6 OK FETCH completed\r\n" ++ // PEEK left \Seen alone
+        "* 1 FETCH (UID 1 BODY[1.MIME] {15}\r\nSubject: hi\r\n\r\n BODY[2] {0}\r\n FLAGS (\\Seen))\r\na7 OK FETCH completed\r\n" ++
+        "a8 BAD syntax error\r\n" ++
+        "a9 BAD syntax error\r\n", transcript[end..]);
 }

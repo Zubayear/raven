@@ -65,11 +65,13 @@ def check_delivery(smtp, imap, expected=1, sender="bob@external.test"):
 
     imap.login("alice@example.com", PASSWORD)
     assert imap.select("INBOX") == ("OK", [b"%d" % expected])
-    fetched = imap.fetch(str(expected), "(BODY[])")[1][0][1]
+    fetched = imap.fetch(str(expected), "(BODY.PEEK[])")[1][0][1]
     assert b"Subject: smoke %d" % expected in fetched
     assert b"Return-Path: <%s>" % sender.encode() in fetched and b"([127.0.0.1])" in fetched, fetched  # #11
+    summary = imap.fetch(str(expected), "(FLAGS ENVELOPE BODYSTRUCTURE)")[1][0]  # #14
+    assert b'"smoke %d"' % expected in summary and b'BODYSTRUCTURE ("text" "plain"' in summary, summary
     # Nothing is expunged in these runs, so the newest message has UID == count (#13).
-    assert b"UID %d " % expected in imap.uid("FETCH", str(expected), "(BODY[])")[1][0][0]
+    assert b"UID %d " % expected in imap.uid("FETCH", str(expected), "(BODY.PEEK[])")[1][0][0]
     validity = imap.response("UIDVALIDITY")[1][0]
     imap.logout()
     return validity
