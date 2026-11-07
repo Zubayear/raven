@@ -9,7 +9,7 @@ It currently provides SMTP, IMAP, filesystem-backed storage, tenant-aware routin
 
 ## Features
 
-- SMTP listener with inbound delivery
+- SMTP receiving per RFC 5321: `SIZE`, `8BITMIME`, `ENHANCEDSTATUSCODES`, `PIPELINING`, enforced line and recipient limits
 - IMAP listener with mailbox access
 - Maildir storage: atomic delivery, flags in file names, safe across restarts
 - Multi-tenant routing: only hosted domains and known users are accepted (no open relay), with aliases and `user+tag` plus-addressing
@@ -95,6 +95,7 @@ Common options:
 - `--tls-cert`
 - `--tls-key`
 - `--max-connections` (per listener, default 100)
+- `--max-message-size` (bytes, default 26214400; advertised with SMTP `SIZE`)
 
 Environment variables use the `RAVEN_` prefix:
 
@@ -107,6 +108,7 @@ Environment variables use the `RAVEN_` prefix:
 - `RAVEN_TLS_CERT`
 - `RAVEN_TLS_KEY`
 - `RAVEN_MAX_CONNECTIONS`
+- `RAVEN_MAX_MESSAGE_SIZE`
 
 Example config file:
 
@@ -119,6 +121,7 @@ data_dir = data
 tls_cert_file = cert.pem
 tls_key_file = key.pem
 max_connections = 100
+max_message_size = 26214400
 ```
 
 ## Data layout

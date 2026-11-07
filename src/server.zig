@@ -34,135 +34,151 @@ pub const Server = struct {
     }
 
     pub fn handleClient(self: *Server, fs_io: Io, r: *Io.Reader, w: *Io.Writer) !void {
-        const tenant_catalog = self.tenant_catalog;
-        try w.writeAll("220 ");
-        try w.writeAll(self.config.hostname);
-        try w.writeAll(" ESMTP raven ready\r\n");
+        const allocator = self.allocator;
+        const catalog = self.tenant_catalog;
+        try w.print("220 {s} ESMTP raven ready\r\n", .{self.config.hostname});
 
-        var sender: ?[]u8 = null;
-        defer if (sender) |value| self.allocator.free(value);
-
+        var greeted = false;
         var auth_identity: ?Identity = null;
-        defer if (auth_identity) |value| value.deinit(self.allocator);
-
-        var auth_pending: ?AuthChallenge = null;
-
-        var recipients = std.ArrayList(Identity).empty;
-        defer {
-            clearRecipients(self.allocator, &recipients);
-            recipients.deinit(self.allocator);
-        }
+        defer if (auth_identity) |value| value.deinit(allocator);
+        var tx: Transaction = .{};
+        defer tx.deinit(allocator);
 
         while (true) {
-            const line = try nextLine(r) orelse return;
-
-            if (auth_pending != null) {
-                auth_pending = null;
-                const identity = completeAuthPlain(self.allocator, fs_io, self.storage, tenant_catalog, line) catch {
-                    try w.writeAll("535 5.7.8 Authentication failed\r\n");
+            const line = switch (try readLine(r) orelse return) {
+                .too_long => {
+                    try w.writeAll("500 5.5.2 line too long\r\n");
                     continue;
-                };
-
-                if (auth_identity) |value| value.deinit(self.allocator);
-                auth_identity = identity;
-                try w.writeAll("235 2.7.0 Authentication successful\r\n");
+                },
+                .line => |line| line,
+            };
+            const verb, const args = splitVerb(line);
+            // AUTH lines may carry a long initial response (RFC 4954 §4).
+            if (line.len + 2 > max_command_line and !std.ascii.eqlIgnoreCase(verb, "AUTH")) {
+                try w.writeAll("500 5.5.2 line too long\r\n");
                 continue;
             }
 
-            if (startsWithIgnoreCase(line, "QUIT")) {
-                try w.writeAll("221 bye\r\n");
+            if (std.ascii.eqlIgnoreCase(verb, "QUIT")) {
+                try w.writeAll("221 2.0.0 bye\r\n");
                 return;
-            }
-
-            if (startsWithIgnoreCase(line, "EHLO") or startsWithIgnoreCase(line, "HELO")) {
-                try w.writeAll("250-");
-                try w.writeAll(self.config.hostname);
-                try w.writeAll("\r\n250-AUTH PLAIN\r\n250 PIPELINING\r\n");
-                continue;
-            }
-
-            if (startsWithIgnoreCase(line, "NOOP")) {
-                try w.writeAll("250 ok\r\n");
-                continue;
-            }
-
-            if (startsWithIgnoreCase(line, "AUTH ")) {
-                const auth = parseAuthCommand(line) catch {
-                    try w.writeAll("501 bad auth command\r\n");
-                    continue;
-                };
-
-                if (!std.ascii.eqlIgnoreCase(auth.mechanism, "PLAIN")) {
-                    try w.writeAll("504 mechanism unsupported\r\n");
+            } else if (std.ascii.eqlIgnoreCase(verb, "NOOP")) {
+                try w.writeAll("250 2.0.0 ok\r\n");
+            } else if (std.ascii.eqlIgnoreCase(verb, "RSET")) {
+                tx.reset(allocator);
+                try w.writeAll("250 2.0.0 ok\r\n");
+            } else if (std.ascii.eqlIgnoreCase(verb, "VRFY")) {
+                // Never confirm whether an account exists.
+                try w.writeAll("252 2.5.0 cannot verify, but will attempt delivery\r\n");
+            } else if (std.ascii.eqlIgnoreCase(verb, "EHLO") or std.ascii.eqlIgnoreCase(verb, "HELO")) {
+                if (args.len == 0) {
+                    try w.writeAll("501 5.5.4 syntax: EHLO hostname\r\n");
                     continue;
                 }
-
-                if (auth.initial_response) |response| {
-                    const identity = completeAuthPlain(self.allocator, fs_io, self.storage, tenant_catalog, response) catch {
-                        try w.writeAll("535 5.7.8 Authentication failed\r\n");
+                tx.reset(allocator);
+                greeted = true;
+                if (std.ascii.eqlIgnoreCase(verb, "HELO")) {
+                    try w.print("250 {s}\r\n", .{self.config.hostname});
+                } else {
+                    try w.print("250-{s}\r\n250-PIPELINING\r\n250-SIZE {d}\r\n250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n250 AUTH PLAIN\r\n", .{ self.config.hostname, self.config.max_message_size });
+                }
+            } else if (!greeted and isTransactionVerb(verb)) {
+                try w.writeAll("503 5.5.1 send EHLO first\r\n");
+            } else if (std.ascii.eqlIgnoreCase(verb, "AUTH")) {
+                if (auth_identity != null) {
+                    try w.writeAll("503 5.5.1 already authenticated\r\n");
+                    continue;
+                }
+                if (tx.sender != null) {
+                    try w.writeAll("503 5.5.1 AUTH not allowed during a transaction\r\n");
+                    continue;
+                }
+                var parts = std.mem.tokenizeScalar(u8, args, ' ');
+                const mechanism = parts.next() orelse "";
+                if (!std.ascii.eqlIgnoreCase(mechanism, "PLAIN")) {
+                    try w.writeAll("504 5.5.4 mechanism not supported\r\n");
+                    continue;
+                }
+                const response = parts.next() orelse response: {
+                    try w.writeAll("334 \r\n");
+                    break :response switch (try readLine(r) orelse return) {
+                        .too_long => "",
+                        .line => |reply| reply,
+                    };
+                };
+                if (std.mem.eql(u8, response, "*")) {
+                    try w.writeAll("501 5.0.0 authentication canceled\r\n");
+                    continue;
+                }
+                auth_identity = completeAuthPlain(allocator, fs_io, self.storage, catalog, response) catch |err| switch (err) {
+                    error.AuthFailed => {
+                        try w.writeAll("535 5.7.8 authentication failed\r\n");
+                        continue;
+                    },
+                    else => return err,
+                };
+                try w.writeAll("235 2.7.0 authentication successful\r\n");
+            } else if (std.ascii.eqlIgnoreCase(verb, "MAIL")) {
+                if (tx.sender != null) {
+                    try w.writeAll("503 5.5.1 nested MAIL command\r\n");
+                    continue;
+                }
+                const path, const params = splitPath(afterPrefix(args, "FROM:") orelse {
+                    try w.writeAll("501 5.5.4 syntax: MAIL FROM:<address>\r\n");
+                    continue;
+                });
+                const declared_size = parseMailParams(params) catch {
+                    try w.writeAll("555 5.5.4 unsupported MAIL parameter\r\n");
+                    continue;
+                };
+                if (declared_size orelse 0 > self.config.max_message_size) {
+                    try w.writeAll("552 5.3.4 message size exceeds limit\r\n");
+                    continue;
+                }
+                // The null reverse-path (bounces, RFC 5321 §4.5.5) is always accepted.
+                if (path.len != 0) {
+                    const addr = address.parse(path) catch {
+                        try w.writeAll("501 5.1.7 bad sender address\r\n");
                         continue;
                     };
-
-                    if (auth_identity) |value| value.deinit(self.allocator);
-                    auth_identity = identity;
-                    try w.writeAll("235 2.7.0 Authentication successful\r\n");
-                    continue;
-                }
-
-                auth_pending = .plain;
-                try w.writeAll("334 \r\n");
-                continue;
-            }
-
-            if (startsWithIgnoreCase(line, "RSET")) {
-                if (sender) |value| self.allocator.free(value);
-                sender = null;
-                clearRecipients(self.allocator, &recipients);
-                try w.writeAll("250 ok\r\n");
-                continue;
-            }
-
-            if (startsWithIgnoreCase(line, "MAIL FROM:")) {
-                const from = trimAfterColon(line);
-                const addr = address.parse(from) catch {
-                    try w.writeAll("501 bad sender\r\n");
-                    continue;
-                };
-
-                const hosted = tenant_catalog.find(addr.domain);
-                if (auth_identity) |identity| {
-                    // Authenticated users may only send as themselves.
-                    const own = hosted != null and std.mem.eql(u8, hosted.?.domain, identity.domain) and
-                        std.ascii.eqlIgnoreCase(addr.user, identity.user);
-                    if (!own) {
-                        try w.writeAll("553 5.7.1 sender not authorized\r\n");
+                    const hosted = catalog.find(addr.domain);
+                    if (auth_identity) |identity| {
+                        // Authenticated users may only send as themselves.
+                        const own = hosted != null and std.mem.eql(u8, hosted.?.domain, identity.domain) and
+                            std.ascii.eqlIgnoreCase(addr.user, identity.user);
+                        if (!own) {
+                            try w.writeAll("553 5.7.1 sender not authorized\r\n");
+                            continue;
+                        }
+                    } else if (hosted != null) {
+                        try w.writeAll("530 5.7.0 authentication required\r\n");
                         continue;
                     }
-                } else if (hosted != null) {
-                    try w.writeAll("530 5.7.0 authentication required\r\n");
+                }
+                tx.sender = try allocator.dupe(u8, path);
+                try w.writeAll("250 2.1.0 ok\r\n");
+            } else if (std.ascii.eqlIgnoreCase(verb, "RCPT")) {
+                if (tx.sender == null) {
+                    try w.writeAll("503 5.5.1 need MAIL first\r\n");
                     continue;
                 }
-
-                const new_sender = try self.allocator.dupe(u8, from);
-                if (sender) |value| self.allocator.free(value);
-                sender = new_sender;
-                clearRecipients(self.allocator, &recipients);
-                try w.writeAll("250 ok\r\n");
-                continue;
-            }
-
-            if (startsWithIgnoreCase(line, "RCPT TO:")) {
-                if (sender == null) {
-                    try w.writeAll("503 need mail first\r\n");
+                const path, const params = splitPath(afterPrefix(args, "TO:") orelse {
+                    try w.writeAll("501 5.5.4 syntax: RCPT TO:<address>\r\n");
+                    continue;
+                });
+                if (params.len != 0) {
+                    try w.writeAll("555 5.5.4 unsupported RCPT parameter\r\n");
                     continue;
                 }
-
-                const addr = address.parse(trimAfterColon(line)) catch {
-                    try w.writeAll("501 bad recipient\r\n");
+                const addr = address.parse(path) catch {
+                    try w.writeAll("501 5.1.3 bad recipient address\r\n");
                     continue;
                 };
-
-                const recipient = resolveRecipient(self.allocator, fs_io, self.storage, tenant_catalog, addr) catch |err| switch (err) {
+                if (tx.recipients.items.len >= max_recipients) {
+                    try w.writeAll("452 4.5.3 too many recipients\r\n");
+                    continue;
+                }
+                const recipient = resolveRecipient(allocator, fs_io, self.storage, catalog, addr) catch |err| switch (err) {
                     error.NotHosted => {
                         try w.writeAll("550 5.7.1 relaying denied\r\n");
                         continue;
@@ -173,61 +189,177 @@ pub const Server = struct {
                     },
                     else => return err,
                 };
-                errdefer recipient.deinit(self.allocator);
-
-                try recipients.append(self.allocator, recipient);
-                try w.writeAll("250 ok\r\n");
-                continue;
-            }
-
-            if (startsWithIgnoreCase(line, "DATA")) {
-                if (recipients.items.len == 0) {
-                    try w.writeAll("503 need rcpt first\r\n");
+                if (tx.has(recipient)) {
+                    recipient.deinit(allocator);
+                } else {
+                    errdefer recipient.deinit(allocator);
+                    try tx.recipients.append(allocator, recipient);
+                }
+                try w.writeAll("250 2.1.5 ok\r\n");
+            } else if (std.ascii.eqlIgnoreCase(verb, "DATA")) {
+                if (tx.recipients.items.len == 0) {
+                    try w.writeAll("503 5.5.1 need RCPT first\r\n");
                     continue;
                 }
+                try w.writeAll("354 end data with <CR><LF>.<CR><LF>\r\n");
+                const data = try readData(allocator, r, self.config.max_message_size) orelse return;
+                defer tx.reset(allocator);
+                const message = switch (data) {
+                    .too_big => {
+                        try w.writeAll("552 5.3.4 message size exceeds limit\r\n");
+                        continue;
+                    },
+                    .line_too_long => {
+                        try w.writeAll("500 5.5.2 line too long\r\n");
+                        continue;
+                    },
+                    .message => |message| message,
+                };
+                defer allocator.free(message);
 
-                try w.writeAll("354 end with <CR><LF>.<CR><LF>\r\n");
-                const message = try readDataBlock(self.allocator, r);
-                defer self.allocator.free(message);
-
-                const delivered = for (recipients.items) |recipient| {
-                    const name = self.storage.deliver(fs_io, self.allocator, recipient.tenant, recipient.domain, recipient.user, message) catch |err| {
+                for (tx.recipients.items) |recipient| {
+                    const name = self.storage.deliver(fs_io, allocator, recipient.tenant, recipient.domain, recipient.user, message) catch |err| {
                         std.debug.print("delivery to {s}@{s} failed: {}\n", .{ recipient.user, recipient.domain, err });
-                        break false;
+                        // A temporary failure makes the client retry: a duplicate beats a lost message.
+                        try w.writeAll("451 4.3.0 local error in processing\r\n");
+                        break;
                     };
-                    defer self.allocator.free(name);
+                    defer allocator.free(name);
                     std.debug.print("delivered to {s}@{s} as {s}\n", .{ recipient.user, recipient.domain, name });
-                } else true;
-
-                if (sender) |value| self.allocator.free(value);
-                sender = null;
-                clearRecipients(self.allocator, &recipients);
-                // A temporary failure makes the client retry: a duplicate beats a lost message.
-                if (!delivered) {
-                    try w.writeAll("451 4.3.0 local error in processing\r\n");
-                    continue;
-                }
-                try w.writeAll("250 queued\r\n");
-                continue;
+                } else try w.writeAll("250 2.0.0 ok\r\n");
+            } else {
+                try w.writeAll("500 5.5.2 command unrecognized\r\n");
             }
-
-            try w.writeAll("502 command not implemented\r\n");
         }
     }
 };
 
-const AuthChallenge = enum { plain };
+// RFC 5321 §4.5.3.1 limits; line lengths include the CRLF.
+const max_command_line = 512;
+const max_text_line = 1000;
+const max_recipients = 100;
 
-const AuthCommand = struct {
-    mechanism: []const u8,
-    initial_response: ?[]const u8,
+/// One mail transaction: MAIL, RCPT..., DATA.
+const Transaction = struct {
+    /// Reverse-path without brackets; empty for the null sender.
+    sender: ?[]u8 = null,
+    recipients: std.ArrayList(Identity) = .empty,
+
+    fn has(self: *const Transaction, identity: Identity) bool {
+        for (self.recipients.items) |r| {
+            if (std.mem.eql(u8, r.tenant, identity.tenant) and std.mem.eql(u8, r.domain, identity.domain) and std.mem.eql(u8, r.user, identity.user)) return true;
+        }
+        return false;
+    }
+
+    fn reset(self: *Transaction, allocator: std.mem.Allocator) void {
+        if (self.sender) |sender| allocator.free(sender);
+        self.sender = null;
+        for (self.recipients.items) |r| r.deinit(allocator);
+        self.recipients.clearRetainingCapacity();
+    }
+
+    fn deinit(self: *Transaction, allocator: std.mem.Allocator) void {
+        self.reset(allocator);
+        self.recipients.deinit(allocator);
+    }
 };
 
-fn parseAuthCommand(line: []const u8) !AuthCommand {
-    const after_auth = std.mem.trim(u8, line[4..], " \t");
-    var parts = std.mem.tokenizeAny(u8, after_auth, " \t");
-    const mechanism = parts.next() orelse return error.InvalidAuth;
-    return .{ .mechanism = mechanism, .initial_response = parts.next() };
+fn isTransactionVerb(verb: []const u8) bool {
+    for ([_][]const u8{ "MAIL", "RCPT", "DATA", "AUTH" }) |name| {
+        if (std.ascii.eqlIgnoreCase(verb, name)) return true;
+    }
+    return false;
+}
+
+fn splitVerb(line: []const u8) struct { []const u8, []const u8 } {
+    const end = std.mem.indexOfScalar(u8, line, ' ') orelse line.len;
+    return .{ line[0..end], std.mem.trim(u8, line[end..], " ") };
+}
+
+fn afterPrefix(text: []const u8, prefix: []const u8) ?[]const u8 {
+    if (text.len < prefix.len or !std.ascii.eqlIgnoreCase(text[0..prefix.len], prefix)) return null;
+    return std.mem.trim(u8, text[prefix.len..], " ");
+}
+
+/// Splits `<path> params` (brackets optional, for lenient clients).
+fn splitPath(text: []const u8) struct { []const u8, []const u8 } {
+    if (text.len > 0 and text[0] == '<') {
+        const close = std.mem.indexOfScalar(u8, text, '>') orelse return .{ text, "" };
+        return .{ text[1..close], std.mem.trim(u8, text[close + 1 ..], " ") };
+    }
+    const end = std.mem.indexOfScalar(u8, text, ' ') orelse text.len;
+    return .{ text[0..end], std.mem.trim(u8, text[end..], " ") };
+}
+
+/// Supported MAIL parameters: SIZE (RFC 1870), BODY (RFC 6152), AUTH
+/// (RFC 4954, accepted and ignored). Returns the declared size.
+fn parseMailParams(params: []const u8) !?u64 {
+    var size: ?u64 = null;
+    var it = std.mem.tokenizeScalar(u8, params, ' ');
+    while (it.next()) |param| {
+        if (afterPrefix(param, "SIZE=")) |value| {
+            size = std.fmt.parseInt(u64, value, 10) catch return error.UnsupportedParameter;
+        } else if (std.ascii.eqlIgnoreCase(param, "BODY=7BIT") or std.ascii.eqlIgnoreCase(param, "BODY=8BITMIME") or afterPrefix(param, "AUTH=") != null) {
+            continue;
+        } else return error.UnsupportedParameter;
+    }
+    return size;
+}
+
+const Line = union(enum) { line: []const u8, too_long };
+
+/// Reads one line without its line ending. A line that does not fit in the
+/// reader's buffer is consumed and reported as `too_long`.
+fn readLine(r: *Io.Reader) !?Line {
+    const raw = r.takeDelimiter('\n') catch |err| switch (err) {
+        error.StreamTooLong => {
+            _ = r.discardDelimiterInclusive('\n') catch |e| switch (e) {
+                error.EndOfStream => return null,
+                else => return e,
+            };
+            return .too_long;
+        },
+        else => return err,
+    } orelse return null;
+    return .{ .line = trimCr(raw) };
+}
+
+const Data = union(enum) { message: []u8, too_big, line_too_long };
+
+/// Reads a DATA block up to the lone ".", undoing dot-stuffing. Oversized
+/// input is drained, never buffered. Returns null if the client disconnects
+/// mid-message (nothing gets delivered).
+fn readData(allocator: std.mem.Allocator, r: *Io.Reader, max_size: u64) !?Data {
+    var message = std.ArrayList(u8).empty;
+    defer message.deinit(allocator);
+    var failure: ?Data = null;
+
+    while (true) {
+        const line = switch (try readLine(r) orelse return null) {
+            .too_long => {
+                failure = failure orelse .line_too_long;
+                continue;
+            },
+            .line => |line| line,
+        };
+        if (std.mem.eql(u8, line, ".")) break;
+        if (failure != null) continue;
+        if (line.len + 2 > max_text_line) {
+            failure = .line_too_long;
+            continue;
+        }
+        const content = if (line.len > 0 and line[0] == '.') line[1..] else line;
+        if (message.items.len + content.len + 2 > max_size) {
+            failure = .too_big;
+            message.clearAndFree(allocator);
+            continue;
+        }
+        try message.appendSlice(allocator, content);
+        try message.appendSlice(allocator, "\r\n");
+    }
+    if (failure) |f| return f;
+    return .{ .message = try message.toOwnedSlice(allocator) };
 }
 
 /// RFC 4616 PLAIN: base64("authzid\0authcid\0password").
@@ -263,32 +395,6 @@ fn decodeBase64Payload(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 
     return error.AuthFailed;
 }
 
-fn nextLine(reader: *Io.Reader) !?[]const u8 {
-    const line = try reader.takeDelimiter('\n') orelse return null;
-
-    return trimCr(line);
-}
-
-fn readDataBlock(allocator: std.mem.Allocator, reader: *Io.Reader) ![]u8 {
-    var message = std.ArrayList(u8).empty;
-    errdefer message.deinit(allocator);
-
-    while (true) {
-        const line = try nextLine(reader) orelse break;
-
-        if (std.mem.eql(u8, line, ".")) break;
-
-        if (line.len > 0 and line[0] == '.') {
-            try message.appendSlice(allocator, line[1..]);
-        } else {
-            try message.appendSlice(allocator, line);
-        }
-        try message.appendSlice(allocator, "\r\n");
-    }
-
-    return try message.toOwnedSlice(allocator);
-}
-
 /// Maps a recipient address to a local mailbox: the domain must be hosted
 /// and the user an account, directly or through an alias. `+tag` is ignored.
 fn resolveRecipient(allocator: std.mem.Allocator, io: Io, storage: Storage, catalog: *const TenantCatalog, addr: address.Address) !Identity {
@@ -301,23 +407,6 @@ fn resolveRecipient(allocator: std.mem.Allocator, io: Io, storage: Storage, cata
 
     const account = accounts.find(aliases.find(addr.user) orelse addr.user) orelse return error.UnknownUser;
     return Identity.init(allocator, hosted.tenant, hosted.domain, account.user);
-}
-
-fn clearRecipients(allocator: std.mem.Allocator, recipients: *std.ArrayList(Identity)) void {
-    for (recipients.items) |recipient| recipient.deinit(allocator);
-    recipients.clearRetainingCapacity();
-}
-
-fn startsWithIgnoreCase(haystack: []const u8, needle: []const u8) bool {
-    if (haystack.len < needle.len) return false;
-    return std.ascii.eqlIgnoreCase(haystack[0..needle.len], needle);
-}
-
-fn trimAfterColon(line: []const u8) []const u8 {
-    var index: usize = 0;
-    while (index < line.len and line[index] != ':') : (index += 1) {}
-    if (index >= line.len) return line;
-    return std.mem.trim(u8, line[index + 1 ..], " \t");
 }
 
 fn trimCr(line: []const u8) []const u8 {
@@ -356,7 +445,11 @@ const TestDir = struct {
 
     /// Runs one SMTP session and returns the transcript; the caller frees it.
     fn session(self: *TestDir, allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-        var server = Server.init(allocator, .{ .data_dir = self.root }, &self.catalog);
+        return self.sessionWith(allocator, .{ .data_dir = self.root }, input);
+    }
+
+    fn sessionWith(self: *TestDir, allocator: std.mem.Allocator, config: Config, input: []const u8) ![]u8 {
+        var server = Server.init(allocator, config, &self.catalog);
         var in: Io.Reader = .fixed(input);
         var out: Io.Writer.Allocating = .init(allocator);
         defer out.deinit();
@@ -416,24 +509,102 @@ fn buildPlainAuthPayload(allocator: std.mem.Allocator, authzid: []const u8, logi
     return encoded;
 }
 
+const greeting = "220 localhost ESMTP raven ready\r\n";
+const ehlo_reply = "250-localhost\r\n250-PIPELINING\r\n250-SIZE 26214400\r\n250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n250 AUTH PLAIN\r\n";
+
 test "smtp session delivers a pipelined transaction" {
     const allocator = std.testing.allocator;
     var dir = try TestDir.init(allocator);
     defer dir.deinit(allocator);
 
-    const transcript = try dir.session(allocator, "EHLO client\r\nMAIL FROM:<bob@external.test>\r\nRCPT TO:<alice+news@example.com>\r\n" ++
+    const transcript = try dir.session(allocator, "EHLO client\r\nMAIL FROM:<bob@external.test> SIZE=30 BODY=8BITMIME\r\n" ++
+        "RCPT TO:<alice+news@example.com>\r\nRCPT TO:<sales@example.com>\r\n" ++
         "DATA\r\nSubject: hi\r\n\r\n..dot\r\n.\r\nQUIT\r\n");
     defer allocator.free(transcript);
-    try std.testing.expectEqualStrings("220 localhost ESMTP raven ready\r\n" ++
-        "250-localhost\r\n250-AUTH PLAIN\r\n250 PIPELINING\r\n" ++
-        "250 ok\r\n250 ok\r\n354 end with <CR><LF>.<CR><LF>\r\n250 queued\r\n221 bye\r\n", transcript);
+    try std.testing.expectEqualStrings(greeting ++ ehlo_reply ++
+        "250 2.1.0 ok\r\n250 2.1.5 ok\r\n250 2.1.5 ok\r\n354 end data with <CR><LF>.<CR><LF>\r\n250 2.0.0 ok\r\n221 2.0.0 bye\r\n", transcript);
 
+    // sales is an alias of alice: one copy, not two.
     const messages = try dir.inbox(allocator);
     defer @import("storage.zig").freeMessages(allocator, messages);
     try std.testing.expectEqual(@as(usize, 1), messages.len);
     const body = try Storage.readMessage(std.testing.io, allocator, messages[0]);
     defer allocator.free(body);
     try std.testing.expectEqualStrings("Subject: hi\r\n\r\n.dot\r\n", body);
+}
+
+test "smtp session accepts the null sender" {
+    const allocator = std.testing.allocator;
+    var dir = try TestDir.init(allocator);
+    defer dir.deinit(allocator);
+
+    const transcript = try dir.session(allocator, "HELO client\r\nMAIL FROM:<>\r\nRCPT TO:<alice@example.com>\r\nDATA\r\nbounce\r\n.\r\nQUIT\r\n");
+    defer allocator.free(transcript);
+    try std.testing.expectEqualStrings(greeting ++ "250 localhost\r\n250 2.1.0 ok\r\n250 2.1.5 ok\r\n" ++
+        "354 end data with <CR><LF>.<CR><LF>\r\n250 2.0.0 ok\r\n221 2.0.0 bye\r\n", transcript);
+}
+
+test "smtp session enforces command order and syntax" {
+    const allocator = std.testing.allocator;
+    var dir = try TestDir.init(allocator);
+    defer dir.deinit(allocator);
+
+    const transcript = try dir.session(allocator, "MAIL FROM:<bob@external.test>\r\nEHLO\r\nVRFY alice\r\nBOGUS\r\nEHLO client\r\n" ++
+        "RCPT TO:<alice@example.com>\r\nDATA\r\nMAIL bob@external.test\r\nMAIL FROM:bob@external.test\r\n" ++
+        "MAIL FROM:<carol@external.test>\r\nRCPT TO:<alice@example.com> NOTIFY=NEVER\r\nRSET\r\n" ++
+        "MAIL FROM:<bob@external.test> FOO=1\r\nQUIT\r\n");
+    defer allocator.free(transcript);
+    try std.testing.expectEqualStrings(greeting ++
+        "503 5.5.1 send EHLO first\r\n501 5.5.4 syntax: EHLO hostname\r\n252 2.5.0 cannot verify, but will attempt delivery\r\n" ++
+        "500 5.5.2 command unrecognized\r\n" ++ ehlo_reply ++
+        "503 5.5.1 need MAIL first\r\n503 5.5.1 need RCPT first\r\n501 5.5.4 syntax: MAIL FROM:<address>\r\n250 2.1.0 ok\r\n" ++
+        "503 5.5.1 nested MAIL command\r\n555 5.5.4 unsupported RCPT parameter\r\n250 2.0.0 ok\r\n" ++
+        "555 5.5.4 unsupported MAIL parameter\r\n221 2.0.0 bye\r\n", transcript);
+}
+
+test "smtp session enforces size and line limits" {
+    const allocator = std.testing.allocator;
+    var dir = try TestDir.init(allocator);
+    defer dir.deinit(allocator);
+
+    const long_command = "NOOP " ++ @as([600]u8, @splat('x')) ++ "\r\n";
+    const long_text = @as([999]u8, @splat('y')) ++ "\r\n";
+    const transcript = try dir.sessionWith(allocator, .{ .data_dir = dir.root, .max_message_size = 64 }, "EHLO client\r\n" ++ long_command ++
+        "MAIL FROM:<bob@external.test> SIZE=65\r\n" ++
+        "MAIL FROM:<bob@external.test>\r\nRCPT TO:<alice@example.com>\r\nDATA\r\n" ++ @as([70]u8, @splat('z')) ++ "\r\n.\r\n" ++
+        "MAIL FROM:<bob@external.test>\r\nRCPT TO:<alice@example.com>\r\nDATA\r\n" ++ long_text ++ ".\r\nQUIT\r\n");
+    defer allocator.free(transcript);
+    try std.testing.expectEqualStrings(greeting ++
+        "250-localhost\r\n250-PIPELINING\r\n250-SIZE 64\r\n250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n250 AUTH PLAIN\r\n" ++
+        "500 5.5.2 line too long\r\n552 5.3.4 message size exceeds limit\r\n" ++
+        "250 2.1.0 ok\r\n250 2.1.5 ok\r\n354 end data with <CR><LF>.<CR><LF>\r\n552 5.3.4 message size exceeds limit\r\n" ++
+        "250 2.1.0 ok\r\n250 2.1.5 ok\r\n354 end data with <CR><LF>.<CR><LF>\r\n500 5.5.2 line too long\r\n221 2.0.0 bye\r\n", transcript);
+
+    const messages = try dir.inbox(allocator);
+    defer @import("storage.zig").freeMessages(allocator, messages);
+    try std.testing.expectEqual(@as(usize, 0), messages.len);
+}
+
+test "smtp session caps recipients per transaction" {
+    const allocator = std.testing.allocator;
+    var dir = try TestDir.init(allocator);
+    defer dir.deinit(allocator);
+
+    var accounts: std.Io.Writer.Allocating = .init(allocator);
+    defer accounts.deinit();
+    var input: std.Io.Writer.Allocating = .init(allocator);
+    defer input.deinit();
+    try input.writer.writeAll("EHLO client\r\nMAIL FROM:<bob@external.test>\r\n");
+    for (0..max_recipients + 1) |i| {
+        try accounts.writer.print("u{d} {s}\n", .{ i, @as([64]u8, @splat('0')) });
+        try input.writer.print("RCPT TO:<u{d}@example.com>\r\n", .{i});
+    }
+    try dir.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tenants/acme/domains/example.com/accounts.txt", .data = accounts.written() });
+
+    const transcript = try dir.session(allocator, input.written());
+    defer allocator.free(transcript);
+    try std.testing.expectEqual(@as(usize, max_recipients), std.mem.count(u8, transcript, "250 2.1.5 ok\r\n"));
+    try std.testing.expect(std.mem.endsWith(u8, transcript, "452 4.5.3 too many recipients\r\n"));
 }
 
 test "smtp session enforces relay, recipient and sender rules" {
@@ -444,22 +615,41 @@ test "smtp session enforces relay, recipient and sender rules" {
     const auth = try buildPlainAuthPayload(allocator, "", "alice@example.com", "secret");
     defer allocator.free(auth);
     const input = try std.mem.concat(allocator, u8, &.{
+        "EHLO client\r\n",
         "MAIL FROM:<alice@example.com>\r\n", // hosted sender without auth
         "MAIL FROM:<bob@external.test>\r\n",
         "RCPT TO:<alice@other.com>\r\n", // not hosted: no relaying
         "RCPT TO:<nobody@example.com>\r\n",
-        "AUTH PLAIN ",
+        "RSET\r\nAUTH PLAIN ",
         auth,
-        "\r\nMAIL FROM:<bob@example.com>\r\n", // authenticated, but not as bob
+        "\r\nAUTH PLAIN\r\n",
+        "MAIL FROM:<bob@example.com>\r\n", // authenticated, but not as bob
         "MAIL FROM:<Alice@example.com>\r\nQUIT\r\n",
     });
     defer allocator.free(input);
 
     const transcript = try dir.session(allocator, input);
     defer allocator.free(transcript);
-    try std.testing.expectEqualStrings("220 localhost ESMTP raven ready\r\n" ++
-        "530 5.7.0 authentication required\r\n250 ok\r\n550 5.7.1 relaying denied\r\n550 5.1.1 user unknown\r\n" ++
-        "235 2.7.0 Authentication successful\r\n553 5.7.1 sender not authorized\r\n250 ok\r\n221 bye\r\n", transcript);
+    try std.testing.expectEqualStrings(greeting ++ ehlo_reply ++
+        "530 5.7.0 authentication required\r\n250 2.1.0 ok\r\n550 5.7.1 relaying denied\r\n550 5.1.1 user unknown\r\n250 2.0.0 ok\r\n" ++
+        "235 2.7.0 authentication successful\r\n503 5.5.1 already authenticated\r\n553 5.7.1 sender not authorized\r\n" ++
+        "250 2.1.0 ok\r\n221 2.0.0 bye\r\n", transcript);
+}
+
+test "smtp session handles AUTH continuation and cancel" {
+    const allocator = std.testing.allocator;
+    var dir = try TestDir.init(allocator);
+    defer dir.deinit(allocator);
+
+    const wrong = try buildPlainAuthPayload(allocator, "", "alice@example.com", "wrong");
+    defer allocator.free(wrong);
+    const input = try std.mem.concat(allocator, u8, &.{ "EHLO client\r\nAUTH LOGIN\r\nAUTH PLAIN\r\n*\r\nAUTH PLAIN\r\n", wrong, "\r\nQUIT\r\n" });
+    defer allocator.free(input);
+
+    const transcript = try dir.session(allocator, input);
+    defer allocator.free(transcript);
+    try std.testing.expectEqualStrings(greeting ++ ehlo_reply ++
+        "504 5.5.4 mechanism not supported\r\n334 \r\n501 5.0.0 authentication canceled\r\n334 \r\n535 5.7.8 authentication failed\r\n221 2.0.0 bye\r\n", transcript);
 }
 
 test "smtp session rejects path traversal in addresses" {
@@ -467,10 +657,10 @@ test "smtp session rejects path traversal in addresses" {
     var dir = try TestDir.init(allocator);
     defer dir.deinit(allocator);
 
-    const transcript = try dir.session(allocator, "MAIL FROM:<../../x@external.test>\r\nMAIL FROM:<bob@external.test>\r\n" ++
+    const transcript = try dir.session(allocator, "EHLO client\r\nMAIL FROM:<../../x@external.test>\r\nMAIL FROM:<bob@external.test>\r\n" ++
         "RCPT TO:<../../../../../escape@example.com>\r\nRCPT TO:<alice@../../../escape>\r\nDATA\r\nQUIT\r\n");
     defer allocator.free(transcript);
-    try std.testing.expectEqualStrings("220 localhost ESMTP raven ready\r\n501 bad sender\r\n250 ok\r\n" ++
-        "501 bad recipient\r\n501 bad recipient\r\n503 need rcpt first\r\n221 bye\r\n", transcript);
+    try std.testing.expectEqualStrings(greeting ++ ehlo_reply ++ "501 5.1.7 bad sender address\r\n250 2.1.0 ok\r\n" ++
+        "501 5.1.3 bad recipient address\r\n501 5.1.3 bad recipient address\r\n503 5.5.1 need RCPT first\r\n221 2.0.0 bye\r\n", transcript);
     try std.testing.expectError(error.FileNotFound, dir.tmp.dir.access(std.testing.io, "escape", .{}));
 }
