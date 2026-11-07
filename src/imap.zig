@@ -89,7 +89,7 @@ const capabilities = "IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE";
 
 const State = enum { not_authenticated, authenticated, selected, logout };
 
-const Command = enum { capability, noop, logout, login, select, examine, list, lsub, create, delete, rename, subscribe, unsubscribe, status, append, fetch, store, expunge, uid, check, close, unselect, copy, move };
+const Command = enum { capability, noop, logout, login, select, examine, list, lsub, create, delete, rename, subscribe, unsubscribe, status, append, fetch, store, expunge, uid, check, close, unselect, copy, move, search };
 
 /// One command being executed.
 const Context = struct {
@@ -111,7 +111,7 @@ const Context = struct {
             .capability, .noop, .logout => true,
             .login => state == .not_authenticated,
             .select, .examine, .list, .lsub, .create, .delete, .rename, .subscribe, .unsubscribe, .status, .append => state == .authenticated or state == .selected,
-            .fetch, .store, .expunge, .uid, .check, .close, .unselect, .copy, .move => state == .selected,
+            .fetch, .store, .expunge, .uid, .check, .close, .unselect, .copy, .move, .search => state == .selected,
         };
         if (!allowed) return ctx.bad(if (state == .not_authenticated) "log in first" else "command not valid in this state");
 
@@ -141,6 +141,7 @@ const Context = struct {
             .status => try ctx.status(p),
             .append => try ctx.append(p),
             .copy, .move => try ctx.copy(p, .sequence, cmd == .move),
+            .search => try ctx.search(p, .sequence),
             .fetch => try ctx.fetch(p, .sequence),
             .store => try ctx.store(p, .sequence),
             .expunge => {
@@ -167,6 +168,7 @@ const Context = struct {
                 if (std.ascii.eqlIgnoreCase(sub, "STORE")) return ctx.store(p, .uid);
                 if (std.ascii.eqlIgnoreCase(sub, "COPY")) return ctx.copy(p, .uid, false);
                 if (std.ascii.eqlIgnoreCase(sub, "MOVE")) return ctx.copy(p, .uid, true);
+                if (std.ascii.eqlIgnoreCase(sub, "SEARCH")) return ctx.search(p, .uid);
                 return ctx.bad("unknown UID command");
             },
         }
@@ -582,6 +584,36 @@ const Context = struct {
         }
     }
 
+    /// SEARCH / UID SEARCH (RFC 3501 §6.4.4).
+    fn search(ctx: Context, p: *proto.Parser, by: Addressing) !void {
+        try p.space();
+        if (p.text.len - p.pos >= 8 and std.ascii.eqlIgnoreCase(p.text[p.pos..][0..8], "CHARSET ")) {
+            p.pos += 8;
+            const charset = try p.astring();
+            if (!std.ascii.eqlIgnoreCase(charset, "UTF-8") and !std.ascii.eqlIgnoreCase(charset, "US-ASCII")) return ctx.no("[BADCHARSET (US-ASCII UTF-8)] unsupported charset");
+            try p.space();
+        }
+        const query = try parseSearchKeys(p, ')');
+        try p.end();
+
+        const allocator = ctx.server.allocator;
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const messages = ctx.session.messages.items;
+        try ctx.w.writeAll("* SEARCH");
+        for (messages, 1..) |message, number| {
+            _ = arena_state.reset(.retain_capacity);
+            var view: SearchView = .{ .session = ctx.session, .number = number, .message = &message, .io = ctx.io, .arena = arena_state.allocator() };
+            const matched = view.matchesAll(query) catch |err| switch (err) {
+                error.FileNotFound => continue, // vanished under a concurrent session
+                else => return err,
+            };
+            if (matched) try ctx.w.print(" {d}", .{if (by == .uid) message.uid else number});
+        }
+        try ctx.w.writeAll("\r\n");
+        try ctx.ok("SEARCH completed");
+    }
+
     fn ok(ctx: Context, text: []const u8) !void {
         try ctx.w.print("{s} OK {s}\r\n", .{ ctx.tag, text });
     }
@@ -786,6 +818,196 @@ fn writeInternalDate(w: *Io.Writer, seconds: u64) !void {
     });
 }
 
+const SearchKey = union(enum) {
+    all,
+    set: proto.SequenceSet,
+    uid_set: proto.SequenceSet,
+    flag: struct { name: enum { seen, answered, flagged, deleted, draft }, set: bool },
+    recent: bool,
+    new,
+    header: struct { field: []const u8, needle: []const u8 },
+    body: []const u8,
+    text: []const u8,
+    date: struct { op: enum { before, on, since }, day: u64, sent: bool },
+    size: struct { larger: bool, bytes: u64 },
+    not: *const SearchKey,
+    @"or": [2]*const SearchKey,
+    group: []const SearchKey,
+};
+
+/// `key *(SP key)` up to end of input or `close`; an implicit AND.
+fn parseSearchKeys(p: *proto.Parser, close: u8) proto.Parser.Error![]const SearchKey {
+    var keys = std.ArrayList(SearchKey).empty;
+    while (true) {
+        try keys.append(p.arena, try parseSearchKey(p));
+        if (p.atEnd() or p.peek() == close) return keys.items;
+        try p.space();
+    }
+}
+
+fn parseSearchKey(p: *proto.Parser) proto.Parser.Error!SearchKey {
+    if (p.take('(')) {
+        const keys = try parseSearchKeys(p, ')');
+        try p.expect(')');
+        return .{ .group = keys };
+    }
+    if (p.peek()) |ch| if (std.ascii.isDigit(ch) or ch == '*') return .{ .set = try p.sequenceSet() };
+
+    const word = try p.atom();
+    const flags = [_]struct { []const u8, @FieldType(@FieldType(SearchKey, "flag"), "name"), bool }{
+        .{ "SEEN", .seen, true },         .{ "UNSEEN", .seen, false },
+        .{ "ANSWERED", .answered, true }, .{ "UNANSWERED", .answered, false },
+        .{ "FLAGGED", .flagged, true },   .{ "UNFLAGGED", .flagged, false },
+        .{ "DELETED", .deleted, true },   .{ "UNDELETED", .deleted, false },
+        .{ "DRAFT", .draft, true },       .{ "UNDRAFT", .draft, false },
+    };
+    for (flags) |f| if (std.ascii.eqlIgnoreCase(word, f[0])) return .{ .flag = .{ .name = f[1], .set = f[2] } };
+    for ([_][]const u8{ "FROM", "TO", "CC", "BCC", "SUBJECT" }) |field| {
+        if (std.ascii.eqlIgnoreCase(word, field)) {
+            try p.space();
+            return .{ .header = .{ .field = field, .needle = try p.astring() } };
+        }
+    }
+    const dates = [_]struct { []const u8, @FieldType(@FieldType(SearchKey, "date"), "op"), bool }{
+        .{ "BEFORE", .before, false },    .{ "ON", .on, false },    .{ "SINCE", .since, false },
+        .{ "SENTBEFORE", .before, true }, .{ "SENTON", .on, true }, .{ "SENTSINCE", .since, true },
+    };
+    for (dates) |d| {
+        if (std.ascii.eqlIgnoreCase(word, d[0])) {
+            try p.space();
+            const day = parseSearchDate(try p.astring()) orelse return error.Syntax;
+            return .{ .date = .{ .op = d[1], .day = day, .sent = d[2] } };
+        }
+    }
+
+    const Simple = enum { all, recent, old, new, header, body, text, larger, smaller, not, @"or", uid };
+    var lower: [8]u8 = undefined;
+    const simple = if (word.len <= lower.len) std.meta.stringToEnum(Simple, std.ascii.lowerString(&lower, word)) else null;
+    switch (simple orelse return error.Syntax) {
+        .all => return .all,
+        .recent => return .{ .recent = true },
+        .old => return .{ .recent = false },
+        .new => return .new,
+        .header => {
+            try p.space();
+            const field = try p.astring();
+            try p.space();
+            return .{ .header = .{ .field = field, .needle = try p.astring() } };
+        },
+        .body, .text => {
+            try p.space();
+            const needle = try p.astring();
+            return if (simple.? == .body) .{ .body = needle } else .{ .text = needle };
+        },
+        .larger, .smaller => {
+            try p.space();
+            return .{ .size = .{ .larger = simple.? == .larger, .bytes = try p.number() } };
+        },
+        .not => {
+            try p.space();
+            const key = try p.arena.create(SearchKey);
+            key.* = try parseSearchKey(p);
+            return .{ .not = key };
+        },
+        .@"or" => {
+            const keys = try p.arena.alloc(SearchKey, 2);
+            for (keys) |*key| {
+                try p.space();
+                key.* = try parseSearchKey(p);
+            }
+            return .{ .@"or" = .{ &keys[0], &keys[1] } };
+        },
+        .uid => {
+            try p.space();
+            return .{ .uid_set = try p.sequenceSet() };
+        },
+    }
+}
+
+/// `7-Nov-2026` (quoted or not) as days since the epoch.
+fn parseSearchDate(text: []const u8) ?u64 {
+    var buf: [48]u8 = undefined;
+    const date_time = std.fmt.bufPrint(&buf, "{s} 00:00:00 +0000", .{text}) catch return null;
+    return (parseDateTime(date_time) orelse return null) / std.time.s_per_day;
+}
+
+/// One message under test; content is read only if a key needs it.
+const SearchView = struct {
+    session: *const Session,
+    number: usize,
+    message: *const Message,
+    io: Io,
+    arena: std.mem.Allocator,
+    part: ?mime.Part = null,
+
+    fn content(view: *SearchView) !mime.Part {
+        if (view.part == null) view.part = try mime.parseShallow(view.arena, try Storage.readMessage(view.io, view.arena, view.message.*));
+        return view.part.?;
+    }
+
+    fn matchesAll(view: *SearchView, keys: []const SearchKey) anyerror!bool {
+        for (keys) |key| if (!try view.matches(key)) return false;
+        return true;
+    }
+
+    fn matches(view: *SearchView, key: SearchKey) anyerror!bool {
+        const m = view.message;
+        return switch (key) {
+            .all => true,
+            .set => |set| view.session.inSet(set, .sequence, view.number),
+            .uid_set => |set| view.session.inSet(set, .uid, view.number),
+            .flag => |f| f.set == switch (f.name) {
+                .seen => m.flags.seen,
+                .answered => m.flags.answered,
+                .flagged => m.flags.flagged,
+                .deleted => m.flags.deleted,
+                .draft => m.flags.draft,
+            },
+            .recent => |recent| m.recent == recent,
+            .new => m.recent and !m.flags.seen,
+            .header => |h| blk: {
+                const value = try mime.field(view.arena, (try view.content()).header, h.field) orelse break :blk false;
+                break :blk containsIgnoreCase(value, h.needle);
+            },
+            .body => |needle| containsIgnoreCase((try view.content()).body, needle),
+            .text => |needle| blk: {
+                const part = try view.content();
+                break :blk containsIgnoreCase(part.header, needle) or containsIgnoreCase(part.body, needle);
+            },
+            .date => |d| blk: {
+                const day = if (d.sent) sentDay(try mime.field(view.arena, (try view.content()).header, "Date")) orelse break :blk false else m.internal_date / std.time.s_per_day;
+                break :blk switch (d.op) {
+                    .before => day < d.day,
+                    .on => day == d.day,
+                    .since => day >= d.day,
+                };
+            },
+            .size => |s| if (s.larger) m.size > s.bytes else m.size < s.bytes,
+            .not => |inner| !try view.matches(inner.*),
+            .@"or" => |pair| try view.matches(pair[0].*) or try view.matches(pair[1].*),
+            .group => |keys| try view.matchesAll(keys),
+        };
+    }
+};
+
+/// The day of an RFC 5322 Date header, ignoring time and zone (RFC 3501
+/// §6.4.4), e.g. `Sat, 07 Nov 2026 09:35:47 +0000`.
+fn sentDay(date: ?[]const u8) ?u64 {
+    var text = date orelse return null;
+    if (std.mem.indexOfScalar(u8, text, ',')) |comma| text = text[comma + 1 ..];
+    var fields = std.mem.tokenizeScalar(u8, text, ' ');
+    const day = fields.next() orelse return null;
+    const month = fields.next() orelse return null;
+    const year = fields.next() orelse return null;
+    var buf: [32]u8 = undefined;
+    const joined = std.fmt.bufPrint(&buf, "{s}-{s}-{s} 00:00:00 +0000", .{ day, month, year }) catch return null;
+    return (parseDateTime(joined) orelse return null) / std.time.s_per_day;
+}
+
+fn containsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    return std.ascii.findIgnoreCase(haystack, needle) != null;
+}
+
 /// Whether a set names messages by sequence number or by UID.
 const Addressing = enum { sequence, uid };
 
@@ -951,10 +1173,10 @@ fn testSession(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
 
     try account_index.writeTestAccounts(allocator, tmp.dir, &.{"alice"}, "pass word");
     try tmp.dir.createDirPath(std.testing.io, "tenants/acme/domains/example.com/users/alice/Maildir/new");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tenants/acme/domains/example.com/users/alice/Maildir/new/1.eml", .data = "Subject: hi\r\n\r\nhello\r\n" });
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tenants/acme/domains/example.com/users/alice/Maildir/new/2.eml", .data = "Subject: two\r\n\r\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tenants/acme/domains/example.com/users/alice/Maildir/new/0000000001.fixture", .data = "Subject: hi\r\n\r\nhello\r\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tenants/acme/domains/example.com/users/alice/Maildir/new/0000000002.fixture", .data = "Subject: two\r\n\r\n" });
     // INTERNALDATE comes from the mtime: pin it to 1970-01-01 00:00:01.
-    for ([_][]const u8{ "1.eml", "2.eml" }) |name| {
+    for ([_][]const u8{ "0000000001.fixture", "0000000002.fixture" }) |name| {
         const path = try std.fmt.allocPrint(allocator, "tenants/acme/domains/example.com/users/alice/Maildir/new/{s}", .{name});
         defer allocator.free(path);
         const file = try tmp.dir.openFile(std.testing.io, path, .{ .mode = .read_write });
@@ -1158,4 +1380,59 @@ test "imap session: folders, append, copy, move, status" {
         "b7 OK DELETE completed\r\n" ++
         "b8 NO [CANNOT] INBOX cannot be deleted\r\n", rest[after_select .. std.mem.indexOf(u8, rest, "b8 NO").? + "b8 NO [CANNOT] INBOX cannot be deleted\r\n".len]);
     try std.testing.expect(std.mem.indexOf(u8, rest, "* 1 EXISTS\r\n") != null); // Trash holds the moved message
+}
+
+test "imap session: search" {
+    const allocator = std.testing.allocator;
+    const transcript = try testSession(allocator, "a1 LOGIN alice@example.com \"pass word\"\r\n" ++
+        "a2 APPEND INBOX (\\Flagged \\Seen) \"07-Nov-2026 09:35:47 +0000\" {138+}\r\nFrom: Alice <alice@example.com>\r\nTo: bob@example.net\r\nSubject: Quarterly Report\r\nDate: Sat, 07 Nov 2026 09:35:47 +0000\r\n\r\nnumbers inside\r\n\r\n" ++
+        "a3 APPEND INBOX (\\Answered) \"02-Nov-2026 12:00:00 +0000\" {90+}\r\nFrom: carol@example.org\r\nSubject: lunch?\r\nDate: Mon, 02 Nov 2026 12:00:00 +0000\r\n\r\npizza\r\n\r\n" ++
+        "a4 SELECT INBOX\r\n" ++
+        "s01 SEARCH ALL\r\n" ++
+        "s02 SEARCH FLAGGED\r\n" ++
+        "s03 SEARCH UNSEEN\r\n" ++
+        "s04 SEARCH FROM ALICE\r\n" ++
+        "s05 SEARCH SUBJECT \"report\"\r\n" ++
+        "s06 SEARCH BODY pizza\r\n" ++
+        "s07 SEARCH TEXT quarterly\r\n" ++
+        "s08 SEARCH SINCE 3-Nov-2026\r\n" ++
+        "s09 SEARCH BEFORE \"1-Jan-1971\"\r\n" ++
+        "s10 SEARCH SENTON 2-Nov-2026\r\n" ++
+        "s11 SEARCH OR FLAGGED ANSWERED\r\n" ++
+        "s12 SEARCH NOT SEEN 2:4\r\n" ++
+        "s13 SEARCH (OR FROM carol SUBJECT hi) UNANSWERED\r\n" ++
+        "s14 SEARCH SMALLER 20\r\n" ++
+        "s15 SEARCH RECENT\r\n" ++
+        "s16 SEARCH NEW\r\n" ++
+        "s17 SEARCH HEADER To bob\r\n" ++
+        "s18 UID SEARCH FLAGGED\r\n" ++
+        "s19 SEARCH UID 4\r\n" ++
+        "s20 SEARCH CHARSET UTF-8 ANSWERED\r\n" ++
+        "s21 SEARCH CHARSET KOI8-R ALL\r\n" ++
+        "s22 SEARCH BOGUS\r\n");
+    defer allocator.free(transcript);
+    const start = std.mem.indexOf(u8, transcript, "a4 OK").?;
+    try std.testing.expectEqualStrings("a4 OK [READ-WRITE] SELECT completed\r\n" ++
+        "* SEARCH 1 2 3 4\r\ns01 OK SEARCH completed\r\n" ++
+        "* SEARCH 3\r\ns02 OK SEARCH completed\r\n" ++
+        "* SEARCH 1 2 4\r\ns03 OK SEARCH completed\r\n" ++
+        "* SEARCH 3\r\ns04 OK SEARCH completed\r\n" ++
+        "* SEARCH 3\r\ns05 OK SEARCH completed\r\n" ++
+        "* SEARCH 4\r\ns06 OK SEARCH completed\r\n" ++
+        "* SEARCH 3\r\ns07 OK SEARCH completed\r\n" ++
+        "* SEARCH 3\r\ns08 OK SEARCH completed\r\n" ++
+        "* SEARCH 1 2\r\ns09 OK SEARCH completed\r\n" ++
+        "* SEARCH 4\r\ns10 OK SEARCH completed\r\n" ++
+        "* SEARCH 3 4\r\ns11 OK SEARCH completed\r\n" ++
+        "* SEARCH 2 4\r\ns12 OK SEARCH completed\r\n" ++
+        "* SEARCH 1\r\ns13 OK SEARCH completed\r\n" ++
+        "* SEARCH 2\r\ns14 OK SEARCH completed\r\n" ++
+        "* SEARCH 1 2\r\ns15 OK SEARCH completed\r\n" ++
+        "* SEARCH 1 2\r\ns16 OK SEARCH completed\r\n" ++
+        "* SEARCH 3\r\ns17 OK SEARCH completed\r\n" ++
+        "* SEARCH 3\r\ns18 OK SEARCH completed\r\n" ++
+        "* SEARCH 4\r\ns19 OK SEARCH completed\r\n" ++
+        "* SEARCH 4\r\ns20 OK SEARCH completed\r\n" ++
+        "s21 NO [BADCHARSET (US-ASCII UTF-8)] unsupported charset\r\n" ++
+        "s22 BAD syntax error\r\n", transcript[start..]);
 }
