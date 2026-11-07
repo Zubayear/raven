@@ -10,6 +10,8 @@ pub const Config = struct {
     tls_key_file: []const u8 = "",
     /// Per listener; further clients are turned away with 421 / BYE.
     max_connections: u32 = 100,
+    /// Largest accepted message in bytes, advertised with SMTP SIZE.
+    max_message_size: u64 = 25 * 1024 * 1024,
     config_path: ?[]const u8 = null,
 
     pub fn load(process: std.process.Init) !Config {
@@ -31,7 +33,7 @@ pub const Config = struct {
         if (self.hostname.len == 0) return error.InvalidConfig;
         if (self.data_dir.len == 0) return error.InvalidConfig;
         if (self.listen_port == 0 or self.imap_port == 0) return error.InvalidConfig;
-        if (self.max_connections == 0) return error.InvalidConfig;
+        if (self.max_connections == 0 or self.max_message_size == 0) return error.InvalidConfig;
     }
 };
 
@@ -45,6 +47,7 @@ const ArgsOptions = struct {
     tls_cert_file: ?[]const u8 = null,
     tls_key_file: ?[]const u8 = null,
     max_connections: ?u32 = null,
+    max_message_size: ?u64 = null,
 };
 
 fn parseArgs(process: std.process.Init, arena: std.mem.Allocator) !ArgsOptions {
@@ -90,6 +93,10 @@ fn parseArgs(process: std.process.Init, arena: std.mem.Allocator) !ArgsOptions {
             args.max_connections = try std.fmt.parseInt(u32, it.next() orelse return error.MissingConfigValue, 10);
             continue;
         }
+        if (std.mem.eql(u8, arg, "--max-message-size")) {
+            args.max_message_size = try std.fmt.parseInt(u64, it.next() orelse return error.MissingConfigValue, 10);
+            continue;
+        }
     }
     return args;
 }
@@ -103,6 +110,7 @@ fn applyArgs(config: *Config, args: ArgsOptions) void {
     if (args.tls_cert_file) |value| config.tls_cert_file = value;
     if (args.tls_key_file) |value| config.tls_key_file = value;
     if (args.max_connections) |value| config.max_connections = value;
+    if (args.max_message_size) |value| config.max_message_size = value;
 }
 
 fn applyEnv(config: *Config, process: std.process.Init, arena: std.mem.Allocator) !void {
@@ -114,6 +122,7 @@ fn applyEnv(config: *Config, process: std.process.Init, arena: std.mem.Allocator
     if (try getEnvValue(process, "RAVEN_TLS_CERT")) |value| config.tls_cert_file = try arena.dupe(u8, value);
     if (try getEnvValue(process, "RAVEN_TLS_KEY")) |value| config.tls_key_file = try arena.dupe(u8, value);
     if (try getEnvValue(process, "RAVEN_MAX_CONNECTIONS")) |value| config.max_connections = try std.fmt.parseInt(u32, value, 10);
+    if (try getEnvValue(process, "RAVEN_MAX_MESSAGE_SIZE")) |value| config.max_message_size = try std.fmt.parseInt(u64, value, 10);
 }
 
 fn getEnvValue(process: std.process.Init, key: []const u8) !?[]const u8 {
@@ -175,6 +184,10 @@ fn applyKeyValue(config: *Config, allocator: std.mem.Allocator, key: []const u8,
     }
     if (std.mem.eql(u8, key, "max_connections")) {
         config.max_connections = try std.fmt.parseInt(u32, value, 10);
+        return;
+    }
+    if (std.mem.eql(u8, key, "max_message_size")) {
+        config.max_message_size = try std.fmt.parseInt(u64, value, 10);
         return;
     }
 }
