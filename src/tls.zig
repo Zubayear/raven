@@ -24,13 +24,7 @@ pub const TlsServer = struct {
         if (c.SSL_CTX_use_PrivateKey_file(ctx, key_z.ptr, c.SSL_FILETYPE_PEM) != 1) return sslError("load private key");
         if (c.SSL_CTX_check_private_key(ctx) != 1) return sslError("certificate/key mismatch");
 
-        const method = c.BIO_meth_new(c.BIO_get_new_index() | c.BIO_TYPE_SOURCE_SINK, "raven socket") orelse return sslError("BIO_meth_new");
-        errdefer c.BIO_meth_free(method);
-        if (c.BIO_meth_set_read_ex(method, bioRead) != 1 or
-            c.BIO_meth_set_write_ex(method, bioWrite) != 1 or
-            c.BIO_meth_set_ctrl(method, bioCtrl) != 1) return sslError("BIO_meth_set");
-
-        return .{ .ctx = ctx, .bio_method = method };
+        return .{ .ctx = ctx, .bio_method = try newBioMethod() };
     }
 
     pub fn deinit(self: *TlsServer) void {
@@ -42,22 +36,65 @@ pub const TlsServer = struct {
     /// Performs the server-side handshake over `socket`. The returned
     /// connection must not be moved once its `reader`/`writer` are in use.
     pub fn accept(self: *TlsServer, socket: *Socket, read_buffer: []u8, write_buffer: []u8) !Connection {
-        const ssl = c.SSL_new(self.ctx) orelse return error.TlsHandshakeFailed;
+        const ssl = try newSsl(self.ctx, self.bio_method, socket);
         errdefer c.SSL_free(ssl);
-
-        const bio = c.BIO_new(self.bio_method) orelse return error.TlsHandshakeFailed;
-        c.BIO_set_data(bio, socket);
-        c.BIO_set_init(bio, 1);
-        c.SSL_set_bio(ssl, bio, bio); // ssl now owns the bio
         if (c.SSL_accept(ssl) != 1) return error.TlsHandshakeFailed;
-
-        return .{
-            .ssl = ssl,
-            .reader = .{ .vtable = &.{ .stream = stream }, .buffer = read_buffer, .seek = 0, .end = 0 },
-            .writer = .{ .vtable = &.{ .drain = drain }, .buffer = write_buffer },
-        };
+        return .init(ssl, read_buffer, write_buffer);
     }
 };
+
+/// Opportunistic TLS for server-to-server SMTP (RFC 7435): traffic is
+/// encrypted, but certificates are not verified, since most MX hosts
+/// cannot be authenticated without MTA-STS or DANE.
+pub const TlsClient = struct {
+    ctx: *c.SSL_CTX,
+    bio_method: *c.BIO_METHOD,
+
+    pub fn init() !TlsClient {
+        const ctx = c.SSL_CTX_new(c.TLS_client_method()) orelse return sslError("SSL_CTX_new");
+        errdefer c.SSL_CTX_free(ctx);
+        if (c.SSL_CTX_set_min_proto_version(ctx, c.TLS1_2_VERSION) != 1) return sslError("set min TLS version");
+        c.SSL_CTX_set_verify(ctx, c.SSL_VERIFY_NONE, null);
+        return .{ .ctx = ctx, .bio_method = try newBioMethod() };
+    }
+
+    pub fn deinit(self: *TlsClient) void {
+        c.SSL_CTX_free(self.ctx);
+        c.BIO_meth_free(self.bio_method);
+        self.* = undefined;
+    }
+
+    /// Client handshake with `host` (sent as SNI) over `socket`.
+    pub fn connect(self: *TlsClient, socket: *Socket, host: []const u8, read_buffer: []u8, write_buffer: []u8) !Connection {
+        const ssl = try newSsl(self.ctx, self.bio_method, socket);
+        errdefer c.SSL_free(ssl);
+        var name_buf: [256]u8 = undefined;
+        const name = std.fmt.bufPrintSentinel(&name_buf, "{s}", .{host}, 0) catch return error.TlsHandshakeFailed;
+        _ = c.SSL_set_tlsext_host_name(ssl, name.ptr);
+        if (c.SSL_connect(ssl) != 1) return error.TlsHandshakeFailed;
+        return .init(ssl, read_buffer, write_buffer);
+    }
+};
+
+fn newBioMethod() !*c.BIO_METHOD {
+    const method = c.BIO_meth_new(c.BIO_get_new_index() | c.BIO_TYPE_SOURCE_SINK, "raven socket") orelse return sslError("BIO_meth_new");
+    errdefer c.BIO_meth_free(method);
+    if (c.BIO_meth_set_read_ex(method, bioRead) != 1 or
+        c.BIO_meth_set_write_ex(method, bioWrite) != 1 or
+        c.BIO_meth_set_ctrl(method, bioCtrl) != 1) return sslError("BIO_meth_set");
+    return method;
+}
+
+/// An SSL object doing its I/O through `socket`.
+fn newSsl(ctx: *c.SSL_CTX, method: *c.BIO_METHOD, socket: *Socket) !*c.SSL {
+    const ssl = c.SSL_new(ctx) orelse return error.TlsHandshakeFailed;
+    errdefer c.SSL_free(ssl);
+    const bio = c.BIO_new(method) orelse return error.TlsHandshakeFailed;
+    c.BIO_set_data(bio, socket);
+    c.BIO_set_init(bio, 1);
+    c.SSL_set_bio(ssl, bio, bio); // ssl now owns the bio
+    return ssl;
+}
 
 /// A TLS session over a `Socket` owned by the caller; `deinit` does not
 /// close the socket.
@@ -65,6 +102,14 @@ pub const Connection = struct {
     ssl: *c.SSL,
     reader: Io.Reader,
     writer: Io.Writer,
+
+    fn init(ssl: *c.SSL, read_buffer: []u8, write_buffer: []u8) Connection {
+        return .{
+            .ssl = ssl,
+            .reader = .{ .vtable = &.{ .stream = stream }, .buffer = read_buffer, .seek = 0, .end = 0 },
+            .writer = .{ .vtable = &.{ .drain = drain }, .buffer = write_buffer },
+        };
+    }
 
     pub fn deinit(self: *Connection) void {
         _ = c.SSL_shutdown(self.ssl);
