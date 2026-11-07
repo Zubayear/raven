@@ -84,11 +84,11 @@ pub const ImapServer = struct {
     }
 };
 
-const capabilities = "IMAP4rev1 LITERAL+";
+const capabilities = "IMAP4rev1 LITERAL+ UNSELECT";
 
 const State = enum { not_authenticated, authenticated, selected, logout };
 
-const Command = enum { capability, noop, logout, login, select, examine, list, fetch, store, expunge, uid };
+const Command = enum { capability, noop, logout, login, select, examine, list, fetch, store, expunge, uid, check, close, unselect };
 
 /// One command being executed.
 const Context = struct {
@@ -110,7 +110,7 @@ const Context = struct {
             .capability, .noop, .logout => true,
             .login => state == .not_authenticated,
             .select, .examine, .list => state == .authenticated or state == .selected,
-            .fetch, .store, .expunge, .uid => state == .selected,
+            .fetch, .store, .expunge, .uid, .check, .close, .unselect => state == .selected,
         };
         if (!allowed) return ctx.bad(if (state == .not_authenticated) "log in first" else "command not valid in this state");
 
@@ -135,7 +135,23 @@ const Context = struct {
             .list => try ctx.list(p),
             .fetch => try ctx.fetch(p, .sequence),
             .store => try ctx.store(p, .sequence),
-            .expunge => try ctx.expunge(p),
+            .expunge => {
+                try p.end();
+                if (ctx.session.read_only) return ctx.no("[READ-ONLY] mailbox is read-only");
+                try ctx.expungeDeleted(true);
+                try ctx.ok("EXPUNGE completed");
+            },
+            .check => {
+                try p.end();
+                try ctx.ok("CHECK completed"); // every change is already on disk
+            },
+            .close, .unselect => {
+                try p.end();
+                // CLOSE expunges silently (RFC 3501 §6.4.2); UNSELECT doesn't (RFC 3691).
+                if (cmd == .close and !ctx.session.read_only) try ctx.expungeDeleted(false);
+                ctx.session.closeMailbox(ctx.server.allocator);
+                try ctx.ok(if (cmd == .close) "CLOSE completed" else "UNSELECT completed");
+            },
             .uid => {
                 try p.space();
                 const sub = try p.atom();
@@ -183,7 +199,9 @@ const Context = struct {
         const w = ctx.w;
         try w.writeAll("* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n");
         try w.writeAll(if (read_only) "* OK [PERMANENTFLAGS ()] read-only\r\n" else "* OK [PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)] limited\r\n");
-        try w.print("* {d} EXISTS\r\n* 0 RECENT\r\n", .{session.messages.items.len});
+        var recent: usize = 0;
+        for (session.messages.items) |message| recent += @intFromBool(message.recent);
+        try w.print("* {d} EXISTS\r\n* {d} RECENT\r\n", .{ session.messages.items.len, recent });
         try w.print("* OK [UIDVALIDITY {d}] UIDs valid\r\n* OK [UIDNEXT {d}] predicted next UID\r\n", .{ session.uid_validity, session.uid_next });
         try ctx.ok(if (read_only) "[READ-ONLY] EXAMINE completed" else "[READ-WRITE] SELECT completed");
     }
@@ -277,7 +295,7 @@ const Context = struct {
         if (!first.*) try w.writeByte(' ');
         first.* = false;
         switch (item) {
-            .flags => try w.print("FLAGS {s}", .{try message.flags.format(arena)}),
+            .flags => try writeFlags(w, message),
             .uid => try w.print("UID {d}", .{message.uid}),
             .internal_date => {
                 try w.writeAll("INTERNALDATE \"");
@@ -310,39 +328,57 @@ const Context = struct {
         }
     }
 
+    /// `STORE set [+|-]FLAGS[.SILENT] flags` (RFC 3501 §6.4.6).
     fn store(ctx: Context, p: *proto.Parser, by: Addressing) !void {
         try p.space();
         const set = try p.sequenceSet();
         try p.space();
-        const item = try p.atom();
-        if (!std.ascii.eqlIgnoreCase(item, "+FLAGS") and !std.ascii.eqlIgnoreCase(item, "+FLAGS.SILENT")) return ctx.no("only +FLAGS is supported");
+        var item = try p.atom();
+        const mode: enum { replace, add, remove } = switch (item[0]) {
+            '+' => .add,
+            '-' => .remove,
+            else => .replace,
+        };
+        if (mode != .replace) item = item[1..];
+        const silent = std.ascii.endsWithIgnoreCase(item, ".SILENT");
+        if (silent) item = item[0 .. item.len - ".SILENT".len];
+        if (!std.ascii.eqlIgnoreCase(item, "FLAGS")) return error.Syntax;
         try p.space();
-        const added = try parseFlagList(p);
+        const given = try parseFlagList(p);
         try p.end();
         if (ctx.session.read_only) return ctx.no("[READ-ONLY] mailbox is read-only");
 
         for (ctx.session.messages.items, 1..) |*message, number| {
             if (!ctx.session.inSet(set, by, number)) continue;
-            Storage.setFlags(ctx.io, ctx.server.allocator, message, message.flags.merge(added)) catch |err| switch (err) {
+            const flags = switch (mode) {
+                .replace => given,
+                .add => message.flags.merge(given),
+                .remove => message.flags.without(given),
+            };
+            Storage.setFlags(ctx.io, ctx.server.allocator, message, flags) catch |err| switch (err) {
                 error.FileNotFound => return ctx.no("message no longer available"),
                 else => return err,
             };
+            if (silent) continue;
+            try ctx.w.print("* {d} FETCH (", .{number});
+            if (by == .uid) try ctx.w.print("UID {d} ", .{message.uid});
+            try writeFlags(ctx.w, message);
+            try ctx.w.writeAll(")\r\n");
         }
         try ctx.ok("STORE completed");
     }
 
-    fn expunge(ctx: Context, p: *proto.Parser) !void {
-        try p.end();
-        if (ctx.session.read_only) return ctx.no("[READ-ONLY] mailbox is read-only");
+    /// Deletes every \\Deleted message, reporting each one unless `announce`
+    /// is false. Highest first, so the reported numbers stay valid.
+    fn expungeDeleted(ctx: Context, announce: bool) !void {
         const session = ctx.session;
         var i: usize = session.messages.items.len;
         while (i > 0) : (i -= 1) {
             if (!session.messages.items[i - 1].flags.deleted) continue;
             try Storage.deleteMessage(ctx.io, session.messages.items[i - 1]);
-            try ctx.w.print("* {d} EXPUNGE\r\n", .{i});
+            if (announce) try ctx.w.print("* {d} EXPUNGE\r\n", .{i});
             session.removeMessage(i - 1, ctx.server.allocator);
         }
-        try ctx.ok("EXPUNGE completed");
     }
 
     fn ok(ctx: Context, text: []const u8) !void {
@@ -517,6 +553,20 @@ fn filterFields(arena: std.mem.Allocator, header: []const u8, names: []const []c
     return out.items;
 }
 
+/// `FLAGS (...)` including the session-only \\Recent.
+fn writeFlags(w: *Io.Writer, message: *const Message) !void {
+    const f = message.flags;
+    try w.writeAll("FLAGS (");
+    var first = true;
+    for ([_]struct { bool, []const u8 }{ .{ f.seen, "\\Seen" }, .{ f.answered, "\\Answered" }, .{ f.flagged, "\\Flagged" }, .{ f.deleted, "\\Deleted" }, .{ f.draft, "\\Draft" }, .{ message.recent, "\\Recent" } }) |flag| {
+        if (!flag[0]) continue;
+        if (!first) try w.writeByte(' ');
+        first = false;
+        try w.writeAll(flag[1]);
+    }
+    try w.writeByte(')');
+}
+
 fn writeLiteral(w: *Io.Writer, name: []const u8, data: []const u8) !void {
     try w.print("{s} {{{d}}}\r\n", .{ name, data.len });
     try w.writeAll(data);
@@ -677,10 +727,10 @@ test "imap session: states, quoting and literals" {
         "a8 SELECT Sent\r\n" ++
         "a9 LOGOUT\r\n");
     defer allocator.free(transcript);
-    try std.testing.expectEqualStrings("* OK [CAPABILITY IMAP4rev1 LITERAL+] raven ready\r\n" ++
+    try std.testing.expectEqualStrings("* OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT] raven ready\r\n" ++
         "a0 BAD log in first\r\n" ++
         "a1 NO [AUTHENTICATIONFAILED] authentication failed\r\n" ++
-        "a2 OK [CAPABILITY IMAP4rev1 LITERAL+] LOGIN completed\r\n" ++
+        "a2 OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT] LOGIN completed\r\n" ++
         "a3 BAD command not valid in this state\r\n" ++
         "a4 BAD unknown command\r\n" ++
         "a5 BAD syntax error\r\n" ++
@@ -705,9 +755,9 @@ test "imap session: select, fetch, store and expunge" {
         "b2 UID BOGUS 1\r\n");
     defer allocator.free(transcript);
     const select = "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n";
-    try std.testing.expectEqualStrings("* OK [CAPABILITY IMAP4rev1 LITERAL+] raven ready\r\n" ++
-        "a1 OK [CAPABILITY IMAP4rev1 LITERAL+] LOGIN completed\r\n" ++
-        select ++ "* OK [PERMANENTFLAGS ()] read-only\r\n* 2 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 1234567890] UIDs valid\r\n* OK [UIDNEXT 3] predicted next UID\r\na2 OK [READ-ONLY] EXAMINE completed\r\n" ++
+    try std.testing.expectEqualStrings("* OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT] raven ready\r\n" ++
+        "a1 OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT] LOGIN completed\r\n" ++
+        select ++ "* OK [PERMANENTFLAGS ()] read-only\r\n* 2 EXISTS\r\n* 2 RECENT\r\n* OK [UIDVALIDITY 1234567890] UIDs valid\r\n* OK [UIDNEXT 3] predicted next UID\r\na2 OK [READ-ONLY] EXAMINE completed\r\n" ++
         "a3 NO [READ-ONLY] mailbox is read-only\r\n" ++
         select ++ "* OK [PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)] limited\r\n* 2 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 1234567890] UIDs valid\r\n* OK [UIDNEXT 3] predicted next UID\r\na4 OK [READ-WRITE] SELECT completed\r\n" ++
         // Reading a body sets \\Seen and reports the new flags.
@@ -734,14 +784,60 @@ test "imap session: fetch data items and sections" {
     defer allocator.free(transcript);
     const end = std.mem.indexOf(u8, transcript, "a2 OK").?;
     try std.testing.expectEqualStrings("a2 OK [READ-WRITE] SELECT completed\r\n" ++
-        "* 1 FETCH (UID 1 FLAGS () RFC822.SIZE 22 INTERNALDATE \"01-Jan-1970 00:00:01 +0000\" " ++
+        "* 1 FETCH (UID 1 FLAGS (\\Recent) RFC822.SIZE 22 INTERNALDATE \"01-Jan-1970 00:00:01 +0000\" " ++
         "ENVELOPE (NIL \"hi\" NIL NIL NIL NIL NIL NIL NIL NIL) BODYSTRUCTURE (\"text\" \"plain\" (\"charset\" \"us-ascii\") NIL NIL \"7bit\" 7 1 NIL NIL NIL NIL))\r\n" ++
         "a3 OK FETCH completed\r\n" ++
-        "* 1 FETCH (FLAGS () INTERNALDATE \"01-Jan-1970 00:00:01 +0000\" RFC822.SIZE 22)\r\na4 OK FETCH completed\r\n" ++
+        "* 1 FETCH (FLAGS (\\Recent) INTERNALDATE \"01-Jan-1970 00:00:01 +0000\" RFC822.SIZE 22)\r\na4 OK FETCH completed\r\n" ++
         "* 1 FETCH (BODY[HEADER.FIELDS (subject)] {15}\r\nSubject: hi\r\n\r\n BODY[TEXT] {7}\r\nhello\r\n BODY[1]<0> {3}\r\nhel RFC822.HEADER {15}\r\nSubject: hi\r\n\r\n)\r\n" ++
         "a5 OK FETCH completed\r\n" ++
-        "* 1 FETCH (FLAGS ())\r\na6 OK FETCH completed\r\n" ++ // PEEK left \Seen alone
-        "* 1 FETCH (UID 1 BODY[1.MIME] {15}\r\nSubject: hi\r\n\r\n BODY[2] {0}\r\n FLAGS (\\Seen))\r\na7 OK FETCH completed\r\n" ++
+        "* 1 FETCH (FLAGS (\\Recent))\r\na6 OK FETCH completed\r\n" ++ // PEEK left \Seen alone
+        "* 1 FETCH (UID 1 BODY[1.MIME] {15}\r\nSubject: hi\r\n\r\n BODY[2] {0}\r\n FLAGS (\\Seen \\Recent))\r\na7 OK FETCH completed\r\n" ++
         "a8 BAD syntax error\r\n" ++
         "a9 BAD syntax error\r\n", transcript[end..]);
+}
+
+test "imap session: store modes, recent, close and unselect" {
+    const allocator = std.testing.allocator;
+    const transcript = try testSession(allocator, "a1 LOGIN alice@example.com \"pass word\"\r\n" ++
+        "a2 SELECT INBOX\r\n" ++
+        "a3 STORE 1 FLAGS (\\Flagged)\r\n" ++
+        "a4 STORE 1 +FLAGS (\\Seen \\Answered)\r\n" ++
+        "a5 STORE 1 -FLAGS (\\Flagged)\r\n" ++
+        "a6 UID STORE 2 FLAGS.SILENT (\\Deleted)\r\n" ++
+        "a7 UID STORE 1:* +FLAGS (\\Draft)\r\n" ++
+        "a8 STORE 1 BOGUS (\\Seen)\r\n" ++
+        "a9 CHECK\r\n" ++
+        "b1 UNSELECT\r\n" ++
+        "b2 FETCH 1 FLAGS\r\n" ++
+        "b3 SELECT INBOX\r\n" ++
+        "b4 CLOSE\r\n" ++
+        "b5 SELECT INBOX\r\n");
+    defer allocator.free(transcript);
+    const end = std.mem.indexOf(u8, transcript, "a2 OK").?;
+    try std.testing.expect(std.mem.indexOf(u8, transcript[0..end], "* 2 RECENT\r\n") != null);
+    try std.testing.expectEqualStrings("a2 OK [READ-WRITE] SELECT completed\r\n" ++
+        "* 1 FETCH (FLAGS (\\Flagged \\Recent))\r\na3 OK STORE completed\r\n" ++
+        "* 1 FETCH (FLAGS (\\Seen \\Answered \\Flagged \\Recent))\r\na4 OK STORE completed\r\n" ++
+        "* 1 FETCH (FLAGS (\\Seen \\Answered \\Recent))\r\na5 OK STORE completed\r\n" ++
+        "a6 OK STORE completed\r\n" ++
+        "* 1 FETCH (UID 1 FLAGS (\\Seen \\Answered \\Draft \\Recent))\r\n* 2 FETCH (UID 2 FLAGS (\\Deleted \\Draft \\Recent))\r\na7 OK STORE completed\r\n" ++
+        "a8 BAD syntax error\r\n" ++
+        "a9 OK CHECK completed\r\n" ++
+        "b1 OK UNSELECT completed\r\n" ++
+        "b2 BAD command not valid in this state\r\n" ++
+        // UNSELECT kept the \Deleted message; nothing is recent any more.
+        "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n* OK [PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)] limited\r\n" ++
+        "* 2 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 1234567890] UIDs valid\r\n* OK [UIDNEXT 3] predicted next UID\r\nb3 OK [READ-WRITE] SELECT completed\r\n" ++
+        // CLOSE expunged it without an EXPUNGE response.
+        "b4 OK CLOSE completed\r\n" ++
+        "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n* OK [PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)] limited\r\n" ++
+        "* 1 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 1234567890] UIDs valid\r\n* OK [UIDNEXT 3] predicted next UID\r\nb5 OK [READ-WRITE] SELECT completed\r\n", transcript[end..]);
+}
+
+test "imap session: expunge renumbers from the highest message down" {
+    const allocator = std.testing.allocator;
+    const transcript = try testSession(allocator, "a1 LOGIN alice@example.com \"pass word\"\r\na2 SELECT INBOX\r\n" ++
+        "a3 STORE 1:2 +FLAGS.SILENT (\\Deleted)\r\na4 EXPUNGE\r\na5 FETCH 1:* FLAGS\r\n");
+    defer allocator.free(transcript);
+    try std.testing.expectStringEndsWith(transcript, "a3 OK STORE completed\r\n* 2 EXPUNGE\r\n* 1 EXPUNGE\r\na4 OK EXPUNGE completed\r\na5 OK FETCH completed\r\n");
 }

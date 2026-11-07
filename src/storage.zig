@@ -70,7 +70,6 @@ pub const Storage = struct {
         var maildir = try Io.Dir.cwd().createDirPathOpen(io, maildir_path, .{});
         defer maildir.close(io);
         for ([_][]const u8{ "tmp", "new", "cur" }) |sub| try maildir.createDirPath(io, sub);
-        try claimNew(io, allocator, maildir);
 
         // Concurrent sessions must not hand out the same UID twice.
         const lock = try maildir.createFile(io, "raven-uidlist.lock", .{ .truncate = false });
@@ -81,6 +80,7 @@ pub const Storage = struct {
         var arena_state = std.heap.ArenaAllocator.init(allocator);
         defer arena_state.deinit();
         const arena = arena_state.allocator();
+        const claimed = try claimNew(io, arena, maildir);
         var uids = try UidList.load(io, arena, maildir);
 
         var messages = std.ArrayList(Message).empty;
@@ -106,6 +106,7 @@ pub const Storage = struct {
         var changed = false;
         var known: usize = 0;
         for (messages.items) |*message| {
+            for (claimed) |name| message.recent = message.recent or std.mem.eql(u8, name, baseName(message.path));
             if (uids.map.get(baseName(message.path))) |uid| {
                 message.uid = uid;
                 known += 1;
@@ -130,6 +131,7 @@ pub const Storage = struct {
 
     /// Renames the message so its file name carries `flags`.
     pub fn setFlags(io: Io, allocator: std.mem.Allocator, message: *Message, flags: MessageFlags) !void {
+        if (std.meta.eql(flags, message.flags)) return;
         var letters_buf: [5]u8 = undefined;
         var name_buf: [std.fs.max_name_bytes]u8 = undefined;
         const name = try std.fmt.bufPrint(&name_buf, "{s}:2,{s}", .{ baseName(message.path), flags.letters(&letters_buf) });
@@ -158,6 +160,8 @@ pub const Message = struct {
     uid: u32,
     /// Arrival time in Unix seconds (IMAP INTERNALDATE), from the mtime.
     internal_date: u64 = 0,
+    /// Moved out of `new/` by this open: IMAP's session-only \Recent.
+    recent: bool = false,
 };
 
 pub const Mailbox = struct {
@@ -257,6 +261,16 @@ pub const MessageFlags = struct {
         return buf[0..n];
     }
 
+    pub fn without(self: MessageFlags, other: MessageFlags) MessageFlags {
+        return .{
+            .seen = self.seen and !other.seen,
+            .answered = self.answered and !other.answered,
+            .flagged = self.flagged and !other.flagged,
+            .deleted = self.deleted and !other.deleted,
+            .draft = self.draft and !other.draft,
+        };
+    }
+
     pub fn merge(self: MessageFlags, other: MessageFlags) MessageFlags {
         return .{
             .seen = self.seen or other.seen,
@@ -265,20 +279,6 @@ pub const MessageFlags = struct {
             .deleted = self.deleted or other.deleted,
             .draft = self.draft or other.draft,
         };
-    }
-
-    /// IMAP flag list, e.g. `(\Seen \Flagged)`.
-    pub fn format(self: MessageFlags, allocator: std.mem.Allocator) ![]u8 {
-        var list = std.ArrayList(u8).empty;
-        errdefer list.deinit(allocator);
-        try list.append(allocator, '(');
-        for ([_]struct { bool, []const u8 }{ .{ self.seen, "\\Seen" }, .{ self.answered, "\\Answered" }, .{ self.flagged, "\\Flagged" }, .{ self.deleted, "\\Deleted" }, .{ self.draft, "\\Draft" } }) |flag| {
-            if (!flag[0]) continue;
-            if (list.items.len > 1) try list.append(allocator, ' ');
-            try list.appendSlice(allocator, flag[1]);
-        }
-        try list.append(allocator, ')');
-        return list.toOwnedSlice(allocator);
     }
 };
 
@@ -296,27 +296,21 @@ fn uniqueName(io: Io, allocator: std.mem.Allocator) ![]u8 {
     });
 }
 
-fn claimNew(io: Io, allocator: std.mem.Allocator, maildir: Io.Dir) !void {
+/// Moves everything in `new/` to `cur/` and returns the names it moved.
+fn claimNew(io: Io, arena: std.mem.Allocator, maildir: Io.Dir) ![]const []const u8 {
     var new = maildir.openDir(io, "new", .{ .iterate = true }) catch |err| switch (err) {
-        error.FileNotFound => return,
+        error.FileNotFound => return &.{},
         else => return err,
     };
     defer new.close(io);
-    try maildir.createDirPath(io, "cur");
 
     // Collect first: renaming entries out of a directory while iterating it is unspecified.
-    var names = std.ArrayList([]u8).empty;
-    defer {
-        for (names.items) |name| allocator.free(name);
-        names.deinit(allocator);
-    }
+    var names = std.ArrayList([]const u8).empty;
     var it = new.iterate();
     while (try it.next(io)) |entry| {
-        if (entry.kind != .file) continue;
-        const name = try allocator.dupe(u8, entry.name);
-        errdefer allocator.free(name);
-        try names.append(allocator, name);
+        if (entry.kind == .file) try names.append(arena, try arena.dupe(u8, entry.name));
     }
+    var claimed = std.ArrayList([]const u8).empty;
 
     var from_buf: [std.fs.max_name_bytes + 4]u8 = undefined;
     var to_buf: [std.fs.max_name_bytes + 8]u8 = undefined;
@@ -324,10 +318,12 @@ fn claimNew(io: Io, allocator: std.mem.Allocator, maildir: Io.Dir) !void {
         const from = try std.fmt.bufPrint(&from_buf, "new/{s}", .{name});
         const to = try std.fmt.bufPrint(&to_buf, "cur/{s}:2,", .{name});
         maildir.rename(from, maildir, to, io) catch |err| switch (err) {
-            error.FileNotFound => {}, // claimed by a concurrent session
+            error.FileNotFound => continue, // claimed by a concurrent session
             else => return err,
         };
+        try claimed.append(arena, name);
     }
+    return claimed.items;
 }
 
 fn baseName(path: []const u8) []const u8 {
@@ -476,10 +472,6 @@ test "maildir flags parse and format" {
     try std.testing.expectEqual(MessageFlags{}, MessageFlags.fromFileName("1.M1R1.raven"));
     var buf: [5]u8 = undefined;
     try std.testing.expectEqualStrings("DFRST", (MessageFlags{ .seen = true, .answered = true, .flagged = true, .deleted = true, .draft = true }).letters(&buf));
-
-    const text = try (MessageFlags{ .seen = true, .flagged = true }).format(std.testing.allocator);
-    defer std.testing.allocator.free(text);
-    try std.testing.expectEqualStrings("(\\Seen \\Flagged)", text);
 }
 
 test "account index path is stable" {
