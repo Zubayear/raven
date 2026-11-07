@@ -155,6 +155,7 @@ test {
     _ = @import("imap_proto.zig");
     _ = @import("mime.zig");
     _ = @import("server.zig");
+    _ = @import("smtp_client.zig");
     _ = @import("storage.zig");
     _ = @import("tenant_index.zig");
 }
