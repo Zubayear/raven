@@ -90,7 +90,8 @@ pub fn Listener(comptime Handler: type) type {
                 stream.close(io);
                 _ = active.fetchSub(1, .monotonic);
             }
-            var read_buf: [1024]u8 = undefined;
+            // IMAP clients send long command lines (RFC 7162 §4 suggests 8192).
+            var read_buf: [8192]u8 = undefined;
             var transport: Transport = .{
                 .socket = .init(io, stream, options.idle_timeout, &read_buf),
                 .tls_server = options.tls,

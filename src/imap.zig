@@ -9,6 +9,7 @@ const Storage = @import("storage.zig").Storage;
 const Message = @import("storage.zig").Message;
 const MessageFlags = @import("storage.zig").MessageFlags;
 const TenantCatalog = @import("tenant_index.zig").TenantCatalog;
+const proto = @import("imap_proto.zig");
 
 pub const ImapServer = struct {
     allocator: std.mem.Allocator,
@@ -38,388 +39,383 @@ pub const ImapServer = struct {
     }
 
     pub fn handleClient(self: *ImapServer, fs_io: Io, client: *conn.Client) !void {
-        const r = client.reader;
         const w = client.writer;
-        try w.writeAll("* OK IMAP4rev1 raven ready\r\n");
+        try w.writeAll("* OK [CAPABILITY " ++ capabilities ++ "] raven ready\r\n");
 
-        var session = Session{};
+        var session: Session = .{};
         defer session.deinit(self.allocator);
+        var arena_state = std.heap.ArenaAllocator.init(self.allocator);
+        defer arena_state.deinit();
 
-        while (true) {
-            const line = try nextLine(r) orelse return;
-
-            var parts = std.mem.tokenizeAny(u8, line, " \t");
-            const tag = parts.next() orelse continue;
-            const command = parts.next() orelse {
-                try taggedBad(w, tag, "missing command");
-                continue;
+        while (session.state != .logout) {
+            _ = arena_state.reset(.retain_capacity);
+            const arena = arena_state.allocator();
+            const input = proto.readCommand(arena, client.reader, w, self.config.max_message_size) catch |err| switch (err) {
+                error.LiteralTooLarge => {
+                    try w.writeAll("* BYE literal too large\r\n");
+                    return;
+                },
+                else => return err,
+            } orelse return;
+            const text = switch (input) {
+                .too_long => {
+                    try w.writeAll("* BAD line too long\r\n");
+                    continue;
+                },
+                .literal_refused => |tag| {
+                    try w.print("{s} NO literal too large\r\n", .{tag});
+                    continue;
+                },
+                .command => |text| text,
             };
 
-            if (std.ascii.eqlIgnoreCase(command, "NOOP")) {
-                try taggedOk(w, tag, "NOOP completed");
+            var p: proto.Parser = .{ .text = text, .arena = arena };
+            const tag = p.atomWith("]") catch {
+                try w.writeAll("* BAD missing tag\r\n");
                 continue;
-            }
-
-            if (std.ascii.eqlIgnoreCase(command, "LOGOUT")) {
-                try w.writeAll("* BYE raven logging out\r\n");
-                try taggedOk(w, tag, "LOGOUT completed");
-                return;
-            }
-
-            if (std.ascii.eqlIgnoreCase(command, "CAPABILITY")) {
-                try w.writeAll("* CAPABILITY IMAP4rev1 LITERAL+\r\n");
-                try taggedOk(w, tag, "CAPABILITY completed");
-                continue;
-            }
-
-            if (std.ascii.eqlIgnoreCase(command, "LOGIN")) {
-                const login_arg = parts.next() orelse {
-                    try taggedBad(w, tag, "missing login address");
-                    continue;
-                };
-
-                const password = parts.next() orelse {
-                    try taggedBad(w, tag, "missing password");
-                    continue;
-                };
-
-                const identity = account_index.authenticate(self.allocator, fs_io, self.storage, self.tenant_catalog, login_arg, password) catch |err| switch (err) {
-                    error.AuthFailed => {
-                        try taggedNo(w, tag, "auth failed");
-                        continue;
-                    },
-                    else => return err,
-                };
-                try session.setIdentity(self.allocator, identity);
-                try taggedOk(w, tag, "LOGIN completed");
-                continue;
-            }
-
-            if (std.ascii.eqlIgnoreCase(command, "LIST")) {
-                if (!session.isAuthenticated()) {
-                    try taggedNo(w, tag, "login first");
-                    continue;
-                }
-
-                try w.writeAll("* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n");
-                try taggedOk(w, tag, "LIST completed");
-                continue;
-            }
-
-            if (std.ascii.eqlIgnoreCase(command, "SELECT") or std.ascii.eqlIgnoreCase(command, "EXAMINE")) {
-                if (!session.isAuthenticated()) {
-                    try taggedNo(w, tag, "login first");
-                    continue;
-                }
-
-                const mailbox = parts.next() orelse {
-                    try taggedBad(w, tag, "missing mailbox");
-                    continue;
-                };
-
-                if (!std.ascii.eqlIgnoreCase(mailbox, "INBOX")) {
-                    try taggedNo(w, tag, "only INBOX is supported");
-                    continue;
-                }
-
-                try session.loadMailbox(self.allocator, fs_io, self.storage);
-                const flags_line = try session.supportedFlags(self.allocator);
-                defer self.allocator.free(flags_line);
-
-                try w.writeAll("* FLAGS ");
-                try w.writeAll(flags_line);
-                try w.writeAll("\r\n");
-                try w.print("* {d} EXISTS\r\n", .{session.messages.items.len});
-                try w.writeAll("* 0 RECENT\r\n");
-                try w.writeAll("* OK [UIDVALIDITY 1] stable\r\n");
-                try taggedOk(w, tag, if (std.ascii.eqlIgnoreCase(command, "EXAMINE")) "READ-ONLY selected" else "READ-WRITE selected");
-                continue;
-            }
-
-            if (std.ascii.eqlIgnoreCase(command, "FETCH")) {
-                if (!session.isAuthenticated()) {
-                    try taggedNo(w, tag, "login first");
-                    continue;
-                }
-
-                if (session.messages.items.len == 0) {
-                    try taggedNo(w, tag, "select mailbox first");
-                    continue;
-                }
-
-                const number_text = parts.next() orelse {
-                    try taggedBad(w, tag, "missing message number");
-                    continue;
-                };
-
-                const number = std.fmt.parseInt(usize, number_text, 10) catch {
-                    try taggedBad(w, tag, "bad message number");
-                    continue;
-                };
-
-                if (number == 0 or number > session.messages.items.len) {
-                    try taggedNo(w, tag, "no such message");
-                    continue;
-                }
-
-                const message = session.messages.items[number - 1];
-                const flags_text = try message.flags.format(self.allocator);
-                defer self.allocator.free(flags_text);
-
-                const data = Storage.readMessage(fs_io, self.allocator, message) catch |err| switch (err) {
-                    error.FileNotFound => {
-                        try taggedNo(w, tag, "message no longer available");
-                        continue;
-                    },
-                    else => return err,
-                };
-                defer self.allocator.free(data);
-
-                try w.print("* {d} FETCH (FLAGS {s} BODY[] {{{d}}}\r\n", .{ number, flags_text, data.len });
-                try w.writeAll(data);
-                try w.writeAll("\r\n)\r\n");
-                try taggedOk(w, tag, "FETCH completed");
-                continue;
-            }
-
-            if (std.ascii.eqlIgnoreCase(command, "STORE")) {
-                if (!session.isAuthenticated()) {
-                    try taggedNo(w, tag, "login first");
-                    continue;
-                }
-
-                if (session.messages.items.len == 0) {
-                    try taggedNo(w, tag, "select mailbox first");
-                    continue;
-                }
-
-                const number_text = parts.next() orelse {
-                    try taggedBad(w, tag, "missing message number");
-                    continue;
-                };
-                const op = parts.next() orelse {
-                    try taggedBad(w, tag, "missing store op");
-                    continue;
-                };
-                const flags_text = parts.next() orelse {
-                    try taggedBad(w, tag, "missing flags");
-                    continue;
-                };
-
-                if (!std.mem.startsWith(u8, op, "+FLAGS")) {
-                    try taggedNo(w, tag, "only +FLAGS supported");
-                    continue;
-                }
-
-                const number = std.fmt.parseInt(usize, number_text, 10) catch {
-                    try taggedBad(w, tag, "bad message number");
-                    continue;
-                };
-
-                if (number == 0 or number > session.messages.items.len) {
-                    try taggedNo(w, tag, "no such message");
-                    continue;
-                }
-
-                const message = &session.messages.items[number - 1];
-                Storage.setFlags(fs_io, self.allocator, message, message.flags.merge(parseFlagsList(flags_text))) catch |err| switch (err) {
-                    error.FileNotFound => {
-                        try taggedNo(w, tag, "message no longer available");
-                        continue;
-                    },
-                    else => return err,
-                };
-
-                try taggedOk(w, tag, "STORE completed");
-                continue;
-            }
-
-            if (std.ascii.eqlIgnoreCase(command, "EXPUNGE")) {
-                if (!session.isAuthenticated()) {
-                    try taggedNo(w, tag, "login first");
-                    continue;
-                }
-
-                if (session.messages.items.len == 0) {
-                    try taggedOk(w, tag, "EXPUNGE completed");
-                    continue;
-                }
-
-                var i: usize = session.messages.items.len;
-                while (i > 0) : (i -= 1) {
-                    const idx = i - 1;
-                    if (!session.messages.items[idx].flags.deleted) continue;
-
-                    try Storage.deleteMessage(fs_io, session.messages.items[idx]);
-
-                    try w.print("* {d} EXPUNGE\r\n", .{idx + 1});
-                    session.removeMessage(idx, self.allocator);
-                }
-                try taggedOk(w, tag, "EXPUNGE completed");
-                continue;
-            }
-
-            try taggedBad(w, tag, "unknown command");
+            };
+            const ctx: Context = .{ .server = self, .io = fs_io, .session = &session, .w = w, .tag = tag };
+            ctx.execute(&p) catch |err| switch (err) {
+                error.Syntax => try ctx.bad("syntax error"),
+                else => return err,
+            };
         }
     }
 };
 
+const capabilities = "IMAP4rev1 LITERAL+";
+
+const State = enum { not_authenticated, authenticated, selected, logout };
+
+const Command = enum { capability, noop, logout, login, select, examine, list, fetch, store, expunge };
+
+/// One command being executed.
+const Context = struct {
+    server: *ImapServer,
+    io: Io,
+    session: *Session,
+    w: *Io.Writer,
+    tag: []const u8,
+
+    fn execute(ctx: Context, p: *proto.Parser) !void {
+        try p.space();
+        const name = try p.atom();
+        var lower: [16]u8 = undefined;
+        const command = if (name.len <= lower.len) std.meta.stringToEnum(Command, std.ascii.lowerString(&lower, name)) else null;
+        const cmd = command orelse return ctx.bad("unknown command");
+
+        const state = ctx.session.state;
+        const allowed = switch (cmd) {
+            .capability, .noop, .logout => true,
+            .login => state == .not_authenticated,
+            .select, .examine, .list => state == .authenticated or state == .selected,
+            .fetch, .store, .expunge => state == .selected,
+        };
+        if (!allowed) return ctx.bad(if (state == .not_authenticated) "log in first" else "command not valid in this state");
+
+        switch (cmd) {
+            .capability => {
+                try p.end();
+                try ctx.w.writeAll("* CAPABILITY " ++ capabilities ++ "\r\n");
+                try ctx.ok("CAPABILITY completed");
+            },
+            .noop => {
+                try p.end();
+                try ctx.ok("NOOP completed");
+            },
+            .logout => {
+                try p.end();
+                try ctx.w.writeAll("* BYE raven logging out\r\n");
+                try ctx.ok("LOGOUT completed");
+                ctx.session.state = .logout;
+            },
+            .login => try ctx.login(p),
+            .select, .examine => try ctx.select(p, cmd == .examine),
+            .list => try ctx.list(p),
+            .fetch => try ctx.fetch(p),
+            .store => try ctx.store(p),
+            .expunge => try ctx.expunge(p),
+        }
+    }
+
+    fn login(ctx: Context, p: *proto.Parser) !void {
+        try p.space();
+        const user = try p.astring();
+        try p.space();
+        const password = try p.astring();
+        try p.end();
+
+        const s = ctx.server;
+        const identity = account_index.authenticate(s.allocator, ctx.io, s.storage, s.tenant_catalog, user, password) catch |err| switch (err) {
+            error.AuthFailed => return ctx.no("[AUTHENTICATIONFAILED] authentication failed"),
+            else => return err,
+        };
+        ctx.session.identity = identity;
+        ctx.session.state = .authenticated;
+        try ctx.ok("[CAPABILITY " ++ capabilities ++ "] LOGIN completed");
+    }
+
+    fn select(ctx: Context, p: *proto.Parser, read_only: bool) !void {
+        try p.space();
+        const mailbox = try p.astring();
+        try p.end();
+
+        const session = ctx.session;
+        session.closeMailbox(ctx.server.allocator);
+        if (!std.ascii.eqlIgnoreCase(mailbox, "INBOX")) return ctx.no("[NONEXISTENT] no such mailbox");
+
+        const id = session.identity.?;
+        session.messages = .fromOwnedSlice(try ctx.server.storage.listMailbox(ctx.io, ctx.server.allocator, id.tenant, id.domain, id.user));
+        session.read_only = read_only;
+        session.state = .selected;
+
+        const w = ctx.w;
+        try w.writeAll("* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n");
+        try w.writeAll(if (read_only) "* OK [PERMANENTFLAGS ()] read-only\r\n" else "* OK [PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)] limited\r\n");
+        try w.print("* {d} EXISTS\r\n* 0 RECENT\r\n", .{session.messages.items.len});
+        try w.writeAll("* OK [UIDVALIDITY 1] UIDs valid\r\n");
+        try ctx.ok(if (read_only) "[READ-ONLY] EXAMINE completed" else "[READ-WRITE] SELECT completed");
+    }
+
+    fn list(ctx: Context, p: *proto.Parser) !void {
+        try p.space();
+        _ = try p.astring(); // reference name: only one level of mailboxes for now
+        try p.space();
+        const pattern = if (p.peek() == '"' or p.peek() == '{') try p.string() else try p.atomWith("]%*");
+        try p.end();
+
+        if (pattern.len == 0) {
+            try ctx.w.writeAll("* LIST (\\Noselect) \"/\" \"\"\r\n");
+        } else if (matchesPattern(pattern, "INBOX")) {
+            try ctx.w.writeAll("* LIST (\\HasNoChildren) \"/\" INBOX\r\n");
+        }
+        try ctx.ok("LIST completed");
+    }
+
+    fn fetch(ctx: Context, p: *proto.Parser) !void {
+        try p.space();
+        const set = try p.sequenceSet();
+        try p.space();
+        _ = p.text[p.pos..]; // data items: always FLAGS and BODY[] until #14
+        p.pos = p.text.len;
+
+        const s = ctx.server;
+        const messages = ctx.session.messages.items;
+        for (messages, 1..) |message, number| {
+            if (!set.contains(@intCast(number), @intCast(messages.len))) continue;
+            const data = Storage.readMessage(ctx.io, s.allocator, message) catch |err| switch (err) {
+                error.FileNotFound => return ctx.no("message no longer available"),
+                else => return err,
+            };
+            defer s.allocator.free(data);
+            const flags = try message.flags.format(s.allocator);
+            defer s.allocator.free(flags);
+            try ctx.w.print("* {d} FETCH (FLAGS {s} BODY[] {{{d}}}\r\n", .{ number, flags, data.len });
+            try ctx.w.writeAll(data);
+            try ctx.w.writeAll(")\r\n");
+        }
+        try ctx.ok("FETCH completed");
+    }
+
+    fn store(ctx: Context, p: *proto.Parser) !void {
+        try p.space();
+        const set = try p.sequenceSet();
+        try p.space();
+        const item = try p.atom();
+        if (!std.ascii.eqlIgnoreCase(item, "+FLAGS") and !std.ascii.eqlIgnoreCase(item, "+FLAGS.SILENT")) return ctx.no("only +FLAGS is supported");
+        try p.space();
+        const added = try parseFlagList(p);
+        try p.end();
+        if (ctx.session.read_only) return ctx.no("[READ-ONLY] mailbox is read-only");
+
+        const messages = ctx.session.messages.items;
+        for (messages, 1..) |*message, number| {
+            if (!set.contains(@intCast(number), @intCast(messages.len))) continue;
+            Storage.setFlags(ctx.io, ctx.server.allocator, message, message.flags.merge(added)) catch |err| switch (err) {
+                error.FileNotFound => return ctx.no("message no longer available"),
+                else => return err,
+            };
+        }
+        try ctx.ok("STORE completed");
+    }
+
+    fn expunge(ctx: Context, p: *proto.Parser) !void {
+        try p.end();
+        if (ctx.session.read_only) return ctx.no("[READ-ONLY] mailbox is read-only");
+        const session = ctx.session;
+        var i: usize = session.messages.items.len;
+        while (i > 0) : (i -= 1) {
+            if (!session.messages.items[i - 1].flags.deleted) continue;
+            try Storage.deleteMessage(ctx.io, session.messages.items[i - 1]);
+            try ctx.w.print("* {d} EXPUNGE\r\n", .{i});
+            session.removeMessage(i - 1, ctx.server.allocator);
+        }
+        try ctx.ok("EXPUNGE completed");
+    }
+
+    fn ok(ctx: Context, text: []const u8) !void {
+        try ctx.w.print("{s} OK {s}\r\n", .{ ctx.tag, text });
+    }
+
+    fn no(ctx: Context, text: []const u8) !void {
+        try ctx.w.print("{s} NO {s}\r\n", .{ ctx.tag, text });
+    }
+
+    fn bad(ctx: Context, text: []const u8) !void {
+        try ctx.w.print("{s} BAD {s}\r\n", .{ ctx.tag, text });
+    }
+};
+
 const Session = struct {
-    tenant: ?[]u8 = null,
-    domain: ?[]u8 = null,
-    user: ?[]u8 = null,
+    state: State = .not_authenticated,
+    identity: ?Identity = null,
     messages: std.ArrayList(Message) = .empty,
+    read_only: bool = false,
 
-    fn isAuthenticated(self: Session) bool {
-        return self.tenant != null and self.domain != null and self.user != null;
-    }
-
-    fn setIdentity(self: *Session, allocator: std.mem.Allocator, identity: Identity) !void {
-        self.clearSelected(allocator);
-        self.clearIdentity(allocator);
-        self.tenant = identity.tenant;
-        self.domain = identity.domain;
-        self.user = identity.user;
-    }
-
-    fn loadMailbox(self: *Session, allocator: std.mem.Allocator, fs_io: Io, storage: Storage) !void {
-        self.clearSelected(allocator);
-        self.messages = .fromOwnedSlice(try storage.listMailbox(fs_io, allocator, self.tenant.?, self.domain.?, self.user.?));
-    }
-
-    fn supportedFlags(self: Session, allocator: std.mem.Allocator) ![]u8 {
-        _ = self;
-        const flags = MessageFlags{};
-        return flags.format(allocator);
-    }
-
-    fn clearSelected(self: *Session, allocator: std.mem.Allocator) void {
+    fn closeMailbox(self: *Session, allocator: std.mem.Allocator) void {
         for (self.messages.items) |message| allocator.free(message.path);
         self.messages.deinit(allocator);
         self.messages = .empty;
+        if (self.state == .selected) self.state = .authenticated;
     }
 
     fn removeMessage(self: *Session, index: usize, allocator: std.mem.Allocator) void {
         allocator.free(self.messages.orderedRemove(index).path);
     }
 
-    fn clearIdentity(self: *Session, allocator: std.mem.Allocator) void {
-        if (self.tenant) |value| allocator.free(value);
-        if (self.domain) |value| allocator.free(value);
-        if (self.user) |value| allocator.free(value);
-        self.tenant = null;
-        self.domain = null;
-        self.user = null;
-    }
-
     fn deinit(self: *Session, allocator: std.mem.Allocator) void {
-        self.clearSelected(allocator);
-        self.clearIdentity(allocator);
+        self.closeMailbox(allocator);
+        if (self.identity) |identity| identity.deinit(allocator);
         self.* = .{};
     }
 };
 
-fn parseFlagsList(raw: []const u8) MessageFlags {
-    var flags = MessageFlags{};
-    const trimmed = std.mem.trim(u8, raw, " \t");
-    const inner = if (trimmed.len >= 2 and trimmed[0] == '(' and trimmed[trimmed.len - 1] == ')') trimmed[1 .. trimmed.len - 1] else trimmed;
-
-    var parts = std.mem.tokenizeAny(u8, inner, " \t");
-    while (parts.next()) |part| {
-        if (std.mem.eql(u8, part, "\\Seen")) flags.seen = true else if (std.mem.eql(u8, part, "\\Answered")) flags.answered = true else if (std.mem.eql(u8, part, "\\Flagged")) flags.flagged = true else if (std.mem.eql(u8, part, "\\Deleted")) flags.deleted = true else if (std.mem.eql(u8, part, "\\Draft")) flags.draft = true else {}
+/// `flag` or `(flag ...)`; keywords are accepted and ignored.
+fn parseFlagList(p: *proto.Parser) !MessageFlags {
+    var flags: MessageFlags = .{};
+    const parenthesized = p.take('(');
+    while (true) {
+        if (parenthesized and p.take(')')) break;
+        const system = p.take('\\');
+        const name = try p.atom();
+        if (system) {
+            if (std.ascii.eqlIgnoreCase(name, "Seen")) flags.seen = true else if (std.ascii.eqlIgnoreCase(name, "Answered")) flags.answered = true else if (std.ascii.eqlIgnoreCase(name, "Flagged")) flags.flagged = true else if (std.ascii.eqlIgnoreCase(name, "Deleted")) flags.deleted = true else if (std.ascii.eqlIgnoreCase(name, "Draft")) flags.draft = true else return error.Syntax;
+        }
+        if (!parenthesized) break;
+        if (p.take(')')) break;
+        try p.space();
     }
-
     return flags;
 }
 
-fn nextLine(reader: *Io.Reader) !?[]const u8 {
-    const line = try reader.takeDelimiter('\n') orelse return null;
-    return trimCr(line);
+/// LIST pattern match (RFC 3501 §6.3.8): `*` matches anything, `%` anything
+/// but the hierarchy delimiter. INBOX is case-insensitive.
+fn matchesPattern(pattern: []const u8, name: []const u8) bool {
+    if (pattern.len == 0) return name.len == 0;
+    switch (pattern[0]) {
+        '*', '%' => {
+            var i: usize = 0;
+            while (i <= name.len) : (i += 1) {
+                if (matchesPattern(pattern[1..], name[i..])) return true;
+                if (i < name.len and pattern[0] == '%' and name[i] == '/') return false;
+            }
+            return false;
+        },
+        else => return name.len > 0 and std.ascii.toLower(pattern[0]) == std.ascii.toLower(name[0]) and matchesPattern(pattern[1..], name[1..]),
+    }
 }
 
-fn trimCr(line: []const u8) []const u8 {
-    if (line.len > 0 and line[line.len - 1] == '\r') return line[0 .. line.len - 1];
-    return line;
+test "flag lists" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    var p: proto.Parser = .{ .text = "(\\Seen \\Flagged $Junk) \\Deleted", .arena = arena.allocator() };
+    try std.testing.expectEqual(MessageFlags{ .seen = true, .flagged = true }, try parseFlagList(&p));
+    try p.space();
+    try std.testing.expectEqual(MessageFlags{ .deleted = true }, try parseFlagList(&p));
+    var bad: proto.Parser = .{ .text = "(\\Bogus)", .arena = arena.allocator() };
+    try std.testing.expectError(error.Syntax, parseFlagList(&bad));
 }
 
-fn taggedOk(w: *Io.Writer, tag: []const u8, msg: []const u8) !void {
-    try w.writeAll(tag);
-    try w.writeAll(" OK ");
-    try w.writeAll(msg);
-    try w.writeAll("\r\n");
+test "list patterns" {
+    try std.testing.expect(matchesPattern("*", "INBOX"));
+    try std.testing.expect(matchesPattern("inbox", "INBOX"));
+    try std.testing.expect(matchesPattern("IN%", "INBOX"));
+    try std.testing.expect(matchesPattern("%", "INBOX"));
+    try std.testing.expect(!matchesPattern("%", "a/b"));
+    try std.testing.expect(matchesPattern("*", "a/b"));
+    try std.testing.expect(!matchesPattern("Sent", "INBOX"));
 }
 
-fn taggedNo(w: *Io.Writer, tag: []const u8, msg: []const u8) !void {
-    try w.writeAll(tag);
-    try w.writeAll(" NO ");
-    try w.writeAll(msg);
-    try w.writeAll("\r\n");
-}
-
-fn taggedBad(w: *Io.Writer, tag: []const u8, msg: []const u8) !void {
-    try w.writeAll(tag);
-    try w.writeAll(" BAD ");
-    try w.writeAll(msg);
-    try w.writeAll("\r\n");
-}
-
-test "parseFlagsList reads standard flags" {
-    const flags = parseFlagsList("(\\Seen \\Flagged)");
-    try std.testing.expect(flags.seen);
-    try std.testing.expect(flags.flagged);
-    try std.testing.expect(!flags.deleted);
-}
-
-test "session removeMessage compacts mailbox" {
-    const allocator = std.testing.allocator;
-    var session = Session{};
-    try session.messages.append(allocator, .{ .path = try allocator.dupe(u8, "cur/1:2,"), .size = 1, .flags = .{} });
-    try session.messages.append(allocator, .{ .path = try allocator.dupe(u8, "cur/2:2,T"), .size = 1, .flags = .{ .deleted = true } });
-    try session.messages.append(allocator, .{ .path = try allocator.dupe(u8, "cur/3:2,"), .size = 1, .flags = .{} });
-
-    session.removeMessage(1, allocator);
-
-    try std.testing.expectEqual(@as(usize, 2), session.messages.items.len);
-    try std.testing.expectEqualStrings("cur/1:2,", session.messages.items[0].path);
-    try std.testing.expectEqualStrings("cur/3:2,", session.messages.items[1].path);
-
-    session.clearSelected(allocator);
-}
-
-test "imap session logs in, selects and fetches" {
-    const allocator = std.testing.allocator;
+/// Runs one IMAP session over fixed buffers against a mailbox holding two
+/// messages for alice (password "pass word"). Returns the transcript.
+fn testSession(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(root);
 
-    try account_index.writeTestAccounts(allocator, tmp.dir, &.{"alice"}, "secret");
+    try account_index.writeTestAccounts(allocator, tmp.dir, &.{"alice"}, "pass word");
     try tmp.dir.createDirPath(std.testing.io, "tenants/acme/domains/example.com/users/alice/Maildir/new");
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tenants/acme/domains/example.com/users/alice/Maildir/new/1.eml", .data = "Subject: hi\r\n\r\nhello\r\n" });
+    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tenants/acme/domains/example.com/users/alice/Maildir/new/2.eml", .data = "Subject: two\r\n\r\n" });
 
     var catalog = try @import("tenant_index.zig").parseForTest(allocator, "tenant acme example.com\n");
     defer catalog.deinit(allocator);
 
     var server = ImapServer.init(allocator, .{ .data_dir = root }, Storage.init(root), &catalog);
-    var in: Io.Reader = .fixed("a1 LOGIN alice@example.com wrong\r\na2 LOGIN alice@example.com secret\r\n" ++
-        "a3 SELECT INBOX\r\na4 FETCH 1 BODY[]\r\na5 LOGOUT\r\n");
+    var in: Io.Reader = .fixed(input);
     var out: Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
-
     var client: conn.Client = .{ .reader = &in, .writer = &out.writer };
     try server.handleClient(std.testing.io, &client);
+    return out.toOwnedSlice();
+}
 
-    const transcript = out.written();
-    for ([_][]const u8{
-        "a1 NO auth failed\r\n",
-        "a2 OK LOGIN completed\r\n",
-        "* 1 EXISTS\r\n",
-        "* 1 FETCH (FLAGS () BODY[] {22}\r\nSubject: hi\r\n\r\nhello\r\n\r\n)\r\na4 OK FETCH completed\r\n",
-        "a5 OK LOGOUT completed\r\n",
-    }) |expected| {
-        if (std.mem.indexOf(u8, transcript, expected) == null) {
-            std.debug.print("missing \"{s}\" in:\n{s}\n", .{ expected, transcript });
-            return error.TestExpectedEqual;
-        }
-    }
+test "imap session: states, quoting and literals" {
+    const allocator = std.testing.allocator;
+    const transcript = try testSession(allocator, "a0 SELECT INBOX\r\n" ++
+        "a1 LOGIN alice@example.com \"wrong\"\r\n" ++
+        "a2 LOGIN {17+}\r\nalice@example.com \"pass word\"\r\n" ++
+        "a3 LOGIN alice@example.com x\r\n" ++
+        "a4 BOGUS\r\n" ++
+        "a5 SELECT\r\n" ++
+        "a6 LIST \"\" *\r\n" ++
+        "a7 LIST \"\" \"\"\r\n" ++
+        "a8 SELECT Sent\r\n" ++
+        "a9 LOGOUT\r\n");
+    defer allocator.free(transcript);
+    try std.testing.expectEqualStrings("* OK [CAPABILITY IMAP4rev1 LITERAL+] raven ready\r\n" ++
+        "a0 BAD log in first\r\n" ++
+        "a1 NO [AUTHENTICATIONFAILED] authentication failed\r\n" ++
+        "a2 OK [CAPABILITY IMAP4rev1 LITERAL+] LOGIN completed\r\n" ++
+        "a3 BAD command not valid in this state\r\n" ++
+        "a4 BAD unknown command\r\n" ++
+        "a5 BAD syntax error\r\n" ++
+        "* LIST (\\HasNoChildren) \"/\" INBOX\r\na6 OK LIST completed\r\n" ++
+        "* LIST (\\Noselect) \"/\" \"\"\r\na7 OK LIST completed\r\n" ++
+        "a8 NO [NONEXISTENT] no such mailbox\r\n" ++
+        "* BYE raven logging out\r\na9 OK LOGOUT completed\r\n", transcript);
+}
+
+test "imap session: select, fetch, store and expunge" {
+    const allocator = std.testing.allocator;
+    const transcript = try testSession(allocator, "a1 LOGIN alice@example.com \"pass word\"\r\n" ++
+        "a2 EXAMINE INBOX\r\n" ++
+        "a3 STORE 1 +FLAGS (\\Deleted)\r\n" ++
+        "a4 SELECT inbox\r\n" ++
+        "a5 FETCH 1:* BODY[]\r\n" ++
+        "a6 STORE 1 +FLAGS.SILENT (\\Deleted \\Seen)\r\n" ++
+        "a7 EXPUNGE\r\n" ++
+        "a8 FETCH 1 BODY[]\r\n");
+    defer allocator.free(transcript);
+    const select = "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n";
+    try std.testing.expectEqualStrings("* OK [CAPABILITY IMAP4rev1 LITERAL+] raven ready\r\n" ++
+        "a1 OK [CAPABILITY IMAP4rev1 LITERAL+] LOGIN completed\r\n" ++
+        select ++ "* OK [PERMANENTFLAGS ()] read-only\r\n* 2 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 1] UIDs valid\r\na2 OK [READ-ONLY] EXAMINE completed\r\n" ++
+        "a3 NO [READ-ONLY] mailbox is read-only\r\n" ++
+        select ++ "* OK [PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)] limited\r\n* 2 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 1] UIDs valid\r\na4 OK [READ-WRITE] SELECT completed\r\n" ++
+        "* 1 FETCH (FLAGS () BODY[] {22}\r\nSubject: hi\r\n\r\nhello\r\n)\r\n* 2 FETCH (FLAGS () BODY[] {16}\r\nSubject: two\r\n\r\n)\r\na5 OK FETCH completed\r\n" ++
+        "a6 OK STORE completed\r\n" ++
+        "* 1 EXPUNGE\r\na7 OK EXPUNGE completed\r\n" ++
+        "* 1 FETCH (FLAGS () BODY[] {16}\r\nSubject: two\r\n\r\n)\r\na8 OK FETCH completed\r\n", transcript);
 }
