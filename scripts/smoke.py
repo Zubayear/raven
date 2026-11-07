@@ -153,19 +153,45 @@ def main():
             assert imap.readline().startswith(tag + b" OK")
             imap.logout()
 
-        with Raven(tmp / "busy", "--max-connections", "1"):
-            # The readiness probe's session may still hold the only slot briefly.
-            for _ in range(50):
-                first = socket.create_connection((HOST, SMTP_PORT), timeout=5)
-                if first.recv(64).startswith(b"220 "):
-                    break
+        # The connection cap, overall and per client address (#26).
+        for limit in ("--max-connections", "--max-connections-per-ip"):
+            with Raven(tmp / "busy", limit, "1"):
+                # The readiness probe's session may still hold the only slot briefly.
+                for _ in range(50):
+                    first = socket.create_connection((HOST, SMTP_PORT), timeout=5)
+                    if first.recv(64).startswith(b"220 "):
+                        break
+                    first.close()
+                    time.sleep(0.05)
+                else:
+                    sys.exit("first client was never served")
+                with socket.create_connection((HOST, SMTP_PORT), timeout=5) as second:
+                    assert second.recv(64).startswith(b"421 "), f"second client should be turned away ({limit})"
                 first.close()
-                time.sleep(0.05)
-            else:
-                sys.exit("first client was never served")
-            with socket.create_connection((HOST, SMTP_PORT), timeout=5) as second:
-                assert second.recv(64).startswith(b"421 "), "second client should be turned away"
-            first.close()
+
+        # Ten failed logins lock the address out of IMAP and SMTP alike (#26).
+        setup_accounts(tmp / "lockout")
+        with Raven(tmp / "lockout"):
+            imap = imap_plain()
+            for _ in range(10):
+                try:
+                    imap.login("alice@example.com", "wrong")
+                    sys.exit("a wrong password was accepted")
+                except imaplib.IMAP4.error as err:
+                    assert "AUTHENTICATIONFAILED" in str(err), err
+            try:
+                imap.login("alice@example.com", PASSWORD)
+                sys.exit("login during a lockout must fail")
+            except imaplib.IMAP4.error as err:
+                assert "UNAVAILABLE" in str(err), err
+            imap.logout()
+            smtp = smtplib.SMTP(HOST, SMTP_PORT, timeout=5)
+            try:
+                smtp.login("alice@example.com", PASSWORD)
+                sys.exit("SMTP AUTH during a lockout must fail")
+            except smtplib.SMTPAuthenticationError as err:
+                assert err.smtp_code == 454, err
+            smtp.quit()
 
         cert, key = tmp / "cert.pem", tmp / "key.pem"
         subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key,

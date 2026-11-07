@@ -11,6 +11,7 @@ const TenantCatalog = @import("tenant_index.zig").TenantCatalog;
 const TlsServer = @import("tls.zig").TlsServer;
 const TlsClient = @import("tls.zig").TlsClient;
 const queue = @import("queue.zig");
+const AuthThrottle = @import("limits.zig").AuthThrottle;
 
 pub const std_options: std.Options = .{
     // Everything is compiled in; `--log-level` filters at runtime.
@@ -47,8 +48,13 @@ pub fn main(process: std.process.Init) !void {
     var tenant_catalog = try TenantCatalog.load(allocator, io, storage);
     defer tenant_catalog.deinit(allocator);
 
+    // One throttle for every listener: guessing can't switch protocols.
+    var throttle: AuthThrottle = .init(allocator);
+    defer throttle.deinit();
     var smtp = Server.init(allocator, config, &tenant_catalog);
+    smtp.throttle = &throttle;
     var imap = ImapServer.init(allocator, config, storage, &tenant_catalog);
+    imap.throttle = &throttle;
 
     var tls_server: ?TlsServer = null;
     defer if (tls_server) |*value| value.deinit();
@@ -73,6 +79,7 @@ pub fn main(process: std.process.Init) !void {
 
     const smtp_options: conn.Options = .{
         .max_connections = config.max_connections,
+        .max_connections_per_ip = config.max_connections_per_ip,
         .idle_timeout = .fromSeconds(5 * 60), // RFC 5321 §4.5.3.2.7
         .busy_reply = "421 4.7.0 too many connections, try again later\r\n",
         .tls = tls, // offered through STARTTLS
@@ -87,11 +94,13 @@ pub fn main(process: std.process.Init) !void {
 
     var submission = Server.init(allocator, config, &tenant_catalog);
     submission.submission = true;
+    submission.throttle = &throttle;
     var submission_listener: ?std.Io.net.Server = if (config.submission_port != 0) try submission.listen(io, config.submission_port) else null;
     defer if (submission_listener) |*listener| listener.deinit(io);
     var submission_task = if (submission_listener) |*listener| try io.concurrent(conn.Listener(Server).serve, .{ io, listener, &submission, smtp_options }) else null;
     const imap_options: conn.Options = .{
         .max_connections = config.max_connections,
+        .max_connections_per_ip = config.max_connections_per_ip,
         .idle_timeout = .fromSeconds(30 * 60), // RFC 3501 §5.4 autologout
         .busy_reply = "* BYE too many connections, try again later\r\n",
         .tls = tls, // offered through STARTTLS
@@ -184,6 +193,7 @@ test {
     _ = @import("dns.zig");
     _ = @import("imap.zig");
     _ = @import("imap_proto.zig");
+    _ = @import("limits.zig");
     _ = @import("mime.zig");
     _ = @import("queue.zig");
     _ = @import("server.zig");
