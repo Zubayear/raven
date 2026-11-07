@@ -66,6 +66,12 @@ pub fn main(process: std.process.Init) !void {
     var smtps_options = smtp_options;
     smtps_options.implicit_tls = true;
     var smtps_task = if (smtps_listener) |*listener| try io.concurrent(conn.Listener(Server).serve, .{ io, listener, &smtp, smtps_options }) else null;
+
+    var submission = Server.init(allocator, config, &tenant_catalog);
+    submission.submission = true;
+    var submission_listener: ?std.Io.net.Server = if (config.submission_port != 0) try submission.listen(io, config.submission_port) else null;
+    defer if (submission_listener) |*listener| listener.deinit(io);
+    var submission_task = if (submission_listener) |*listener| try io.concurrent(conn.Listener(Server).serve, .{ io, listener, &submission, smtp_options }) else null;
     const imap_options: conn.Options = .{
         .max_connections = config.max_connections,
         .idle_timeout = .fromSeconds(30 * 60), // RFC 3501 §5.4 autologout
@@ -85,6 +91,7 @@ pub fn main(process: std.process.Init) !void {
     std.debug.print("shutdown requested by signal {d}\n", .{sig});
     smtp_task.cancel(io);
     if (smtps_task) |*task| task.cancel(io);
+    if (submission_task) |*task| task.cancel(io);
     imap_task.cancel(io);
     if (imaps_task) |*task| task.cancel(io);
 }

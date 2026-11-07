@@ -112,6 +112,7 @@ Common options:
 - `--max-message-size` (bytes, default 26214400; advertised with SMTP `SIZE`)
 - `--smtps-port` (implicit-TLS SMTP; off by default)
 - `--imaps-port` (implicit-TLS IMAP; off by default)
+- `--submission-port` (mail submission, RFC 6409; AUTH required; off by default)
 - `--allow-plaintext-auth` (testing only)
 
 Environment variables use the `RAVEN_` prefix:
@@ -128,6 +129,7 @@ Environment variables use the `RAVEN_` prefix:
 - `RAVEN_MAX_MESSAGE_SIZE`
 - `RAVEN_SMTPS_PORT`
 - `RAVEN_IMAPS_PORT`
+- `RAVEN_SUBMISSION_PORT`
 - `RAVEN_ALLOW_PLAINTEXT_AUTH`
 
 Example config file:
@@ -170,6 +172,7 @@ data/tenants/<tenant>/domains/<domain>/accounts.txt     <user> <argon2id hash>
 data/tenants/<tenant>/domains/<domain>/aliases.txt      <alias> <user>
 data/tenants/<tenant>/domains/<domain>/users/<user>/Maildir/{tmp,new,cur}   INBOX
 data/tenants/<tenant>/domains/<domain>/users/<user>/Maildir/.Sent/...       folders (Maildir++)
+data/queue/outbound/<id>.eml + <id>.env                                    outbound queue
 ```
 
 Each domain belongs to exactly one tenant. Domains and local parts match case-insensitively; mail for `user+tag@domain` is delivered to `user`.

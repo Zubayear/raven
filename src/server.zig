@@ -17,6 +17,8 @@ pub const Server = struct {
     config: Config,
     storage: Storage,
     tenant_catalog: *const TenantCatalog,
+    /// The submission port (587): every transaction needs AUTH.
+    submission: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, config: Config, tenant_catalog: *const TenantCatalog) Server {
         return .{
@@ -177,6 +179,10 @@ pub const Server = struct {
                     try w.writeAll("552 5.3.4 message size exceeds limit\r\n");
                     continue;
                 }
+                if (self.submission and auth_identity == null) {
+                    try w.writeAll("530 5.7.0 authentication required\r\n");
+                    continue;
+                }
                 // The null reverse-path (bounces, RFC 5321 §4.5.5) is always accepted.
                 if (path.len != 0) {
                     const addr = address.parse(path) catch {
@@ -216,13 +222,21 @@ pub const Server = struct {
                     try w.writeAll("501 5.1.3 bad recipient address\r\n");
                     continue;
                 };
-                if (tx.recipients.items.len >= max_recipients) {
+                if (tx.recipients.items.len + tx.remote.items.len >= max_recipients) {
                     try w.writeAll("452 4.5.3 too many recipients\r\n");
                     continue;
                 }
                 const recipient = resolveRecipient(allocator, fs_io, self.storage, catalog, addr) catch |err| switch (err) {
                     error.NotHosted => {
-                        try w.writeAll("550 5.7.1 relaying denied\r\n");
+                        // Only authenticated users may relay: otherwise this would be an open relay.
+                        if (auth_identity == null) {
+                            try w.writeAll("550 5.7.1 relaying denied\r\n");
+                            continue;
+                        }
+                        const remote = try allocator.dupe(u8, path);
+                        errdefer allocator.free(remote);
+                        try tx.remote.append(allocator, remote);
+                        try w.writeAll("250 2.1.5 ok\r\n");
                         continue;
                     },
                     error.UnknownUser => {
@@ -239,7 +253,7 @@ pub const Server = struct {
                 }
                 try w.writeAll("250 2.1.5 ok\r\n");
             } else if (std.ascii.eqlIgnoreCase(verb, "DATA")) {
-                if (tx.recipients.items.len == 0) {
+                if (tx.recipients.items.len == 0 and tx.remote.items.len == 0) {
                     try w.writeAll("503 5.5.1 need RCPT first\r\n");
                     continue;
                 }
@@ -274,18 +288,31 @@ pub const Server = struct {
                 var header: Io.Writer.Allocating = .init(allocator);
                 defer header.deinit();
 
-                for (tx.recipients.items) |recipient| {
+                const delivered = for (tx.recipients.items) |recipient| {
                     header.clearRetainingCapacity();
                     try writeTrace(&header.writer, trace, recipient);
                     const name = self.storage.deliver(fs_io, allocator, recipient.tenant, recipient.domain, recipient.user, header.written(), message) catch |err| {
                         std.debug.print("delivery to {s}@{s} failed: {}\n", .{ recipient.user, recipient.domain, err });
-                        // A temporary failure makes the client retry: a duplicate beats a lost message.
-                        try w.writeAll("451 4.3.0 local error in processing\r\n");
-                        break;
+                        break false;
                     };
                     defer allocator.free(name);
                     std.debug.print("delivered to {s}@{s} as {s}\n", .{ recipient.user, recipient.domain, name });
-                } else try w.writeAll("250 2.0.0 ok\r\n");
+                } else true;
+                const queued = tx.remote.items.len == 0 or queued: {
+                    // One queue entry for every remote recipient; Return-Path is
+                    // left for the final delivery (RFC 5321 §4.4).
+                    header.clearRetainingCapacity();
+                    try writeTrace(&header.writer, trace, null);
+                    const id = self.storage.enqueue(fs_io, allocator, tx.sender.?, tx.remote.items, header.written(), message) catch |err| {
+                        std.debug.print("queueing failed: {}\n", .{err});
+                        break :queued false;
+                    };
+                    defer allocator.free(id);
+                    std.debug.print("queued {s} for {d} remote recipient(s)\n", .{ id, tx.remote.items.len });
+                    break :queued true;
+                };
+                // A temporary failure makes the client retry: a duplicate beats a lost message.
+                try w.writeAll(if (delivered and queued) "250 2.0.0 ok\r\n" else "451 4.3.0 local error in processing\r\n");
             } else {
                 try w.writeAll("500 5.5.2 command unrecognized\r\n");
             }
@@ -303,6 +330,8 @@ const Transaction = struct {
     /// Reverse-path without brackets; empty for the null sender.
     sender: ?[]u8 = null,
     recipients: std.ArrayList(Identity) = .empty,
+    /// Recipients on other domains, queued for delivery (authenticated only).
+    remote: std.ArrayList([]u8) = .empty,
 
     fn has(self: *const Transaction, identity: Identity) bool {
         for (self.recipients.items) |r| {
@@ -316,11 +345,14 @@ const Transaction = struct {
         self.sender = null;
         for (self.recipients.items) |r| r.deinit(allocator);
         self.recipients.clearRetainingCapacity();
+        for (self.remote.items) |r| allocator.free(r);
+        self.remote.clearRetainingCapacity();
     }
 
     fn deinit(self: *Transaction, allocator: std.mem.Allocator) void {
         self.reset(allocator);
         self.recipients.deinit(allocator);
+        self.remote.deinit(allocator);
     }
 };
 
@@ -335,16 +367,20 @@ const Trace = struct {
     seconds: u64,
 };
 
-/// Return-Path and Received headers (RFC 5321 §4.4) for one delivered copy.
-fn writeTrace(w: *Io.Writer, t: Trace, recipient: Identity) !void {
-    try w.print("Return-Path: <{s}>\r\nReceived: from ", .{t.reverse_path});
+/// Return-Path and Received headers (RFC 5321 §4.4) for one locally
+/// delivered copy, or only Received (without `for`) for queued mail.
+fn writeTrace(w: *Io.Writer, t: Trace, recipient: ?Identity) !void {
+    if (recipient != null) try w.print("Return-Path: <{s}>\r\n", .{t.reverse_path});
+    try w.writeAll("Received: from ");
     // The HELO name is client-supplied: keep only printable characters.
     for (t.helo) |ch| try w.writeByte(if (std.ascii.isPrint(ch) and ch != '(' and ch != ')') ch else '?');
     if (t.remote) |ip| switch (ip) {
         .ip4 => |a| try w.print(" ([{d}.{d}.{d}.{d}])", .{ a.bytes[0], a.bytes[1], a.bytes[2], a.bytes[3] }),
         .ip6 => |a| try w.print(" ([IPv6:{f}])", .{std.Io.net.Ip6Address.Unresolved{ .bytes = a.bytes, .interface_name = null }}),
     };
-    try w.print("\r\n\tby {s} with {s} id {s}\r\n\tfor <{s}@{s}>; ", .{ t.hostname, t.protocol, &t.id, recipient.user, recipient.domain });
+    try w.print("\r\n\tby {s} with {s} id {s}", .{ t.hostname, t.protocol, &t.id });
+    if (recipient) |r| try w.print("\r\n\tfor <{s}@{s}>", .{ r.user, r.domain });
+    try w.writeAll("; ");
     try writeDate(w, t.seconds);
     try w.writeAll("\r\n");
 }
@@ -791,4 +827,56 @@ test "smtp session rejects path traversal in addresses" {
     try std.testing.expectEqualStrings(greeting ++ ehlo_reply ++ "501 5.1.7 bad sender address\r\n250 2.1.0 ok\r\n" ++
         "501 5.1.3 bad recipient address\r\n501 5.1.3 bad recipient address\r\n503 5.5.1 need RCPT first\r\n221 2.0.0 bye\r\n", transcript);
     try std.testing.expectError(error.FileNotFound, dir.tmp.dir.access(std.testing.io, "escape", .{}));
+}
+
+test "authenticated users relay through the queue; local copies are delivered" {
+    const allocator = std.testing.allocator;
+    var dir = try TestDir.init(allocator);
+    defer dir.deinit(allocator);
+
+    const auth = try buildPlainAuthPayload(allocator, "", "alice@example.com", "secret");
+    defer allocator.free(auth);
+    const input = try std.mem.concat(allocator, u8, &.{ "EHLO client\r\nAUTH PLAIN ", auth, "\r\nMAIL FROM:<alice@example.com>\r\n" ++
+        "RCPT TO:<bob@remote.test>\r\nRCPT TO:<carol+x@other.test>\r\nRCPT TO:<sales@example.com>\r\nDATA\r\nSubject: out\r\n\r\nhi\r\n.\r\nQUIT\r\n" });
+    defer allocator.free(input);
+    const transcript = try dir.session(allocator, input);
+    defer allocator.free(transcript);
+    try std.testing.expectStringEndsWith(transcript, "250 2.1.0 ok\r\n250 2.1.5 ok\r\n250 2.1.5 ok\r\n250 2.1.5 ok\r\n" ++
+        "354 end data with <CR><LF>.<CR><LF>\r\n250 2.0.0 ok\r\n221 2.0.0 bye\r\n");
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const entries = try Storage.init(dir.root).listQueue(std.testing.io, arena_state.allocator());
+    try std.testing.expectEqual(@as(usize, 1), entries.len);
+    try std.testing.expectEqualStrings("alice@example.com", entries[0].sender);
+    try std.testing.expectEqual(@as(usize, 2), entries[0].recipients.len);
+    try std.testing.expectEqualStrings("bob@remote.test", entries[0].recipients[0]);
+    try std.testing.expectEqualStrings("carol+x@other.test", entries[0].recipients[1]);
+
+    const queued_path = try std.fmt.allocPrint(allocator, "queue/outbound/{s}.eml", .{entries[0].id});
+    defer allocator.free(queued_path);
+    const queued = try dir.tmp.dir.readFileAlloc(std.testing.io, queued_path, allocator, .limited(4096));
+    defer allocator.free(queued);
+    try std.testing.expectStringStartsWith(queued, "Received: from client\r\n\tby localhost with ESMTPSA id ");
+    try std.testing.expect(std.mem.indexOf(u8, queued, "Return-Path") == null);
+    try std.testing.expectStringEndsWith(queued, "Subject: out\r\n\r\nhi\r\n");
+
+    const messages = try dir.inbox(allocator);
+    defer @import("storage.zig").freeMessages(allocator, messages);
+    try std.testing.expectEqual(@as(usize, 1), messages.len); // the local alias copy
+}
+
+test "the submission port requires AUTH before MAIL" {
+    const allocator = std.testing.allocator;
+    var dir = try TestDir.init(allocator);
+    defer dir.deinit(allocator);
+
+    var server = Server.init(allocator, .{ .data_dir = dir.root }, &dir.catalog);
+    server.submission = true;
+    var in: Io.Reader = .fixed("EHLO client\r\nMAIL FROM:<bob@external.test>\r\nQUIT\r\n");
+    var out: Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    var client: conn.Client = .{ .reader = &in, .writer = &out.writer, .secure = true };
+    try server.handleClient(std.testing.io, &client);
+    try std.testing.expectStringEndsWith(out.written(), "530 5.7.0 authentication required\r\n221 2.0.0 bye\r\n");
 }
