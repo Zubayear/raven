@@ -18,16 +18,17 @@ HOST, SMTP_PORT, IMAP_PORT, SMTPS_PORT, IMAPS_PORT, SUBMISSION_PORT = "127.0.0.1
 
 
 class Raven:
-    def __init__(self, data_dir, *extra):
+    def __init__(self, data_dir, *extra, ports=(SMTP_PORT, IMAP_PORT), hostname="localhost"):
         if "--tls-cert" not in extra:
             extra += ("--allow-plaintext-auth",)  # no TLS in these runs, so IMAP LOGIN needs the opt-out
-        self.args = [BIN, "--listen-address", HOST, "--listen-port", str(SMTP_PORT),
-                     "--imap-port", str(IMAP_PORT), "--hostname", "localhost",
+        self.ports = ports
+        self.args = [BIN, "--listen-address", HOST, "--listen-port", str(ports[0]),
+                     "--imap-port", str(ports[1]), "--hostname", hostname,
                      "--data-dir", str(data_dir), *extra]
 
     def __enter__(self):
         self.proc = subprocess.Popen(self.args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-        for port in (SMTP_PORT, IMAP_PORT):
+        for port in self.ports:
             deadline = time.monotonic() + 10
             while True:
                 if self.proc.poll() is not None:
@@ -164,8 +165,15 @@ def main():
 
         data = tmp / "tls"
         setup_accounts(data)
-        with Raven(data, "--tls-cert", str(cert), "--tls-key", str(key), "--smtps-port", str(SMTPS_PORT),
-                   "--imaps-port", str(IMAPS_PORT), "--submission-port", str(SUBMISSION_PORT)):
+        # A second Raven hosting remote.test receives what the first one relays.
+        remote = tmp / "remote"
+        (remote / "tenants/beta/domains/remote.test").mkdir(parents=True)
+        (remote / "tenants/index.txt").write_text("tenant beta remote.test\n")
+        (remote / "tenants/beta/domains/remote.test/accounts.txt").write_text(f"bob {PASSWORD_HASH}\n")
+        with Raven(remote, "--tls-cert", str(cert), "--tls-key", str(key), ports=(3525, 3143), hostname="mx.remote.test"), \
+                Raven(data, "--tls-cert", str(cert), "--tls-key", str(key), "--smtps-port", str(SMTPS_PORT),
+                      "--imaps-port", str(IMAPS_PORT), "--submission-port", str(SUBMISSION_PORT),
+                      "--relay-host", HOST, "--relay-port", "3525"):
             # Submission: AUTH first, then remote recipients go to the queue (#20).
             sub = smtplib.SMTP(HOST, SUBMISSION_PORT, timeout=5)
             sub.starttls(context=ctx)
@@ -177,8 +185,19 @@ def main():
             sub.login("alice@example.com", PASSWORD)
             sub.sendmail("alice@example.com", ["bob@remote.test"], "Subject: out\r\n\r\nhi\r\n")
             sub.quit()
-            envelopes = list((data / "queue/outbound").glob("*.env"))
-            assert len(envelopes) == 1 and "recipient bob@remote.test" in envelopes[0].read_text(), envelopes
+
+            # The queue runner relays it to the other Raven over STARTTLS (#22, #23).
+            bob = remote / "tenants/beta/domains/remote.test/users/bob/Maildir/new"
+            deadline = time.monotonic() + 20
+            while not (bob.exists() and any(bob.iterdir())):
+                assert time.monotonic() < deadline, "relayed mail never arrived"
+                time.sleep(0.2)
+            relayed = next(bob.iterdir()).read_bytes()
+            assert b"with ESMTPS" in relayed and b"Subject: out" in relayed, relayed
+            deadline = time.monotonic() + 5
+            while list((data / "queue/outbound").glob("*.env")):
+                assert time.monotonic() < deadline, "queue entry was not removed after delivery"
+                time.sleep(0.1)
 
             # IMAP refuses passwords before STARTTLS, then accepts them (#19).
             imap = imaplib.IMAP4(HOST, IMAP_PORT, timeout=5)

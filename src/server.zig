@@ -226,7 +226,7 @@ pub const Server = struct {
                     try w.writeAll("452 4.5.3 too many recipients\r\n");
                     continue;
                 }
-                const recipient = resolveRecipient(allocator, fs_io, self.storage, catalog, addr) catch |err| switch (err) {
+                const recipient = account_index.resolveMailbox(allocator, fs_io, self.storage, catalog, addr) catch |err| switch (err) {
                     error.NotHosted => {
                         // Only authenticated users may relay: otherwise this would be an open relay.
                         if (auth_identity == null) {
@@ -386,7 +386,7 @@ fn writeTrace(w: *Io.Writer, t: Trace, recipient: ?Identity) !void {
 }
 
 /// RFC 5322 date-time in UTC, e.g. `Sat, 07 Nov 2026 09:15:47 +0000`.
-fn writeDate(w: *Io.Writer, seconds: u64) !void {
+pub fn writeDate(w: *Io.Writer, seconds: u64) !void {
     const epoch: std.time.epoch.EpochSeconds = .{ .secs = seconds };
     const day = epoch.getEpochDay();
     const year_day = day.calculateYearDay();
@@ -502,20 +502,6 @@ fn readData(allocator: std.mem.Allocator, r: *Io.Reader, max_size: u64) !?Data {
     return .{ .message = try message.toOwnedSlice(allocator) };
 }
 
-/// Maps a recipient address to a local mailbox: the domain must be hosted
-/// and the user an account, directly or through an alias. `+tag` is ignored.
-fn resolveRecipient(allocator: std.mem.Allocator, io: Io, storage: Storage, catalog: *const TenantCatalog, addr: address.Address) !Identity {
-    const hosted = catalog.find(addr.domain) orelse return error.NotHosted;
-
-    var aliases = try AliasTable.load(allocator, io, storage, hosted.tenant, hosted.domain);
-    defer aliases.deinit(allocator);
-    var accounts = try AccountStore.load(allocator, io, storage, hosted.tenant, hosted.domain);
-    defer accounts.deinit(allocator);
-
-    const account = accounts.find(aliases.find(addr.user) orelse addr.user) orelse return error.UnknownUser;
-    return Identity.init(allocator, hosted.tenant, hosted.domain, account.user);
-}
-
 fn trimCr(line: []const u8) []const u8 {
     if (line.len > 0 and line[line.len - 1] == '\r') {
         return line[0 .. line.len - 1];
@@ -569,21 +555,21 @@ const TestDir = struct {
     }
 };
 
-test "resolveRecipient maps aliases, plus tags and case to the canonical account" {
+test "resolveMailbox maps aliases, plus tags and case to the canonical account" {
     const allocator = std.testing.allocator;
     var dir = try TestDir.init(allocator);
     defer dir.deinit(allocator);
     const storage = Storage.init(dir.root);
 
     for ([_][]const u8{ "<alice@example.com>", "<Alice+news@EXAMPLE.com>", "<sales@example.com>", "<SALES+x@example.com>" }) |raw| {
-        const identity = try resolveRecipient(allocator, std.testing.io, storage, &dir.catalog, try address.parse(raw));
+        const identity = try account_index.resolveMailbox(allocator, std.testing.io, storage, &dir.catalog, try address.parse(raw));
         defer identity.deinit(allocator);
         try std.testing.expectEqualStrings("acme", identity.tenant);
         try std.testing.expectEqualStrings("example.com", identity.domain);
         try std.testing.expectEqualStrings("alice", identity.user);
     }
-    try std.testing.expectError(error.UnknownUser, resolveRecipient(allocator, std.testing.io, storage, &dir.catalog, try address.parse("<bob@example.com>")));
-    try std.testing.expectError(error.NotHosted, resolveRecipient(allocator, std.testing.io, storage, &dir.catalog, try address.parse("<alice@other.com>")));
+    try std.testing.expectError(error.UnknownUser, account_index.resolveMailbox(allocator, std.testing.io, storage, &dir.catalog, try address.parse("<bob@example.com>")));
+    try std.testing.expectError(error.NotHosted, account_index.resolveMailbox(allocator, std.testing.io, storage, &dir.catalog, try address.parse("<alice@other.com>")));
 }
 
 test "authenticatePlain authenticates and refuses impersonation" {

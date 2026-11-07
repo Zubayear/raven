@@ -10,6 +10,10 @@ pub const Config = struct {
     imaps_port: u16 = 0,
     /// Mail submission (usually 587, RFC 6409): AUTH required; 0 disables it.
     submission_port: u16 = 0,
+    /// Send all outbound mail through this host instead of the recipients'
+    /// MX hosts (a smarthost); empty means direct delivery.
+    relay_host: []const u8 = "",
+    relay_port: u16 = 25,
     hostname: []const u8 = "localhost",
     data_dir: []const u8 = "data",
     tls_cert_file: []const u8 = "",
@@ -54,6 +58,8 @@ const ArgsOptions = struct {
     smtps_port: ?u16 = null,
     imaps_port: ?u16 = null,
     submission_port: ?u16 = null,
+    relay_host: ?[]const u8 = null,
+    relay_port: ?u16 = null,
     hostname: ?[]const u8 = null,
     data_dir: ?[]const u8 = null,
     tls_cert_file: ?[]const u8 = null,
@@ -98,6 +104,14 @@ fn parseArgs(process: std.process.Init, arena: std.mem.Allocator) !ArgsOptions {
             args.submission_port = try parsePort(it.next() orelse return error.MissingConfigValue);
             continue;
         }
+        if (std.mem.eql(u8, arg, "--relay-host")) {
+            args.relay_host = try arena.dupe(u8, it.next() orelse return error.MissingConfigValue);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--relay-port")) {
+            args.relay_port = try parsePort(it.next() orelse return error.MissingConfigValue);
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--allow-plaintext-auth")) {
             args.allow_plaintext_auth = true;
             continue;
@@ -137,6 +151,8 @@ fn applyArgs(config: *Config, args: ArgsOptions) void {
     if (args.smtps_port) |value| config.smtps_port = value;
     if (args.imaps_port) |value| config.imaps_port = value;
     if (args.submission_port) |value| config.submission_port = value;
+    if (args.relay_host) |value| config.relay_host = value;
+    if (args.relay_port) |value| config.relay_port = value;
     if (args.allow_plaintext_auth) |value| config.allow_plaintext_auth = value;
     if (args.hostname) |value| config.hostname = value;
     if (args.data_dir) |value| config.data_dir = value;
@@ -153,6 +169,8 @@ fn applyEnv(config: *Config, process: std.process.Init, arena: std.mem.Allocator
     if (try getEnvValue(process, "RAVEN_SMTPS_PORT")) |value| config.smtps_port = try parsePort(value);
     if (try getEnvValue(process, "RAVEN_IMAPS_PORT")) |value| config.imaps_port = try parsePort(value);
     if (try getEnvValue(process, "RAVEN_SUBMISSION_PORT")) |value| config.submission_port = try parsePort(value);
+    if (try getEnvValue(process, "RAVEN_RELAY_HOST")) |value| config.relay_host = try arena.dupe(u8, value);
+    if (try getEnvValue(process, "RAVEN_RELAY_PORT")) |value| config.relay_port = try parsePort(value);
     if (try getEnvValue(process, "RAVEN_ALLOW_PLAINTEXT_AUTH")) |value| config.allow_plaintext_auth = try parseBool(value);
     if (try getEnvValue(process, "RAVEN_HOSTNAME")) |value| config.hostname = try arena.dupe(u8, value);
     if (try getEnvValue(process, "RAVEN_DATA_DIR")) |value| config.data_dir = try arena.dupe(u8, value);
@@ -213,6 +231,14 @@ fn applyKeyValue(config: *Config, allocator: std.mem.Allocator, key: []const u8,
     }
     if (std.mem.eql(u8, key, "submission_port")) {
         config.submission_port = try parsePort(value);
+        return;
+    }
+    if (std.mem.eql(u8, key, "relay_host")) {
+        config.relay_host = try allocator.dupe(u8, value);
+        return;
+    }
+    if (std.mem.eql(u8, key, "relay_port")) {
+        config.relay_port = try parsePort(value);
         return;
     }
     if (std.mem.eql(u8, key, "allow_plaintext_auth")) {
