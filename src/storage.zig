@@ -345,8 +345,7 @@ pub const Storage = struct {
 
         try ensurePath(io, queue_dir);
 
-        const id = self.next_inbound_id;
-        self.next_inbound_id += 1;
+        const id = @atomicRmw(u64, &self.next_inbound_id, .Add, 1, .monotonic);
 
         var filename_buf: [64]u8 = undefined;
         const filename = try std.fmt.bufPrint(&filename_buf, "{d}.eml", .{id});
@@ -379,8 +378,7 @@ pub const Storage = struct {
 
         try ensurePath(io, mailbox_new_dir);
 
-        const id = self.next_inbound_id;
-        self.next_inbound_id += 1;
+        const id = @atomicRmw(u64, &self.next_inbound_id, .Add, 1, .monotonic);
 
         var filename_buf: [64]u8 = undefined;
         const filename = try std.fmt.bufPrint(&filename_buf, "{d}.eml", .{id});

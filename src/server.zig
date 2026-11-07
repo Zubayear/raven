@@ -8,18 +8,19 @@ const AliasTable = @import("alias_index.zig").AliasTable;
 const Storage = @import("storage.zig").Storage;
 const TenantCatalog = @import("tenant_index.zig").TenantCatalog;
 const TenantIndex = @import("tenant_index.zig");
-const TlsServer = @import("tls.zig").TlsServer;
 
 pub const Server = struct {
     allocator: std.mem.Allocator,
     config: Config,
     storage: Storage,
+    tenant_catalog: *const TenantCatalog,
 
-    pub fn init(allocator: std.mem.Allocator, config: Config) Server {
+    pub fn init(allocator: std.mem.Allocator, config: Config, tenant_catalog: *const TenantCatalog) Server {
         return .{
             .allocator = allocator,
             .config = config,
             .storage = Storage.init(config.data_dir),
+            .tenant_catalog = tenant_catalog,
         };
     }
 
@@ -30,42 +31,8 @@ pub const Server = struct {
         return listener;
     }
 
-    pub fn serve(
-        self: *Server,
-        io: Io,
-        listener: *std.Io.net.Server,
-        tenant_catalog: *const TenantCatalog,
-        shutdown: *const std.atomic.Value(bool),
-        tls_server: ?*TlsServer,
-    ) !void {
-        while (!shutdown.load(.acquire)) {
-            const stream = listener.accept(io) catch |err| switch (err) {
-                error.SocketNotListening, error.Canceled => return,
-                else => {
-                    std.debug.print("smtp accept error: {}\n", .{err});
-                    continue;
-                },
-            };
-            defer stream.close(io);
-            self.serveConnection(io, stream, tenant_catalog, tls_server) catch |err| {
-                std.debug.print("smtp session error: {}\n", .{err});
-            };
-        }
-    }
-
-    fn serveConnection(self: *Server, io: Io, stream: std.Io.net.Stream, tenant_catalog: *const TenantCatalog, tls_server: ?*TlsServer) !void {
-        var read_buf: [1024]u8 = undefined;
-        if (tls_server) |server| {
-            var conn = try server.accept(stream.socket.handle, &read_buf, &.{});
-            defer conn.deinit();
-            return self.handleClient(io, &conn.reader, &conn.writer, tenant_catalog);
-        }
-        var reader = stream.reader(io, &read_buf);
-        var writer = stream.writer(io, &.{});
-        return self.handleClient(io, &reader.interface, &writer.interface, tenant_catalog);
-    }
-
-    fn handleClient(self: *Server, fs_io: Io, r: *Io.Reader, w: *Io.Writer, tenant_catalog: *const TenantCatalog) !void {
+    pub fn handleClient(self: *Server, fs_io: Io, r: *Io.Reader, w: *Io.Writer) !void {
+        const tenant_catalog = self.tenant_catalog;
         try w.writeAll("220 ");
         try w.writeAll(self.config.hostname);
         try w.writeAll(" ESMTP raven ready\r\n");
@@ -595,13 +562,13 @@ test "smtp session delivers a pipelined transaction" {
     var catalog = try TenantIndex.parseForTest(allocator, "tenant acme example.com\n");
     defer catalog.deinit(allocator);
 
-    var server = Server.init(allocator, .{ .data_dir = root });
+    var server = Server.init(allocator, .{ .data_dir = root }, &catalog);
     var in: Io.Reader = .fixed("EHLO client\r\nMAIL FROM:<bob@external.test>\r\nRCPT TO:<alice@example.com>\r\n" ++
         "DATA\r\nSubject: hi\r\n\r\n..dot\r\n.\r\nQUIT\r\n");
     var out: Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
 
-    try server.handleClient(std.testing.io, &in, &out.writer, &catalog);
+    try server.handleClient(std.testing.io, &in, &out.writer);
 
     try std.testing.expectEqualStrings("220 localhost ESMTP raven ready\r\n" ++
         "250-localhost\r\n250-AUTH PLAIN\r\n250 PIPELINING\r\n" ++
@@ -625,13 +592,13 @@ test "smtp session rejects path traversal in addresses" {
     var catalog = try TenantIndex.parseForTest(allocator, "tenant acme example.com\n");
     defer catalog.deinit(allocator);
 
-    var server = Server.init(allocator, .{ .data_dir = root });
+    var server = Server.init(allocator, .{ .data_dir = root }, &catalog);
     var in: Io.Reader = .fixed("MAIL FROM:<../../x@external.test>\r\nMAIL FROM:<bob@external.test>\r\n" ++
         "RCPT TO:<../../../../../escape@example.com>\r\nRCPT TO:<alice@../../../escape>\r\nDATA\r\nQUIT\r\n");
     var out: Io.Writer.Allocating = .init(allocator);
     defer out.deinit();
 
-    try server.handleClient(std.testing.io, &in, &out.writer, &catalog);
+    try server.handleClient(std.testing.io, &in, &out.writer);
 
     try std.testing.expectEqualStrings("220 localhost ESMTP raven ready\r\n501 bad sender\r\n250 ok\r\n" ++
         "501 bad recipient\r\n501 bad recipient\r\n503 need rcpt first\r\n221 bye\r\n", out.written());

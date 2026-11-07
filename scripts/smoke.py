@@ -92,8 +92,19 @@ def main():
         data = tmp / "plain"
         setup_accounts(data)
         with Raven(data):
+            # Silent clients must not block anyone else (#5).
+            idle = [socket.create_connection((HOST, port), timeout=5) for port in (SMTP_PORT, IMAP_PORT)]
             check_delivery(smtplib.SMTP(HOST, SMTP_PORT, timeout=5),
                            socket.create_connection((HOST, IMAP_PORT), timeout=5))
+            for s in idle:
+                s.close()
+
+        with Raven(tmp / "busy", "--max-connections", "1"):
+            first = socket.create_connection((HOST, SMTP_PORT), timeout=5)
+            assert first.recv(64).startswith(b"220 "), "first client should be served"
+            with socket.create_connection((HOST, SMTP_PORT), timeout=5) as second:
+                assert second.recv(64).startswith(b"421 "), "second client should be turned away"
+            first.close()
 
         cert, key = tmp / "cert.pem", tmp / "key.pem"
         subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-keyout", key,
@@ -107,6 +118,10 @@ def main():
         with Raven(data, "--tls-cert", str(cert), "--tls-key", str(key)):
             check_delivery(smtplib.SMTP_SSL(HOST, SMTP_PORT, timeout=5, context=ctx),
                            ctx.wrap_socket(socket.create_connection((HOST, IMAP_PORT), timeout=5)))
+            # Left open across shutdown: SIGTERM must still stop raven promptly.
+            idle_tls = ctx.wrap_socket(socket.create_connection((HOST, IMAP_PORT), timeout=5))
+            assert idle_tls.recv(64).startswith(b"* OK")
+        idle_tls.close()
 
         bad = subprocess.run([BIN, "--data-dir", str(tmp / "bad"), "--tls-cert", str(cert)],
                              capture_output=True, timeout=10)

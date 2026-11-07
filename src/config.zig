@@ -8,6 +8,8 @@ pub const Config = struct {
     data_dir: []const u8 = "data",
     tls_cert_file: []const u8 = "",
     tls_key_file: []const u8 = "",
+    /// Per listener; further clients are turned away with 421 / BYE.
+    max_connections: u32 = 100,
     config_path: ?[]const u8 = null,
 
     pub fn load(process: std.process.Init) !Config {
@@ -29,6 +31,7 @@ pub const Config = struct {
         if (self.hostname.len == 0) return error.InvalidConfig;
         if (self.data_dir.len == 0) return error.InvalidConfig;
         if (self.listen_port == 0 or self.imap_port == 0) return error.InvalidConfig;
+        if (self.max_connections == 0) return error.InvalidConfig;
     }
 };
 
@@ -41,6 +44,7 @@ const ArgsOptions = struct {
     data_dir: ?[]const u8 = null,
     tls_cert_file: ?[]const u8 = null,
     tls_key_file: ?[]const u8 = null,
+    max_connections: ?u32 = null,
 };
 
 fn parseArgs(process: std.process.Init, arena: std.mem.Allocator) !ArgsOptions {
@@ -82,6 +86,10 @@ fn parseArgs(process: std.process.Init, arena: std.mem.Allocator) !ArgsOptions {
             args.tls_key_file = try arena.dupe(u8, it.next() orelse return error.MissingConfigValue);
             continue;
         }
+        if (std.mem.eql(u8, arg, "--max-connections")) {
+            args.max_connections = try std.fmt.parseInt(u32, it.next() orelse return error.MissingConfigValue, 10);
+            continue;
+        }
     }
     return args;
 }
@@ -94,6 +102,7 @@ fn applyArgs(config: *Config, args: ArgsOptions) void {
     if (args.data_dir) |value| config.data_dir = value;
     if (args.tls_cert_file) |value| config.tls_cert_file = value;
     if (args.tls_key_file) |value| config.tls_key_file = value;
+    if (args.max_connections) |value| config.max_connections = value;
 }
 
 fn applyEnv(config: *Config, process: std.process.Init, arena: std.mem.Allocator) !void {
@@ -104,6 +113,7 @@ fn applyEnv(config: *Config, process: std.process.Init, arena: std.mem.Allocator
     if (try getEnvValue(process, "RAVEN_DATA_DIR")) |value| config.data_dir = try arena.dupe(u8, value);
     if (try getEnvValue(process, "RAVEN_TLS_CERT")) |value| config.tls_cert_file = try arena.dupe(u8, value);
     if (try getEnvValue(process, "RAVEN_TLS_KEY")) |value| config.tls_key_file = try arena.dupe(u8, value);
+    if (try getEnvValue(process, "RAVEN_MAX_CONNECTIONS")) |value| config.max_connections = try std.fmt.parseInt(u32, value, 10);
 }
 
 fn getEnvValue(process: std.process.Init, key: []const u8) !?[]const u8 {
@@ -161,6 +171,10 @@ fn applyKeyValue(config: *Config, allocator: std.mem.Allocator, key: []const u8,
     }
     if (std.mem.eql(u8, key, "tls_key_file")) {
         config.tls_key_file = try allocator.dupe(u8, value);
+        return;
+    }
+    if (std.mem.eql(u8, key, "max_connections")) {
+        config.max_connections = try std.fmt.parseInt(u32, value, 10);
         return;
     }
 }
