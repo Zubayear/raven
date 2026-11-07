@@ -5,7 +5,6 @@ const AccountStore = @import("account_index.zig").AccountStore;
 const Config = @import("config.zig").Config;
 const AliasTable = @import("alias_index.zig").AliasTable;
 const Storage = @import("storage.zig").Storage;
-const ImapServer = @import("imap.zig").ImapServer;
 const TenantCatalog = @import("tenant_index.zig").TenantCatalog;
 const TenantIndex = @import("tenant_index.zig");
 const TlsServer = @import("tls.zig").TlsServer;
@@ -23,20 +22,6 @@ pub const Server = struct {
         };
     }
 
-    pub fn run(self: *Server) !void {
-        const io = std.Options.debug_io;
-        try self.storage.ensureLayout(io, self.allocator);
-
-        var tenant_catalog = try TenantCatalog.load(self.allocator, io, self.storage);
-        defer tenant_catalog.deinit(self.allocator);
-
-        var listener = try self.listen(io);
-        defer listener.deinit(io);
-
-        var shutdown = std.atomic.Value(bool).init(false);
-        try self.serve(io, &listener, &tenant_catalog, &shutdown, null);
-    }
-
     pub fn listen(self: *Server, io: Io) !std.Io.net.Server {
         const address = try std.Io.net.IpAddress.parse(self.config.listen_address, self.config.listen_port);
         const listener = try address.listen(io, .{ .reuse_address = true });
@@ -46,51 +31,40 @@ pub const Server = struct {
 
     pub fn serve(
         self: *Server,
-        fs_io: Io,
+        io: Io,
         listener: *std.Io.net.Server,
         tenant_catalog: *const TenantCatalog,
         shutdown: *const std.atomic.Value(bool),
         tls_server: ?*TlsServer,
     ) !void {
-        while (!shutdown.load(.seq_cst)) {
-            var stream = listener.accept(fs_io) catch |err| switch (err) {
-                error.SocketNotListening => return,
+        while (!shutdown.load(.acquire)) {
+            const stream = listener.accept(io) catch |err| switch (err) {
+                error.SocketNotListening, error.Canceled => return,
                 else => {
                     std.debug.print("smtp accept error: {}\n", .{err});
                     continue;
                 },
             };
-
-            if (tls_server) |server| {
-                var tls_conn = server.accept(stream.socket.handle) catch |err| {
-                    std.debug.print("smtp tls handshake error: {}\n", .{err});
-                    stream.close(fs_io);
-                    continue;
-                };
-                defer tls_conn.deinit();
-                const net_io = tls_conn.io();
-                defer stream.close(net_io);
-                self.handleClient(fs_io, net_io, stream, tenant_catalog) catch |err| {
-                    std.debug.print("session error: {}\n", .{err});
-                };
-                continue;
-            }
-
-            defer stream.close(fs_io);
-            self.handleClient(fs_io, fs_io, stream, tenant_catalog) catch |err| {
-                std.debug.print("session error: {}\n", .{err});
+            defer stream.close(io);
+            self.serveConnection(io, stream, tenant_catalog, tls_server) catch |err| {
+                std.debug.print("smtp session error: {}\n", .{err});
             };
         }
     }
 
-    fn handleClient(self: *Server, fs_io: Io, net_io: Io, stream: std.Io.net.Stream, tenant_catalog: *const TenantCatalog) !void {
+    fn serveConnection(self: *Server, io: Io, stream: std.Io.net.Stream, tenant_catalog: *const TenantCatalog, tls_server: ?*TlsServer) !void {
         var read_buf: [1024]u8 = undefined;
-        var write_buf: [0]u8 = undefined;
-        var reader = stream.reader(net_io, &read_buf);
-        var writer = stream.writer(net_io, &write_buf);
-        const r = &reader.interface;
-        const w = &writer.interface;
+        if (tls_server) |server| {
+            var conn = try server.accept(stream.socket.handle, &read_buf, &.{});
+            defer conn.deinit();
+            return self.handleClient(io, &conn.reader, &conn.writer, tenant_catalog);
+        }
+        var reader = stream.reader(io, &read_buf);
+        var writer = stream.writer(io, &.{});
+        return self.handleClient(io, &reader.interface, &writer.interface, tenant_catalog);
+    }
 
+    fn handleClient(self: *Server, fs_io: Io, r: *Io.Reader, w: *Io.Writer, tenant_catalog: *const TenantCatalog) !void {
         try w.writeAll("220 ");
         try w.writeAll(self.config.hostname);
         try w.writeAll(" ESMTP raven ready\r\n");
@@ -254,6 +228,7 @@ pub const Server = struct {
                     std.debug.print("delivered to {s}@{s} at {s}\n", .{ recipient.user, recipient.domain, mailbox_path });
                 }
 
+                if (sender) |value| self.allocator.free(value);
                 sender = null;
                 clearRecipients(self.allocator, &recipients);
                 std.debug.print("stored inbound message at {s}\n", .{stored_path});
@@ -363,10 +338,7 @@ fn freeMailIdentity(allocator: std.mem.Allocator, identity: MailIdentity) void {
 }
 
 fn nextLine(reader: *Io.Reader) !?[]const u8 {
-    const line = reader.takeDelimiterExclusive('\n') catch |err| switch (err) {
-        error.EndOfStream => return null,
-        else => return err,
-    };
+    const line = try reader.takeDelimiter('\n') orelse return null;
 
     return trimCr(line);
 }
@@ -640,7 +612,37 @@ fn buildPlainAuthPayload(allocator: std.mem.Allocator, login: []const u8, passwo
     const encoded = try allocator.alloc(u8, encoded_len);
     errdefer allocator.free(encoded);
 
-    const out = std.base64.standard.Encoder.encode(encoded, raw);
+    _ = std.base64.standard.Encoder.encode(encoded, raw);
     allocator.free(raw);
-    return out;
+    return encoded;
+}
+
+test "smtp session delivers a pipelined transaction" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
+    defer allocator.free(root);
+
+    var catalog = try TenantIndex.parseForTest(allocator, "tenant acme example.com\n");
+    defer catalog.deinit(allocator);
+
+    var server = Server.init(allocator, .{ .data_dir = root });
+    var in: Io.Reader = .fixed("EHLO client\r\nMAIL FROM:<bob@external.test>\r\nRCPT TO:<alice@example.com>\r\n" ++
+        "DATA\r\nSubject: hi\r\n\r\n..dot\r\n.\r\nQUIT\r\n");
+    var out: Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+
+    try server.handleClient(std.testing.io, &in, &out.writer, &catalog);
+
+    try std.testing.expectEqualStrings("220 localhost ESMTP raven ready\r\n" ++
+        "250-localhost\r\n250-AUTH PLAIN\r\n250 PIPELINING\r\n" ++
+        "250 ok\r\n250 ok\r\n354 end with <CR><LF>.<CR><LF>\r\n250 queued\r\n221 bye\r\n", out.written());
+
+    const messages = try server.storage.listMailboxMessages(std.testing.io, allocator, "acme", "example.com", "alice");
+    defer @import("storage.zig").freeMailboxMessages(allocator, messages);
+    try std.testing.expectEqual(@as(usize, 1), messages.len);
+    const body = try server.storage.readMailboxMessage(std.testing.io, allocator, "acme", "example.com", "alice", messages[0].name);
+    defer allocator.free(body);
+    try std.testing.expectEqualStrings("Subject: hi\r\n\r\n.dot\r\n", body);
 }

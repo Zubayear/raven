@@ -2,7 +2,7 @@ const std = @import("std");
 
 pub fn main(process: std.process.Init) !void {
     const io = process.io;
-    const allocator = process.arena.allocator();
+    const allocator = process.gpa;
     const Config = @import("config.zig").Config;
     const ImapServer = @import("imap.zig").ImapServer;
     const Server = @import("server.zig").Server;
@@ -22,41 +22,44 @@ pub fn main(process: std.process.Init) !void {
     var imap = ImapServer.init(allocator, config, smtp.storage, &tenant_catalog);
 
     var tls_server: ?TlsServer = null;
+    defer if (tls_server) |*value| value.deinit();
     if (config.tls_cert_file.len != 0 or config.tls_key_file.len != 0) {
         if (config.tls_cert_file.len == 0 or config.tls_key_file.len == 0) return error.InvalidConfig;
         tls_server = try TlsServer.init(allocator, config.tls_cert_file, config.tls_key_file);
-        defer if (tls_server) |*value| value.deinit();
         std.debug.print("tls enabled with {s} and {s}\n", .{ config.tls_cert_file, config.tls_key_file });
     }
 
     var smtp_listener = try smtp.listen(io);
+    defer smtp_listener.deinit(io);
     var imap_listener = try imap.listen(io);
+    defer imap_listener.deinit(io);
 
-    var shutdown = std.atomic.Value(bool).init(false);
-    var signal_set = std.posix.sigfillset();
+    // Block only SIGINT/SIGTERM for sigwait; std.Io cancelation interrupts
+    // blocked syscalls with SIGIO, so that one must stay deliverable.
+    var signal_set = std.posix.sigemptyset();
+    std.posix.sigaddset(&signal_set, .INT);
+    std.posix.sigaddset(&signal_set, .TERM);
     std.posix.sigprocmask(std.posix.SIG.BLOCK, &signal_set, null);
 
+    var shutdown = std.atomic.Value(bool).init(false);
     const tls_ptr: ?*TlsServer = if (tls_server) |*value| value else null;
-    const signal_thread = try std.Thread.spawn(.{}, waitForShutdown, .{ io, &shutdown, &smtp_listener, &imap_listener, &signal_set });
-    const smtp_thread = try std.Thread.spawn(.{}, Server.serve, .{ &smtp, io, &smtp_listener, &tenant_catalog, &shutdown, tls_ptr });
-    const imap_thread = try std.Thread.spawn(.{}, ImapServer.serve, .{ &imap, io, &imap_listener, &shutdown, tls_ptr });
+    var smtp_task = try io.concurrent(Server.serve, .{ &smtp, io, &smtp_listener, &tenant_catalog, &shutdown, tls_ptr });
+    var imap_task = try io.concurrent(ImapServer.serve, .{ &imap, io, &imap_listener, &shutdown, tls_ptr });
 
-    smtp_thread.join();
-    imap_thread.join();
-    signal_thread.join();
+    var sig: c_int = 0;
+    _ = std.c.sigwait(&signal_set, &sig);
+    std.debug.print("shutdown requested by signal {d}\n", .{sig});
+    shutdown.store(true, .release);
+    smtp_task.cancel(io) catch {};
+    imap_task.cancel(io) catch {};
 }
 
-fn waitForShutdown(
-    io: std.Io,
-    shutdown: *std.atomic.Value(bool),
-    smtp_listener: *std.Io.net.Server,
-    imap_listener: *std.Io.net.Server,
-    signal_set: *std.posix.sigset_t,
-) void {
-    var sig: c_int = 0;
-    _ = std.c.sigwait(signal_set, &sig);
-    shutdown.store(true, .seq_cst);
-    smtp_listener.deinit(io);
-    imap_listener.deinit(io);
-    std.debug.print("shutdown requested by signal {d}\n", .{sig});
+test {
+    _ = @import("account_index.zig");
+    _ = @import("alias_index.zig");
+    _ = @import("config.zig");
+    _ = @import("imap.zig");
+    _ = @import("server.zig");
+    _ = @import("storage.zig");
+    _ = @import("tenant_index.zig");
 }
