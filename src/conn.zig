@@ -25,6 +25,8 @@ pub const Client = struct {
     secure: bool = false,
     /// Null in unit tests, which drive handlers over fixed buffers.
     transport: ?*Transport = null,
+    /// The peer's address, if known.
+    remote: ?net.IpAddress = null,
 
     pub fn canStartTls(self: Client) bool {
         return !self.secure and self.transport != null and self.transport.?.tls_server != null;
@@ -98,6 +100,7 @@ pub fn Listener(comptime Handler: type) type {
                 .reader = &transport.socket.reader,
                 .writer = &transport.socket.writer.interface,
                 .transport = &transport,
+                .remote = stream.socket.address,
             };
 
             if (options.implicit_tls) client.startTls() catch |err| {
