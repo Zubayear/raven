@@ -393,11 +393,8 @@ test "imap session logs in, selects and fetches" {
     const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(root);
 
-    var hash_buf: [64]u8 = undefined;
-    const accounts = try std.fmt.allocPrint(allocator, "alice {s}\n", .{@import("account_index.zig").passwordHashHex("secret", &hash_buf)});
-    defer allocator.free(accounts);
+    try account_index.writeTestAccounts(allocator, tmp.dir, &.{"alice"}, "secret");
     try tmp.dir.createDirPath(std.testing.io, "tenants/acme/domains/example.com/users/alice/Maildir/new");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tenants/acme/domains/example.com/accounts.txt", .data = accounts });
     try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tenants/acme/domains/example.com/users/alice/Maildir/new/1.eml", .data = "Subject: hi\r\n\r\nhello\r\n" });
 
     var catalog = try @import("tenant_index.zig").parseForTest(allocator, "tenant acme example.com\n");

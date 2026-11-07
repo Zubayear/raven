@@ -461,11 +461,7 @@ const TestDir = struct {
     fn init(allocator: std.mem.Allocator) !TestDir {
         var tmp = std.testing.tmpDir(.{});
         errdefer tmp.cleanup();
-        var hash_buf: [64]u8 = undefined;
-        const accounts = try std.fmt.allocPrint(allocator, "alice {s}\n", .{account_index.passwordHashHex("secret", &hash_buf)});
-        defer allocator.free(accounts);
-        try tmp.dir.createDirPath(std.testing.io, "tenants/acme/domains/example.com");
-        try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tenants/acme/domains/example.com/accounts.txt", .data = accounts });
+        try account_index.writeTestAccounts(allocator, tmp.dir, &.{"alice"}, "secret");
         try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tenants/acme/domains/example.com/aliases.txt", .data = "sales alice\n" });
         const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
         errdefer allocator.free(root);
@@ -627,16 +623,16 @@ test "smtp session caps recipients per transaction" {
     var dir = try TestDir.init(allocator);
     defer dir.deinit(allocator);
 
-    var accounts: std.Io.Writer.Allocating = .init(allocator);
-    defer accounts.deinit();
+    var users: [max_recipients + 1][]const u8 = undefined;
+    var names: [max_recipients + 1][8]u8 = undefined;
     var input: std.Io.Writer.Allocating = .init(allocator);
     defer input.deinit();
     try input.writer.writeAll("EHLO client\r\nMAIL FROM:<bob@external.test>\r\n");
-    for (0..max_recipients + 1) |i| {
-        try accounts.writer.print("u{d} {s}\n", .{ i, @as([64]u8, @splat('0')) });
-        try input.writer.print("RCPT TO:<u{d}@example.com>\r\n", .{i});
+    for (&users, &names, 0..) |*user, *name, i| {
+        user.* = try std.fmt.bufPrint(name, "u{d}", .{i});
+        try input.writer.print("RCPT TO:<{s}@example.com>\r\n", .{user.*});
     }
-    try dir.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tenants/acme/domains/example.com/accounts.txt", .data = accounts.written() });
+    try account_index.writeTestAccounts(allocator, dir.tmp.dir, &users, "secret");
 
     const transcript = try dir.session(allocator, input.written());
     defer allocator.free(transcript);

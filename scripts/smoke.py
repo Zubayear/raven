@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """End-to-end smoke test against a real raven binary. Run with `zig build smoke`."""
 import base64
-import hashlib
 import imaplib
 import mailbox
 import os
@@ -69,11 +68,19 @@ class Imap:
                 return out
 
 
+PASSWORD_HASH = None
+
+
 def setup_accounts(root):
+    global PASSWORD_HASH
+    if PASSWORD_HASH is None:  # argon2id is deliberately slow: hash once
+        PASSWORD_HASH = subprocess.run([BIN, "passwd"], input=b"secret\n", capture_output=True,
+                                       check=True).stdout.decode().strip()
+        assert PASSWORD_HASH.startswith("$argon2id$"), PASSWORD_HASH
     domain = root / "tenants/acme/domains/example.com"
     domain.mkdir(parents=True)
     (root / "tenants/index.txt").write_text("tenant acme example.com\n")
-    (domain / "accounts.txt").write_text(f"alice {hashlib.sha256(b'secret').hexdigest()}\n")
+    (domain / "accounts.txt").write_text(f"alice {PASSWORD_HASH}\n")
 
 
 def check_delivery(smtp, imap_sock, expected=1, sender="bob@external.test"):

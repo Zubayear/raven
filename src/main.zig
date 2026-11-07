@@ -1,4 +1,6 @@
 const std = @import("std");
+const Io = std.Io;
+const account_index = @import("account_index.zig");
 const Config = @import("config.zig").Config;
 const conn = @import("conn.zig");
 const ImapServer = @import("imap.zig").ImapServer;
@@ -10,6 +12,13 @@ const TlsServer = @import("tls.zig").TlsServer;
 pub fn main(process: std.process.Init) !void {
     const io = process.io;
     const allocator = process.gpa;
+
+    var args = try std.process.Args.Iterator.initAllocator(process.minimal.args, allocator);
+    defer args.deinit();
+    _ = args.next();
+    if (args.next()) |command| {
+        if (std.mem.eql(u8, command, "passwd")) return passwd(io, allocator);
+    }
 
     const config = try Config.load(process);
     std.debug.print("starting raven {s} on {s}:{d} / imap {d} data={s}\n", .{ config.hostname, config.listen_address, config.listen_port, config.imap_port, config.data_dir });
@@ -74,6 +83,40 @@ pub fn main(process: std.process.Init) !void {
     smtp_task.cancel(io);
     if (smtps_task) |*task| task.cancel(io);
     imap_task.cancel(io);
+}
+
+/// `raven passwd`: reads a password from stdin and prints its argon2id hash,
+/// ready for accounts.txt: `echo "alice $(raven passwd)" >> accounts.txt`.
+fn passwd(io: Io, allocator: std.mem.Allocator) !void {
+    const stdin = Io.File.stdin();
+    // Don't echo the password when a person types it at a terminal.
+    const original = if (stdin.isTty(io) catch false) std.posix.tcgetattr(stdin.handle) catch null else null;
+    if (original) |termios| {
+        var quiet = termios;
+        quiet.lflag.ECHO = false;
+        try std.posix.tcsetattr(stdin.handle, .FLUSH, quiet);
+        std.debug.print("Password: ", .{});
+    }
+    defer if (original) |termios| {
+        std.posix.tcsetattr(stdin.handle, .FLUSH, termios) catch {};
+        std.debug.print("\n", .{});
+    };
+
+    var buf: [1024]u8 = undefined;
+    defer std.crypto.secureZero(u8, &buf);
+    var reader = stdin.readerStreaming(io, &buf);
+    const password = std.mem.trimEnd(u8, try reader.interface.takeDelimiter('\n') orelse "", "\r");
+    if (password.len == 0) {
+        std.debug.print("raven passwd: empty password\n", .{});
+        return error.EmptyPassword;
+    }
+
+    const hash = try account_index.hashPassword(allocator, io, password);
+    defer allocator.free(hash);
+    var out_buf: [256]u8 = undefined;
+    var stdout = Io.File.stdout().writerStreaming(io, &out_buf);
+    try stdout.interface.print("{s}\n", .{hash});
+    try stdout.interface.flush();
 }
 
 test {

@@ -1,9 +1,20 @@
+//! `accounts.txt`: one account per line, `<user> <argon2id PHC string>`.
+//! Create lines with `raven passwd`.
 const std = @import("std");
 const Io = std.Io;
+const argon2 = std.crypto.pwhash.argon2;
 
 const Storage = @import("storage.zig").Storage;
 const TenantCatalog = @import("tenant_index.zig").TenantCatalog;
 const address = @import("address.zig");
+
+/// OWASP's recommendation for argon2id (19 MiB, 2 passes). Each login holds
+/// that much memory while it verifies.
+const hash_params = argon2.Params.owasp_2id;
+
+/// Verified when the user does not exist, so a failed login takes as long
+/// either way and response times don't reveal which accounts exist.
+const dummy_hash = "$argon2id$v=19$m=19456,t=2,p=1$cmF2ZW5kdW1teXNhbHQ$Hh8Xnzvbbj6HTZ8nHArp0n2LBnz5/YF6jXTkpdyXl2U";
 
 /// A mailbox owner. All names come from the index files, never from client
 /// input, so they are safe to use in paths.
@@ -34,9 +45,23 @@ pub fn authenticate(allocator: std.mem.Allocator, io: Io, storage: Storage, cata
     const hosted = catalog.find(addr.domain) orelse return error.AuthFailed;
     var accounts = try AccountStore.load(allocator, io, storage, hosted.tenant, hosted.domain);
     defer accounts.deinit(allocator);
-    const account = accounts.find(addr.user) orelse return error.AuthFailed;
-    if (!account.verify(password)) return error.AuthFailed;
+    const account = accounts.find(addr.user) orelse {
+        _ = verifyPassword(allocator, io, dummy_hash, password);
+        return error.AuthFailed;
+    };
+    if (!verifyPassword(allocator, io, account.password_hash, password)) return error.AuthFailed;
     return Identity.init(allocator, hosted.tenant, hosted.domain, account.user);
+}
+
+/// Returns an argon2id PHC string for `password`; the caller owns it.
+pub fn hashPassword(allocator: std.mem.Allocator, io: Io, password: []const u8) ![]u8 {
+    var buf: [128]u8 = undefined;
+    return allocator.dupe(u8, try argon2.strHash(password, .{ .allocator = allocator, .params = hash_params }, &buf, io));
+}
+
+fn verifyPassword(allocator: std.mem.Allocator, io: Io, phc: []const u8, password: []const u8) bool {
+    argon2.strVerify(phc, password, .{ .allocator = allocator }, io) catch return false;
+    return true;
 }
 
 pub const AccountStore = struct {
@@ -45,34 +70,23 @@ pub const AccountStore = struct {
     pub const Entry = struct {
         user: []u8,
         password_hash: []u8,
-
-        pub fn verify(self: Entry, password: []const u8) bool {
-            var hash_buf: [64]u8 = undefined;
-            return std.ascii.eqlIgnoreCase(self.password_hash, passwordHashHex(password, &hash_buf));
-        }
     };
 
     pub fn load(allocator: std.mem.Allocator, io: Io, storage: Storage, tenant: []const u8, domain: []const u8) !AccountStore {
         const path = try storage.accountIndexPath(allocator, tenant, domain);
         defer allocator.free(path);
 
-        const raw = storageReadAccounts(io, allocator, path) catch |err| switch (err) {
+        const raw = Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(256 * 1024)) catch |err| switch (err) {
             error.FileNotFound => return .{},
             else => return err,
         };
         defer allocator.free(raw);
-
-        return try parse(allocator, raw);
+        return parse(allocator, raw);
     }
 
     pub fn deinit(self: *AccountStore, allocator: std.mem.Allocator) void {
-        if (self.entries.len > 0) freeEntries(allocator, self.entries);
+        freeEntries(allocator, self.entries);
         self.* = .{};
-    }
-
-    pub fn verify(self: *const AccountStore, user: []const u8, password: []const u8) bool {
-        const entry = self.find(user) orelse return false;
-        return entry.verify(password);
     }
 
     /// Local parts are matched case-insensitively.
@@ -84,118 +98,93 @@ pub const AccountStore = struct {
     }
 };
 
-fn storageReadAccounts(io: Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    return Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(32 * 1024));
-}
-
 fn parse(allocator: std.mem.Allocator, raw: []const u8) !AccountStore {
     var entries = std.ArrayList(AccountStore.Entry).empty;
-    errdefer freeEntries(allocator, entries.items);
+    errdefer {
+        for (entries.items) |entry| freeEntry(allocator, entry);
+        entries.deinit(allocator);
+    }
 
     var lines = std.mem.tokenizeScalar(u8, raw, '\n');
     while (lines.next()) |line| {
         const trimmed = std.mem.trim(u8, line, " \t\r");
         if (trimmed.len == 0 or trimmed[0] == '#') continue;
 
-        var tokens = std.mem.tokenizeAny(u8, trimmed, " \t=");
+        var tokens = std.mem.tokenizeAny(u8, trimmed, " \t");
         const user = tokens.next() orelse return error.InvalidAccountIndex;
         const password_hash = tokens.next() orelse return error.InvalidAccountIndex;
-        if (password_hash.len != 64) return error.InvalidAccountIndex;
+        // Only argon2id; the old unsalted SHA-256 hex hashes are refused.
+        if (tokens.next() != null or !std.mem.startsWith(u8, password_hash, "$argon2id$")) return error.InvalidAccountIndex;
 
-        try entries.append(allocator, .{
-            .user = try allocator.dupe(u8, user),
-            .password_hash = try allocator.dupe(u8, password_hash),
-        });
+        const owned_user = try allocator.dupe(u8, user);
+        errdefer allocator.free(owned_user);
+        const owned_hash = try allocator.dupe(u8, password_hash);
+        errdefer allocator.free(owned_hash);
+        try entries.append(allocator, .{ .user = owned_user, .password_hash = owned_hash });
     }
-
     return .{ .entries = try entries.toOwnedSlice(allocator) };
 }
 
-pub fn parseForTest(allocator: std.mem.Allocator, raw: []const u8) !AccountStore {
-    return parse(allocator, raw);
-}
-
-pub fn passwordHashHex(password: []const u8, out_buf: *[64]u8) []const u8 {
-    var digest: [32]u8 = undefined;
-    std.crypto.hash.sha2.Sha256.hash(password, &digest, .{});
-    const encoded = std.fmt.bytesToHex(digest, .lower);
-    out_buf.* = encoded;
-    return out_buf[0..];
-}
-
 fn freeEntries(allocator: std.mem.Allocator, entries: []AccountStore.Entry) void {
-    for (entries) |entry| {
-        allocator.free(entry.user);
-        allocator.free(entry.password_hash);
-    }
+    if (entries.len == 0) return;
+    for (entries) |entry| freeEntry(allocator, entry);
     allocator.free(entries);
 }
 
-test "account store parses entries" {
+fn freeEntry(allocator: std.mem.Allocator, entry: AccountStore.Entry) void {
+    allocator.free(entry.user);
+    allocator.free(entry.password_hash);
+}
+
+/// A cheap (but real) argon2id hash for tests; production uses `hashPassword`.
+pub fn hashForTest(allocator: std.mem.Allocator, password: []const u8) ![]u8 {
+    var buf: [128]u8 = undefined;
+    return allocator.dupe(u8, try argon2.strHash(password, .{ .allocator = allocator, .params = .{ .t = 1, .m = 8, .p = 1 } }, &buf, std.testing.io));
+}
+
+/// Writes `accounts.txt` for tenant acme / example.com under `dir`.
+pub fn writeTestAccounts(allocator: std.mem.Allocator, dir: Io.Dir, users: []const []const u8, password: []const u8) !void {
+    const hash = try hashForTest(allocator, password);
+    defer allocator.free(hash);
+    var text: Io.Writer.Allocating = .init(allocator);
+    defer text.deinit();
+    for (users) |user| try text.writer.print("{s} {s}\n", .{ user, hash });
+    try dir.createDirPath(std.testing.io, "tenants/acme/domains/example.com");
+    try dir.writeFile(std.testing.io, .{ .sub_path = "tenants/acme/domains/example.com/accounts.txt", .data = text.written() });
+}
+
+test "hashPassword produces argon2id that verifies" {
     const allocator = std.testing.allocator;
-    var hash_buf: [64]u8 = undefined;
-    const hash = passwordHashHex("secret", &hash_buf);
-    const raw = try std.fmt.allocPrint(allocator, "alice {s}\n# comment\nbob {s}\n", .{ hash, hash });
-    defer allocator.free(raw);
+    const hash = try hashPassword(allocator, std.testing.io, "correct horse");
+    defer allocator.free(hash);
+    try std.testing.expect(std.mem.startsWith(u8, hash, "$argon2id$v=19$m=19456,t=2,p=1$"));
+    try std.testing.expect(verifyPassword(allocator, std.testing.io, hash, "correct horse"));
+    try std.testing.expect(!verifyPassword(allocator, std.testing.io, hash, "wrong horse"));
+}
 
-    var store = try parse(allocator, raw);
+test "dummy hash runs a full verification" {
+    // A parse error would make unknown users fail faster than known ones.
+    try std.testing.expectError(error.PasswordVerificationFailed, argon2.strVerify(dummy_hash, "anything", .{ .allocator = std.testing.allocator }, std.testing.io));
+}
+
+test "account store parses entries and refuses legacy hashes" {
+    const allocator = std.testing.allocator;
+    var store = try parse(allocator, "# comment\nalice $argon2id$v=19$m=8,t=1,p=1$c2FsdHNhbHQ$aGFzaA\nBob $argon2id$x\n");
     defer store.deinit(allocator);
-
     try std.testing.expectEqualStrings("alice", store.entries[0].user);
-    try std.testing.expectEqualStrings(hash, store.entries[0].password_hash);
-    try std.testing.expectEqualStrings("bob", store.entries[1].user);
-}
+    try std.testing.expectEqualStrings("Bob", store.find("bob").?.user);
+    try std.testing.expect(store.find("carol") == null);
 
-test "account store verifies password" {
-    const allocator = std.testing.allocator;
-    var hash_buf: [64]u8 = undefined;
-    const hash = passwordHashHex("secret", &hash_buf);
-    const raw = try std.fmt.allocPrint(allocator, "alice {s}\n", .{hash});
-    defer allocator.free(raw);
-
-    var store = try parse(allocator, raw);
-    defer store.deinit(allocator);
-
-    try std.testing.expect(store.verify("alice", "secret"));
-    try std.testing.expect(!store.verify("alice", "wrong"));
-    try std.testing.expect(!store.verify("bob", "secret"));
-}
-
-test "account store loads from filesystem" {
-    const allocator = std.testing.allocator;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    var hash_buf: [64]u8 = undefined;
-    const hash = passwordHashHex("secret", &hash_buf);
-    const accounts = try std.fmt.allocPrint(allocator, "alice {s}\n", .{hash});
-    defer allocator.free(accounts);
-
-    try tmp.dir.createDirPath(std.testing.io, "tenants/acme/domains/example.com");
-    try tmp.dir.writeFile(std.testing.io, .{
-        .sub_path = "tenants/acme/domains/example.com/accounts.txt",
-        .data = accounts,
-    });
-
-    const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
-    defer allocator.free(root);
-
-    var store = try AccountStore.load(allocator, std.testing.io, Storage.init(root), "acme", "example.com");
-    defer store.deinit(allocator);
-
-    try std.testing.expect(store.verify("alice", "secret"));
+    try std.testing.expectError(error.InvalidAccountIndex, parse(allocator, "alice 2bb80d537b1da3e38bd30361aa855686bde0eacd7162fef6a25fe97bf527a25b\n"));
+    try std.testing.expectError(error.InvalidAccountIndex, parse(allocator, "alice\n"));
+    try std.testing.expectError(error.InvalidAccountIndex, parse(allocator, "alice $argon2id$a extra\n"));
 }
 
 test "authenticate checks domain, user and password" {
     const allocator = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-
-    var hash_buf: [64]u8 = undefined;
-    const accounts = try std.fmt.allocPrint(allocator, "alice {s}\n", .{passwordHashHex("secret", &hash_buf)});
-    defer allocator.free(accounts);
-    try tmp.dir.createDirPath(std.testing.io, "tenants/acme/domains/example.com");
-    try tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tenants/acme/domains/example.com/accounts.txt", .data = accounts });
+    try writeTestAccounts(allocator, tmp.dir, &.{"alice"}, "secret");
     const root = try std.fs.path.join(allocator, &.{ ".zig-cache", "tmp", tmp.sub_path[0..] });
     defer allocator.free(root);
 

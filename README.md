@@ -13,7 +13,7 @@ It currently provides SMTP, IMAP, filesystem-backed storage, tenant-aware routin
 - IMAP listener with mailbox access
 - Maildir storage: atomic delivery, flags in file names, safe across restarts
 - Multi-tenant routing: only hosted domains and known users are accepted (no open relay), with aliases and `user+tag` plus-addressing
-- Account authentication from local storage
+- Accounts with argon2id password hashes (`raven passwd`)
 - TLS via OpenSSL: SMTP `STARTTLS` and implicit-TLS SMTPS; authentication only over TLS
 - Concurrent sessions with idle timeouts (SMTP 5 min, IMAP 30 min) and a connection cap
 - Graceful shutdown on signal
@@ -139,11 +139,29 @@ max_connections = 100
 max_message_size = 26214400
 ```
 
+## Accounts
+
+Host a domain by adding its tenant to `data/tenants/index.txt` (read at startup):
+
+```text
+tenant acme example.com
+```
+
+Create an account; `raven passwd` reads the password from stdin (without echo on a terminal) and prints an argon2id hash:
+
+```bash
+mkdir -p data/tenants/acme/domains/example.com
+echo "alice $(zig-out/bin/raven passwd)" >> data/tenants/acme/domains/example.com/accounts.txt
+echo "sales alice" >> data/tenants/acme/domains/example.com/aliases.txt   # optional alias
+```
+
+Accounts and aliases are read on every login and delivery, so no restart is needed. Only argon2id hashes are accepted.
+
 ## Data layout
 
 ```text
 data/tenants/index.txt                                  tenant <name> <domain>...
-data/tenants/<tenant>/domains/<domain>/accounts.txt     <user> <password hash>
+data/tenants/<tenant>/domains/<domain>/accounts.txt     <user> <argon2id hash>
 data/tenants/<tenant>/domains/<domain>/aliases.txt      <alias> <user>
 data/tenants/<tenant>/domains/<domain>/users/<user>/Maildir/{tmp,new,cur}
 ```
