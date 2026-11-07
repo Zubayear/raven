@@ -76,7 +76,7 @@ pub const ImapServer = struct {
                 try w.writeAll("* BAD missing tag\r\n");
                 continue;
             };
-            const ctx: Context = .{ .server = self, .io = fs_io, .session = &session, .w = w, .tag = tag };
+            const ctx: Context = .{ .server = self, .io = fs_io, .session = &session, .client = client, .w = w, .tag = tag };
             ctx.execute(&p) catch |err| switch (err) {
                 error.Syntax => try ctx.bad("syntax error"),
                 else => return err,
@@ -85,17 +85,18 @@ pub const ImapServer = struct {
     }
 };
 
-const capabilities = "IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE";
+const capabilities = "IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE IDLE";
 
 const State = enum { not_authenticated, authenticated, selected, logout };
 
-const Command = enum { capability, noop, logout, login, select, examine, list, lsub, create, delete, rename, subscribe, unsubscribe, status, append, fetch, store, expunge, uid, check, close, unselect, copy, move, search };
+const Command = enum { capability, noop, logout, login, select, examine, list, lsub, create, delete, rename, subscribe, unsubscribe, status, append, fetch, store, expunge, uid, check, close, unselect, copy, move, search, idle };
 
 /// One command being executed.
 const Context = struct {
     server: *ImapServer,
     io: Io,
     session: *Session,
+    client: *conn.Client,
     w: *Io.Writer,
     tag: []const u8,
 
@@ -109,6 +110,7 @@ const Context = struct {
         const state = ctx.session.state;
         const allowed = switch (cmd) {
             .capability, .noop, .logout => true,
+            .idle => state == .authenticated or state == .selected,
             .login => state == .not_authenticated,
             .select, .examine, .list, .lsub, .create, .delete, .rename, .subscribe, .unsubscribe, .status, .append => state == .authenticated or state == .selected,
             .fetch, .store, .expunge, .uid, .check, .close, .unselect, .copy, .move, .search => state == .selected,
@@ -123,8 +125,10 @@ const Context = struct {
             },
             .noop => {
                 try p.end();
+                try ctx.syncMailbox();
                 try ctx.ok("NOOP completed");
             },
+            .idle => try ctx.idle(p),
             .logout => {
                 try p.end();
                 try ctx.w.writeAll("* BYE raven logging out\r\n");
@@ -152,7 +156,8 @@ const Context = struct {
             },
             .check => {
                 try p.end();
-                try ctx.ok("CHECK completed"); // every change is already on disk
+                try ctx.syncMailbox(); // every change is already on disk
+                try ctx.ok("CHECK completed");
             },
             .close, .unselect => {
                 try p.end();
@@ -201,7 +206,7 @@ const Context = struct {
         const session = ctx.session;
         session.closeMailbox(ctx.server.allocator);
         const path = try ctx.mailboxPath(mailbox) orelse return ctx.no("[NONEXISTENT] no such mailbox");
-        defer ctx.server.allocator.free(path);
+        session.selected_path = path;
         const opened = try Storage.openMailbox(ctx.io, ctx.server.allocator, path);
         session.messages = .fromOwnedSlice(opened.messages);
         session.uid_validity = opened.uid_validity;
@@ -614,6 +619,57 @@ const Context = struct {
         try ctx.ok("SEARCH completed");
     }
 
+    /// Re-reads the selected mailbox and reports what other sessions and
+    /// deliveries changed (RFC 3501 §7: EXPUNGE, FETCH flags, EXISTS).
+    fn syncMailbox(ctx: Context) !void {
+        const session = ctx.session;
+        if (session.state != .selected) return;
+        const allocator = ctx.server.allocator;
+        const opened = try Storage.openMailbox(ctx.io, allocator, session.selected_path.?);
+        // This session claimed its \Recent messages earlier; they stay recent for it.
+        for (opened.messages) |*message| {
+            if (findUid(session.messages.items, message.uid)) |old| message.recent = message.recent or old.recent;
+        }
+        try writeChanges(ctx.w, session.messages.items, opened.messages);
+        for (session.messages.items) |message| allocator.free(message.path);
+        session.messages.deinit(allocator);
+        session.messages = .fromOwnedSlice(opened.messages);
+        session.uid_next = opened.uid_next;
+    }
+
+    /// IDLE (RFC 2177): report mailbox changes as they happen until DONE.
+    fn idle(ctx: Context, p: *proto.Parser) !void {
+        try p.end();
+        try ctx.w.writeAll("+ idling\r\n");
+        try ctx.w.flush();
+
+        // Poll for changes every couple of seconds; clients re-issue IDLE
+        // within 29 minutes, so 30 without one means they are gone.
+        const saved = ctx.client.readTimeout();
+        ctx.client.setReadTimeout(.fromSeconds(2));
+        defer if (saved) |timeout| ctx.client.setReadTimeout(timeout);
+        const deadline = Io.Clock.awake.now(ctx.io).addDuration(.fromSeconds(30 * 60));
+
+        while (true) {
+            const line = ctx.client.reader.takeDelimiter('\n') catch |err| {
+                if (err != error.ReadFailed or !ctx.client.takeTimedOut()) return err;
+                if (Io.Clock.awake.now(ctx.io).nanoseconds > deadline.nanoseconds) {
+                    try ctx.w.writeAll("* BYE idle for too long\r\n");
+                    ctx.session.state = .logout;
+                    return;
+                }
+                try ctx.syncMailbox();
+                try ctx.w.flush();
+                continue;
+            } orelse {
+                ctx.session.state = .logout;
+                return;
+            };
+            if (!std.ascii.eqlIgnoreCase(std.mem.trimEnd(u8, line, "\r"), "DONE")) return ctx.bad("expected DONE");
+            return ctx.ok("IDLE terminated");
+        }
+    }
+
     fn ok(ctx: Context, text: []const u8) !void {
         try ctx.w.print("{s} OK {s}\r\n", .{ ctx.tag, text });
     }
@@ -784,6 +840,37 @@ fn filterFields(arena: std.mem.Allocator, header: []const u8, names: []const []c
     }
     try out.appendSlice(arena, "\r\n");
     return out.items;
+}
+
+/// Untagged responses turning the client's view `old` into `new` (both in
+/// UID order): expunges first, highest number first so every number is
+/// current when sent; then flag changes; then new mail.
+fn writeChanges(w: *Io.Writer, old: []const Message, new: []const Message) !void {
+    var seq = old.len;
+    while (seq > 0) : (seq -= 1) {
+        if (findUid(new, old[seq - 1].uid) == null) try w.print("* {d} EXPUNGE\r\n", .{seq});
+    }
+    var survivors: usize = 0;
+    var recent: usize = 0;
+    for (new, 1..) |*message, number| {
+        recent += @intFromBool(message.recent);
+        const before = findUid(old, message.uid) orelse continue;
+        survivors += 1;
+        if (std.meta.eql(before.flags, message.flags) and before.recent == message.recent) continue;
+        try w.print("* {d} FETCH (", .{number});
+        try writeFlags(w, message);
+        try w.writeAll(")\r\n");
+    }
+    if (new.len > survivors) try w.print("* {d} EXISTS\r\n* {d} RECENT\r\n", .{ new.len, recent });
+}
+
+fn findUid(messages: []const Message, uid: u32) ?*const Message {
+    const index = std.sort.binarySearch(Message, messages, uid, struct {
+        fn order(target: u32, message: Message) std.math.Order {
+            return std.math.order(target, message.uid);
+        }
+    }.order) orelse return null;
+    return &messages[index];
 }
 
 /// `FLAGS (...)` including the session-only \\Recent.
@@ -1017,6 +1104,8 @@ const Session = struct {
     messages: std.ArrayList(Message) = .empty,
     /// The user's INBOX Maildir, set at login.
     maildir: ?[]u8 = null,
+    /// Maildir of the selected mailbox.
+    selected_path: ?[]u8 = null,
     uid_validity: u32 = 0,
     uid_next: u32 = 0,
     read_only: bool = false,
@@ -1034,6 +1123,8 @@ const Session = struct {
         for (self.messages.items) |message| allocator.free(message.path);
         self.messages.deinit(allocator);
         self.messages = .empty;
+        if (self.selected_path) |path| allocator.free(path);
+        self.selected_path = null;
         if (self.state == .selected) self.state = .authenticated;
     }
 
@@ -1211,10 +1302,10 @@ test "imap session: states, quoting and literals" {
         "a8 SELECT Nope\r\n" ++
         "a9 LOGOUT\r\n");
     defer allocator.free(transcript);
-    try std.testing.expectEqualStrings("* OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE] raven ready\r\n" ++
+    try std.testing.expectEqualStrings("* OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE IDLE] raven ready\r\n" ++
         "a0 BAD log in first\r\n" ++
         "a1 NO [AUTHENTICATIONFAILED] authentication failed\r\n" ++
-        "a2 OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE] LOGIN completed\r\n" ++
+        "a2 OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE IDLE] LOGIN completed\r\n" ++
         "a3 BAD command not valid in this state\r\n" ++
         "a4 BAD unknown command\r\n" ++
         "a5 BAD syntax error\r\n" ++
@@ -1241,8 +1332,8 @@ test "imap session: select, fetch, store and expunge" {
         "b2 UID BOGUS 1\r\n");
     defer allocator.free(transcript);
     const select = "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n";
-    try std.testing.expectEqualStrings("* OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE] raven ready\r\n" ++
-        "a1 OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE] LOGIN completed\r\n" ++
+    try std.testing.expectEqualStrings("* OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE IDLE] raven ready\r\n" ++
+        "a1 OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE IDLE] LOGIN completed\r\n" ++
         select ++ "* OK [PERMANENTFLAGS ()] read-only\r\n* 2 EXISTS\r\n* 2 RECENT\r\n* OK [UIDVALIDITY 1234567890] UIDs valid\r\n* OK [UIDNEXT 3] predicted next UID\r\na2 OK [READ-ONLY] EXAMINE completed\r\n" ++
         "a3 NO [READ-ONLY] mailbox is read-only\r\n" ++
         select ++ "* OK [PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)] limited\r\n* 2 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 1234567890] UIDs valid\r\n* OK [UIDNEXT 3] predicted next UID\r\na4 OK [READ-WRITE] SELECT completed\r\n" ++
@@ -1360,7 +1451,7 @@ test "imap session: folders, append, copy, move, status" {
     const end = std.mem.indexOf(u8, transcript, "a1 OK").?;
     const rest = transcript[end..];
     const after_select = std.mem.indexOf(u8, rest, "a7 OK").?;
-    try std.testing.expectEqualStrings("a1 OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE] LOGIN completed\r\n" ++
+    try std.testing.expectEqualStrings("a1 OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE IDLE] LOGIN completed\r\n" ++
         "a2 OK CREATE completed\r\n" ++
         "a3 NO [ALREADYEXISTS] mailbox exists\r\n" ++
         "a4 NO [CANNOT] invalid mailbox name\r\n" ++
@@ -1435,4 +1526,36 @@ test "imap session: search" {
         "* SEARCH 4\r\ns20 OK SEARCH completed\r\n" ++
         "s21 NO [BADCHARSET (US-ASCII UTF-8)] unsupported charset\r\n" ++
         "s22 BAD syntax error\r\n", transcript[start..]);
+}
+
+test "writeChanges reports expunges, flag changes and new mail" {
+    var paths: [5][1]u8 = .{ "a".*, "b".*, "c".*, "d".*, "e".* };
+    const old = [_]Message{
+        .{ .path = &paths[0], .size = 1, .flags = .{}, .uid = 1 },
+        .{ .path = &paths[1], .size = 1, .flags = .{}, .uid = 2 },
+        .{ .path = &paths[2], .size = 1, .flags = .{}, .uid = 3 },
+        .{ .path = &paths[3], .size = 1, .flags = .{}, .uid = 4 },
+    };
+    const new = [_]Message{
+        .{ .path = &paths[0], .size = 1, .flags = .{ .seen = true }, .uid = 1 },
+        .{ .path = &paths[2], .size = 1, .flags = .{}, .uid = 3 },
+        .{ .path = &paths[4], .size = 1, .flags = .{}, .uid = 5, .recent = true },
+    };
+    var out: Io.Writer.Allocating = .init(std.testing.allocator);
+    defer out.deinit();
+    try writeChanges(&out.writer, &old, &new);
+    try std.testing.expectEqualStrings("* 4 EXPUNGE\r\n* 2 EXPUNGE\r\n* 1 FETCH (FLAGS (\\Seen))\r\n* 3 EXISTS\r\n* 1 RECENT\r\n", out.written());
+
+    out.clearRetainingCapacity();
+    try writeChanges(&out.writer, &new, &new);
+    try std.testing.expectEqualStrings("", out.written());
+}
+
+test "imap session: idle until done" {
+    const allocator = std.testing.allocator;
+    const transcript = try testSession(allocator, "a1 LOGIN alice@example.com \"pass word\"\r\na2 SELECT INBOX\r\n" ++
+        "a3 IDLE\r\nDONE\r\na4 IDLE\r\nnope\r\na5 NOOP\r\n");
+    defer allocator.free(transcript);
+    try std.testing.expectStringEndsWith(transcript, "a2 OK [READ-WRITE] SELECT completed\r\n" ++
+        "+ idling\r\na3 OK IDLE terminated\r\n+ idling\r\na4 BAD expected DONE\r\na5 OK NOOP completed\r\n");
 }

@@ -28,6 +28,24 @@ pub const Client = struct {
     /// The peer's address, if known.
     remote: ?net.IpAddress = null,
 
+    /// Changes how long reads wait for the peer (IMAP IDLE polls).
+    pub fn setReadTimeout(self: *Client, timeout: Io.Duration) void {
+        if (self.transport) |t| t.socket.idle_timeout = timeout;
+    }
+
+    pub fn readTimeout(self: *const Client) ?Io.Duration {
+        return if (self.transport) |t| t.socket.idle_timeout else null;
+    }
+
+    /// Whether the last failed read was a timeout; clears the record. The
+    /// reader is still usable afterwards.
+    pub fn takeTimedOut(self: *Client) bool {
+        const t = self.transport orelse return false;
+        defer t.socket.err = null;
+        const err = t.socket.err orelse return false;
+        return err == error.Timeout;
+    }
+
     pub fn canStartTls(self: Client) bool {
         return !self.secure and self.transport != null and self.transport.?.tls_server != null;
     }

@@ -121,6 +121,24 @@ def main():
             assert b"\\Sent" in b"".join(imap.list()[1])
             imap.logout()
 
+        data = tmp / "idle"
+        setup_accounts(data)
+        with Raven(data):  # #18: a delivery shows up while the client IDLEs
+            imap = imap_plain()
+            imap.login("alice@example.com", PASSWORD)
+            imap.select("INBOX")
+            tag = imap._new_tag()
+            imap.send(tag + b" IDLE\r\n")
+            assert imap.readline().startswith(b"+"), "IDLE not accepted"
+            started = time.monotonic()
+            smtplib.SMTP(HOST, SMTP_PORT, timeout=5).sendmail("bob@external.test", ["alice@example.com"], "Subject: ping\r\n\r\n")
+            assert imap.readline() == b"* 1 EXISTS\r\n"
+            assert time.monotonic() - started < 5
+            assert imap.readline() == b"* 1 RECENT\r\n"
+            imap.send(b"DONE\r\n")
+            assert imap.readline().startswith(tag + b" OK")
+            imap.logout()
+
         with Raven(tmp / "busy", "--max-connections", "1"):
             # The readiness probe's session may still hold the only slot briefly.
             for _ in range(50):
@@ -159,6 +177,21 @@ def main():
             smtps.login("alice@example.com", PASSWORD)
             check_delivery(smtps, imaplib.IMAP4_SSL(HOST, IMAP_PORT, ssl_context=ctx, timeout=5), expected=2,
                            sender="alice@example.com")
+
+            # IDLE over TLS: poll timeouts must not break the TLS session (#18).
+            imap = imaplib.IMAP4_SSL(HOST, IMAP_PORT, ssl_context=ctx, timeout=10)
+            imap.login("alice@example.com", PASSWORD)
+            imap.select("INBOX")
+            tag = imap._new_tag()
+            imap.send(tag + b" IDLE\r\n")
+            assert imap.readline().startswith(b"+")
+            time.sleep(2.5)  # at least one poll timeout inside TLS before the delivery
+            smtplib.SMTP(HOST, SMTP_PORT, timeout=5).sendmail("bob@external.test", ["alice@example.com"], "Subject: ping\r\n\r\n")
+            assert imap.readline() == b"* 3 EXISTS\r\n"
+            imap.readline()
+            imap.send(b"DONE\r\n")
+            assert imap.readline().startswith(tag + b" OK")
+            imap.logout()
 
             s_client = subprocess.run(["openssl", "s_client", "-starttls", "smtp", "-connect", f"{HOST}:{SMTP_PORT}",
                                        "-CAfile", cert, "-quiet"], input=b"EHLO client\r\nQUIT\r\n",
