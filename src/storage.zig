@@ -128,6 +128,10 @@ pub const Storage = struct {
         return std.fs.path.join(allocator, &.{ self.root_dir, "tenants", tenant, "domains", domain, "accounts.txt" });
     }
 
+    pub fn dkimPath(self: Storage, allocator: std.mem.Allocator, tenant: []const u8, domain: []const u8) ![]u8 {
+        return std.fs.path.join(allocator, &.{ self.root_dir, "tenants", tenant, "domains", domain, "dkim" });
+    }
+
     pub fn maildirPath(self: Storage, allocator: std.mem.Allocator, tenant: []const u8, domain: []const u8, user: []const u8) ![]u8 {
         return std.fs.path.join(allocator, &.{ self.root_dir, "tenants", tenant, "domains", domain, "users", user, "Maildir" });
     }

@@ -20,4 +20,9 @@ jobs:
           version: 0.17.1
       - run: zig fmt --check build.zig src
       - run: zig build test --summary all
+      - name: Install dkimpy (independent DKIM verifier for the smoke test)
+        run: |
+          python3 -m venv "$RUNNER_TEMP/venv"
+          "$RUNNER_TEMP/venv/bin/pip" install --quiet dkimpy==1.1.8
+          echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
       - run: zig build smoke

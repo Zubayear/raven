@@ -15,7 +15,7 @@ It currently provides SMTP, IMAP, filesystem-backed storage, tenant-aware routin
 - Multi-tenant routing: only hosted domains and known users are accepted (no open relay), with aliases and `user+tag` plus-addressing
 - Accounts with argon2id password hashes (`raven passwd`)
 - TLS via OpenSSL: `STARTTLS` for SMTP and IMAP, implicit-TLS SMTPS/IMAPS; passwords only over TLS
-- Outbound delivery for authenticated users: durable queue, MX lookup, opportunistic STARTTLS, retries with backoff for 5 days, DSN bounces
+- Outbound delivery for authenticated users: durable queue, MX lookup, opportunistic STARTTLS, DKIM signing, retries with backoff for 5 days, DSN bounces
 - Concurrent sessions with idle timeouts (SMTP 5 min, IMAP 30 min) and a connection cap
 - Graceful shutdown on signal
 
@@ -167,12 +167,35 @@ echo "sales alice" >> data/tenants/acme/domains/example.com/aliases.txt   # opti
 
 Accounts and aliases are read on every login and delivery, so no restart is needed. Only argon2id hashes are accepted.
 
+## DKIM
+
+Mail that authenticated users send to other domains is DKIM-signed (RFC 6376, `rsa-sha256`, relaxed/relaxed) when their domain has a key. The key's file name is the selector:
+
+```bash
+mkdir -p data/tenants/acme/domains/example.com/dkim
+openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 \
+  -out data/tenants/acme/domains/example.com/dkim/mail2026.pem
+chmod 600 data/tenants/acme/domains/example.com/dkim/mail2026.pem
+```
+
+Publish the public key as a TXT record at `<selector>._domainkey.<domain>`:
+
+```bash
+echo "mail2026._domainkey.example.com. TXT \"v=DKIM1; k=rsa; p=$(openssl pkey \
+  -in data/tenants/acme/domains/example.com/dkim/mail2026.pem -pubout -outform DER | base64 | tr -d '\n')\""
+```
+
+In a zone file, split values longer than 255 characters into several quoted strings; most DNS providers do this for you.
+
+Keys are read for every message, and the alphabetically last `<selector>.pem` signs: to rotate, add the new key and its DNS record, then remove the old key (and later its record). Without a key, or if signing fails, mail goes out unsigned.
+
 ## Data layout
 
 ```text
 data/tenants/index.txt                                  tenant <name> <domain>...
 data/tenants/<tenant>/domains/<domain>/accounts.txt     <user> <argon2id hash>
 data/tenants/<tenant>/domains/<domain>/aliases.txt      <alias> <user>
+data/tenants/<tenant>/domains/<domain>/dkim/<selector>.pem   DKIM signing key
 data/tenants/<tenant>/domains/<domain>/users/<user>/Maildir/{tmp,new,cur}   INBOX
 data/tenants/<tenant>/domains/<domain>/users/<user>/Maildir/.Sent/...       folders (Maildir++)
 data/queue/outbound/<id>.eml + <id>.env                                    outbound queue
@@ -196,6 +219,7 @@ Mailboxes are standard Maildirs: delivery writes to `tmp/`, syncs, then renames 
 - `src/config.zig` loads CLI, environment, and config-file settings.
 - `src/conn.zig` runs the accept loop and gives each connection socket I/O with an idle timeout.
 - `src/tls.zig` wraps OpenSSL for server-side TLS on top of that socket I/O.
+- `src/dkim.zig` DKIM-signs mail leaving through the queue.
 - `src/address.zig` validates mail addresses before they reach the filesystem.
 - `src/tenant_index.zig`, `src/alias_index.zig`, and `src/account_index.zig` provide routing and identity lookup.
 
