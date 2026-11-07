@@ -166,6 +166,7 @@ test {
     _ = @import("alias_index.zig");
     _ = @import("config.zig");
     _ = @import("conn.zig");
+    _ = @import("dkim.zig");
     _ = @import("dns.zig");
     _ = @import("imap.zig");
     _ = @import("imap_proto.zig");

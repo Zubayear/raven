@@ -13,6 +13,11 @@ import tempfile
 import time
 from pathlib import Path
 
+try:
+    import dkim  # dkimpy: an independent DKIM verifier
+except ImportError:
+    dkim = None
+
 BIN = os.environ.get("RAVEN_BIN", "zig-out/bin/raven")
 HOST, SMTP_PORT, IMAP_PORT, SMTPS_PORT, IMAPS_PORT, SUBMISSION_PORT = "127.0.0.1", 2525, 2143, 2465, 2993, 2587
 
@@ -170,6 +175,14 @@ def main():
         (remote / "tenants/beta/domains/remote.test").mkdir(parents=True)
         (remote / "tenants/index.txt").write_text("tenant beta remote.test\n")
         (remote / "tenants/beta/domains/remote.test/accounts.txt").write_text(f"bob {PASSWORD_HASH}\n")
+        # example.com signs outgoing mail with DKIM selector "smoke" (#24).
+        dkim_key = data / "tenants/acme/domains/example.com/dkim/smoke.pem"
+        dkim_key.parent.mkdir()
+        subprocess.run(["openssl", "genpkey", "-algorithm", "RSA", "-pkeyopt", "rsa_keygen_bits:2048",
+                        "-out", dkim_key], check=True, capture_output=True)
+        public_der = subprocess.run(["openssl", "pkey", "-in", dkim_key, "-pubout", "-outform", "DER"],
+                                    check=True, capture_output=True).stdout
+        dkim_record = b"v=DKIM1; k=rsa; p=" + base64.b64encode(public_der)
         with Raven(remote, "--tls-cert", str(cert), "--tls-key", str(key), ports=(3525, 3143), hostname="mx.remote.test"), \
                 Raven(data, "--tls-cert", str(cert), "--tls-key", str(key), "--smtps-port", str(SMTPS_PORT),
                       "--imaps-port", str(IMAPS_PORT), "--submission-port", str(SUBMISSION_PORT),
@@ -183,7 +196,9 @@ def main():
             except smtplib.SMTPSenderRefused as err:
                 assert err.smtp_code == 530, err
             sub.login("alice@example.com", PASSWORD)
-            sub.sendmail("alice@example.com", ["bob@remote.test"], "Subject: out\r\n\r\nhi\r\n")
+            sub.sendmail("alice@example.com", ["bob@remote.test"],
+                         "From: Alice <alice@example.com>\r\nTo: bob@remote.test\r\nSubject: out \t there\r\n"
+                         "Subject:  out\r\n\tfolded \r\n\r\n.hi  there \r\n\r\n\r\n")
             sub.quit()
 
             # The queue runner relays it to the other Raven over STARTTLS (#22, #23).
@@ -193,7 +208,15 @@ def main():
                 assert time.monotonic() < deadline, "relayed mail never arrived"
                 time.sleep(0.2)
             relayed = next(bob.iterdir()).read_bytes()
-            assert b"with ESMTPS" in relayed and b"Subject: out" in relayed, relayed
+            assert b"with ESMTPS" in relayed and b"Subject:  out" in relayed, relayed
+            assert b"DKIM-Signature: v=1; a=rsa-sha256; c=relaxed/relaxed; d=example.com; s=smoke;" in relayed, relayed
+            if dkim is None:
+                assert not os.environ.get("CI"), "CI must install dkimpy"
+                print("smoke: dkimpy not installed, skipping DKIM verification (pip install dkimpy)")
+            else:
+                def dkim_dns(name, timeout=5):
+                    return dkim_record if name == b"smoke._domainkey.example.com." else None
+                assert dkim.verify(relayed, dnsfunc=dkim_dns), relayed
             deadline = time.monotonic() + 5
             while list((data / "queue/outbound").glob("*.env")):
                 assert time.monotonic() < deadline, "queue entry was not removed after delivery"

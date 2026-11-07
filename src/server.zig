@@ -11,6 +11,7 @@ const Storage = @import("storage.zig").Storage;
 const TenantCatalog = @import("tenant_index.zig").TenantCatalog;
 const TenantIndex = @import("tenant_index.zig");
 const conn = @import("conn.zig");
+const dkim = @import("dkim.zig");
 
 pub const Server = struct {
     allocator: std.mem.Allocator,
@@ -32,6 +33,22 @@ pub const Server = struct {
     /// Passwords only travel encrypted, unless the operator opted out.
     fn authAllowed(self: *const Server, client: *const conn.Client) bool {
         return client.secure or self.config.allow_plaintext_auth;
+    }
+
+    /// A DKIM-Signature for `message` from `identity`'s domain, or null if
+    /// the domain has no key or signing fails: the mail then goes unsigned.
+    fn dkimSignature(self: *const Server, io: Io, identity: Identity, message: []const u8, seconds: u64) ?[]u8 {
+        const key_dir = self.storage.dkimPath(self.allocator, identity.tenant, identity.domain) catch return null;
+        defer self.allocator.free(key_dir);
+        const key = (dkim.loadKey(self.allocator, io, key_dir) catch |err| {
+            std.debug.print("dkim: cannot load key for {s}: {}\n", .{ identity.domain, err });
+            return null;
+        }) orelse return null;
+        defer key.deinit(self.allocator);
+        return dkim.sign(self.allocator, key, identity.domain, message, seconds) catch |err| {
+            std.debug.print("dkim: signing for {s} failed: {}\n", .{ identity.domain, err });
+            return null;
+        };
     }
 
     pub fn listen(self: *Server, io: Io, port: u16) !std.Io.net.Server {
@@ -302,6 +319,10 @@ pub const Server = struct {
                     // One queue entry for every remote recipient; Return-Path is
                     // left for the final delivery (RFC 5321 §4.4).
                     header.clearRetainingCapacity();
+                    // Only authenticated users relay, and only as themselves.
+                    const signature = if (auth_identity) |identity| self.dkimSignature(fs_io, identity, message, trace.seconds) else null;
+                    defer if (signature) |value| allocator.free(value);
+                    if (signature) |value| try header.writer.writeAll(value);
                     try writeTrace(&header.writer, trace, null);
                     const id = self.storage.enqueue(fs_io, allocator, tx.sender.?, tx.remote.items, header.written(), message) catch |err| {
                         std.debug.print("queueing failed: {}\n", .{err});
