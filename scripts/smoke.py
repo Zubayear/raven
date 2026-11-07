@@ -76,7 +76,7 @@ def setup_accounts(root):
 
 
 def check_delivery(smtp, imap_sock, expected=1):
-    smtp.sendmail("bob@external.test", ["alice@example.com"], f"Subject: smoke {expected}\r\n\r\nhello raven\r\n")
+    smtp.sendmail("bob@external.test", ["alice+smoke@example.com"], f"Subject: smoke {expected}\r\n\r\nhello raven\r\n")
     smtp.quit()
 
     imap = Imap(imap_sock)
