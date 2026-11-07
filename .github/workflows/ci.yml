@@ -26,3 +26,13 @@ jobs:
           "$RUNNER_TEMP/venv/bin/pip" install --quiet dkimpy==1.1.8
           echo "$RUNNER_TEMP/venv/bin" >> "$GITHUB_PATH"
       - run: zig build smoke
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+      # The smoke stage runs scripts/smoke.py against the runtime image.
+      - run: docker build --target smoke .
+      - run: docker build -t raven .

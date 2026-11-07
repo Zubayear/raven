@@ -1,0 +1,39 @@
+# Raven on the standard mail ports, with a Let's Encrypt certificate.
+# Install: see "Deployment" in the README. Replace mail.example.com below.
+[Unit]
+Description=Raven mail server
+Documentation=https://github.com/Zubayear/raven
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=raven
+Group=raven
+ExecStart=/usr/local/bin/raven --config /etc/raven/raven.conf --tls-cert %d/cert.pem --tls-key %d/key.pem
+# The key is readable by root only; systemd hands the service a private copy.
+LoadCredential=cert.pem:/etc/letsencrypt/live/mail.example.com/fullchain.pem
+LoadCredential=key.pem:/etc/letsencrypt/live/mail.example.com/privkey.pem
+StateDirectory=raven
+StateDirectoryMode=0700
+UMask=0077
+# Binding ports below 1024 is the only privilege Raven needs.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+LimitNOFILE=65536
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
