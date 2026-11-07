@@ -10,7 +10,7 @@ It currently provides SMTP, IMAP, filesystem-backed storage, tenant-aware routin
 ## Features
 
 - SMTP receiving per RFC 5321: `SIZE`, `8BITMIME`, `ENHANCEDSTATUSCODES`, `PIPELINING`, enforced line and recipient limits
-- IMAP listener with mailbox access
+- IMAP4rev1 for real clients: literals, UIDs, full FETCH (ENVELOPE, BODYSTRUCTURE, sections), STORE, folders with special-use (Sent, Drafts, Trash, Junk), APPEND, COPY/MOVE, STATUS
 - Maildir storage: atomic delivery, flags in file names, safe across restarts
 - Multi-tenant routing: only hosted domains and known users are accepted (no open relay), with aliases and `user+tag` plus-addressing
 - Accounts with argon2id password hashes (`raven passwd`)
@@ -163,7 +163,8 @@ Accounts and aliases are read on every login and delivery, so no restart is need
 data/tenants/index.txt                                  tenant <name> <domain>...
 data/tenants/<tenant>/domains/<domain>/accounts.txt     <user> <argon2id hash>
 data/tenants/<tenant>/domains/<domain>/aliases.txt      <alias> <user>
-data/tenants/<tenant>/domains/<domain>/users/<user>/Maildir/{tmp,new,cur}
+data/tenants/<tenant>/domains/<domain>/users/<user>/Maildir/{tmp,new,cur}   INBOX
+data/tenants/<tenant>/domains/<domain>/users/<user>/Maildir/.Sent/...       folders (Maildir++)
 ```
 
 Each domain belongs to exactly one tenant. Domains and local parts match case-insensitively; mail for `user+tag@domain` is delivered to `user`.

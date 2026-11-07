@@ -5,7 +5,8 @@ const Config = @import("config.zig").Config;
 const conn = @import("conn.zig");
 const account_index = @import("account_index.zig");
 const Identity = account_index.Identity;
-const Storage = @import("storage.zig").Storage;
+const mailstore = @import("storage.zig");
+const Storage = mailstore.Storage;
 const Message = @import("storage.zig").Message;
 const MessageFlags = @import("storage.zig").MessageFlags;
 const TenantCatalog = @import("tenant_index.zig").TenantCatalog;
@@ -84,11 +85,11 @@ pub const ImapServer = struct {
     }
 };
 
-const capabilities = "IMAP4rev1 LITERAL+ UNSELECT";
+const capabilities = "IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE";
 
 const State = enum { not_authenticated, authenticated, selected, logout };
 
-const Command = enum { capability, noop, logout, login, select, examine, list, fetch, store, expunge, uid, check, close, unselect };
+const Command = enum { capability, noop, logout, login, select, examine, list, lsub, create, delete, rename, subscribe, unsubscribe, status, append, fetch, store, expunge, uid, check, close, unselect, copy, move };
 
 /// One command being executed.
 const Context = struct {
@@ -109,8 +110,8 @@ const Context = struct {
         const allowed = switch (cmd) {
             .capability, .noop, .logout => true,
             .login => state == .not_authenticated,
-            .select, .examine, .list => state == .authenticated or state == .selected,
-            .fetch, .store, .expunge, .uid, .check, .close, .unselect => state == .selected,
+            .select, .examine, .list, .lsub, .create, .delete, .rename, .subscribe, .unsubscribe, .status, .append => state == .authenticated or state == .selected,
+            .fetch, .store, .expunge, .uid, .check, .close, .unselect, .copy, .move => state == .selected,
         };
         if (!allowed) return ctx.bad(if (state == .not_authenticated) "log in first" else "command not valid in this state");
 
@@ -132,7 +133,14 @@ const Context = struct {
             },
             .login => try ctx.login(p),
             .select, .examine => try ctx.select(p, cmd == .examine),
-            .list => try ctx.list(p),
+            .list, .lsub => try ctx.list(p, cmd == .lsub),
+            .create => try ctx.create(p),
+            .delete => try ctx.delete(p),
+            .rename => try ctx.rename(p),
+            .subscribe, .unsubscribe => try ctx.subscribe(p, cmd == .subscribe),
+            .status => try ctx.status(p),
+            .append => try ctx.append(p),
+            .copy, .move => try ctx.copy(p, .sequence, cmd == .move),
             .fetch => try ctx.fetch(p, .sequence),
             .store => try ctx.store(p, .sequence),
             .expunge => {
@@ -157,6 +165,8 @@ const Context = struct {
                 const sub = try p.atom();
                 if (std.ascii.eqlIgnoreCase(sub, "FETCH")) return ctx.fetch(p, .uid);
                 if (std.ascii.eqlIgnoreCase(sub, "STORE")) return ctx.store(p, .uid);
+                if (std.ascii.eqlIgnoreCase(sub, "COPY")) return ctx.copy(p, .uid, false);
+                if (std.ascii.eqlIgnoreCase(sub, "MOVE")) return ctx.copy(p, .uid, true);
                 return ctx.bad("unknown UID command");
             },
         }
@@ -175,7 +185,9 @@ const Context = struct {
             else => return err,
         };
         ctx.session.identity = identity;
+        ctx.session.maildir = try s.storage.maildirPath(s.allocator, identity.tenant, identity.domain, identity.user);
         ctx.session.state = .authenticated;
+        try ensureDefaultFolders(ctx.io, s.allocator, ctx.session.maildir.?);
         try ctx.ok("[CAPABILITY " ++ capabilities ++ "] LOGIN completed");
     }
 
@@ -186,10 +198,9 @@ const Context = struct {
 
         const session = ctx.session;
         session.closeMailbox(ctx.server.allocator);
-        if (!std.ascii.eqlIgnoreCase(mailbox, "INBOX")) return ctx.no("[NONEXISTENT] no such mailbox");
-
-        const id = session.identity.?;
-        const opened = try ctx.server.storage.openMailbox(ctx.io, ctx.server.allocator, id.tenant, id.domain, id.user);
+        const path = try ctx.mailboxPath(mailbox) orelse return ctx.no("[NONEXISTENT] no such mailbox");
+        defer ctx.server.allocator.free(path);
+        const opened = try Storage.openMailbox(ctx.io, ctx.server.allocator, path);
         session.messages = .fromOwnedSlice(opened.messages);
         session.uid_validity = opened.uid_validity;
         session.uid_next = opened.uid_next;
@@ -206,19 +217,209 @@ const Context = struct {
         try ctx.ok(if (read_only) "[READ-ONLY] EXAMINE completed" else "[READ-WRITE] SELECT completed");
     }
 
-    fn list(ctx: Context, p: *proto.Parser) !void {
+    /// The Maildir path of an existing mailbox, or null; the caller owns it.
+    fn mailboxPath(ctx: Context, name: []const u8) !?[]u8 {
+        const allocator = ctx.server.allocator;
+        const maildir = ctx.session.maildir.?;
+        if (!std.ascii.eqlIgnoreCase(name, "INBOX") and !mailstore.isFolderName(name)) return null;
+        const path = try mailstore.folderPath(allocator, maildir, name);
+        if (std.ascii.eqlIgnoreCase(name, "INBOX")) return path;
+        Io.Dir.cwd().access(ctx.io, path, .{}) catch {
+            allocator.free(path);
+            return null;
+        };
+        return path;
+    }
+
+    /// LIST / LSUB (RFC 3501 §6.3.8–9) with special-use attributes (RFC 6154).
+    fn list(ctx: Context, p: *proto.Parser, subscribed_only: bool) !void {
         try p.space();
-        _ = try p.astring(); // reference name: only one level of mailboxes for now
+        const reference = try p.astring();
         try p.space();
         const pattern = if (p.peek() == '"' or p.peek() == '{') try p.string() else try p.atomWith("]%*");
         try p.end();
 
+        const verb = if (subscribed_only) "LSUB" else "LIST";
         if (pattern.len == 0) {
-            try ctx.w.writeAll("* LIST (\\Noselect) \"/\" \"\"\r\n");
-        } else if (matchesPattern(pattern, "INBOX")) {
-            try ctx.w.writeAll("* LIST (\\HasNoChildren) \"/\" INBOX\r\n");
+            try ctx.w.print("* {s} (\\Noselect) \"/\" \"\"\r\n", .{verb});
+            return ctx.ok("LIST completed");
         }
-        try ctx.ok("LIST completed");
+        var arena_state = std.heap.ArenaAllocator.init(ctx.server.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        const full_pattern = try std.mem.concat(arena, u8, &.{ reference, pattern });
+        const folders = try mailstore.listFolders(ctx.io, arena, ctx.session.maildir.?);
+        const names = if (subscribed_only) try mailstore.readSubscriptions(ctx.io, arena, ctx.session.maildir.?) else try std.mem.concat(arena, []const u8, &.{ &.{"INBOX"}, folders });
+
+        for (names) |name| {
+            if (!matchesPattern(full_pattern, name)) continue;
+            var children = false;
+            for (folders) |folder| children = children or (std.mem.startsWith(u8, folder, name) and folder.len > name.len and folder[name.len] == '/');
+            try ctx.w.print("* {s} ({s}", .{ verb, if (children) "\\HasChildren" else "\\HasNoChildren" });
+            if (specialUse(name)) |attribute| try ctx.w.print(" {s}", .{attribute});
+            try ctx.w.writeAll(") \"/\" ");
+            try proto.writeString(ctx.w, name);
+            try ctx.w.writeAll("\r\n");
+        }
+        try ctx.ok(if (subscribed_only) "LSUB completed" else "LIST completed");
+    }
+
+    fn create(ctx: Context, p: *proto.Parser) !void {
+        try p.space();
+        const name = std.mem.trimEnd(u8, try p.astring(), "/"); // a trailing delimiter is allowed
+        try p.end();
+        if (std.ascii.eqlIgnoreCase(name, "INBOX")) return ctx.no("[ALREADYEXISTS] INBOX always exists");
+        if (!mailstore.isFolderName(name)) return ctx.no("[CANNOT] invalid mailbox name");
+        mailstore.createFolder(ctx.io, ctx.server.allocator, ctx.session.maildir.?, name) catch |err| switch (err) {
+            error.FolderExists => return ctx.no("[ALREADYEXISTS] mailbox exists"),
+            else => return err,
+        };
+        try ctx.ok("CREATE completed");
+    }
+
+    fn delete(ctx: Context, p: *proto.Parser) !void {
+        try p.space();
+        const name = try p.astring();
+        try p.end();
+        if (std.ascii.eqlIgnoreCase(name, "INBOX")) return ctx.no("[CANNOT] INBOX cannot be deleted");
+        if (!mailstore.isFolderName(name)) return ctx.no("[NONEXISTENT] no such mailbox");
+        mailstore.deleteFolder(ctx.io, ctx.server.allocator, ctx.session.maildir.?, name) catch |err| switch (err) {
+            error.NoSuchFolder => return ctx.no("[NONEXISTENT] no such mailbox"),
+            else => return err,
+        };
+        try ctx.ok("DELETE completed");
+    }
+
+    fn rename(ctx: Context, p: *proto.Parser) !void {
+        try p.space();
+        const from = try p.astring();
+        try p.space();
+        const to = try p.astring();
+        try p.end();
+        if (std.ascii.eqlIgnoreCase(from, "INBOX") or std.ascii.eqlIgnoreCase(to, "INBOX")) return ctx.no("[CANNOT] INBOX cannot be renamed");
+        if (!mailstore.isFolderName(from) or !mailstore.isFolderName(to)) return ctx.no("[CANNOT] invalid mailbox name");
+        mailstore.renameFolder(ctx.io, ctx.server.allocator, ctx.session.maildir.?, from, to) catch |err| switch (err) {
+            error.NoSuchFolder => return ctx.no("[NONEXISTENT] no such mailbox"),
+            error.FolderExists => return ctx.no("[ALREADYEXISTS] target exists"),
+            error.InvalidFolderName => return ctx.no("[CANNOT] invalid mailbox name"),
+            else => return err,
+        };
+        try ctx.ok("RENAME completed");
+    }
+
+    fn subscribe(ctx: Context, p: *proto.Parser, add: bool) !void {
+        try p.space();
+        const name = try p.astring();
+        try p.end();
+        if (!std.ascii.eqlIgnoreCase(name, "INBOX") and !mailstore.isFolderName(name)) return ctx.no("[CANNOT] invalid mailbox name");
+
+        var arena_state = std.heap.ArenaAllocator.init(ctx.server.allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+        var names = std.ArrayList([]const u8).empty;
+        for (try mailstore.readSubscriptions(ctx.io, arena, ctx.session.maildir.?)) |existing| {
+            if (!std.mem.eql(u8, existing, name)) try names.append(arena, existing);
+        }
+        if (add) try names.append(arena, name);
+        try mailstore.writeSubscriptions(ctx.io, ctx.server.allocator, ctx.session.maildir.?, names.items);
+        try ctx.ok(if (add) "SUBSCRIBE completed" else "UNSUBSCRIBE completed");
+    }
+
+    fn status(ctx: Context, p: *proto.Parser) !void {
+        try p.space();
+        const name = try p.astring();
+        try p.space();
+        try p.expect('(');
+        var items = std.ArrayList([]const u8).empty;
+        while (true) {
+            try items.append(p.arena, try p.atom());
+            if (p.take(')')) break;
+            try p.space();
+        }
+        try p.end();
+
+        const allocator = ctx.server.allocator;
+        const path = try ctx.mailboxPath(name) orelse return ctx.no("[NONEXISTENT] no such mailbox");
+        defer allocator.free(path);
+        const opened = try Storage.openMailbox(ctx.io, allocator, path);
+        defer mailstore.freeMessages(allocator, opened.messages);
+        var unseen: usize = 0;
+        var recent: usize = 0;
+        for (opened.messages) |message| {
+            unseen += @intFromBool(!message.flags.seen);
+            recent += @intFromBool(message.recent);
+        }
+
+        try ctx.w.writeAll("* STATUS ");
+        try proto.writeString(ctx.w, name);
+        try ctx.w.writeAll(" (");
+        for (items.items, 0..) |item, i| {
+            if (i != 0) try ctx.w.writeByte(' ');
+            const value: usize = if (std.ascii.eqlIgnoreCase(item, "MESSAGES")) opened.messages.len else if (std.ascii.eqlIgnoreCase(item, "RECENT")) recent else if (std.ascii.eqlIgnoreCase(item, "UIDNEXT")) opened.uid_next else if (std.ascii.eqlIgnoreCase(item, "UIDVALIDITY")) opened.uid_validity else if (std.ascii.eqlIgnoreCase(item, "UNSEEN")) unseen else return error.Syntax;
+            try ctx.w.print("{s} {d}", .{ item, value });
+        }
+        try ctx.w.writeAll(")\r\n");
+        try ctx.ok("STATUS completed");
+    }
+
+    /// `APPEND mailbox [(flags)] ["date-time"] message` (RFC 3501 §6.3.11).
+    fn append(ctx: Context, p: *proto.Parser) !void {
+        try p.space();
+        const name = try p.astring();
+        try p.space();
+        var flags: ?MessageFlags = null;
+        if (p.peek() == '(') {
+            flags = try parseFlagList(p);
+            try p.space();
+        }
+        var date: ?u64 = null;
+        if (p.peek() == '"') {
+            date = parseDateTime(try p.string()) orelse return error.Syntax;
+            try p.space();
+        }
+        const message = try p.string();
+        try p.end();
+
+        const allocator = ctx.server.allocator;
+        const path = try ctx.mailboxPath(name) orelse return ctx.no("[TRYCREATE] no such mailbox");
+        defer allocator.free(path);
+        allocator.free(try mailstore.deliverTo(ctx.io, allocator, path, "", message, .{ .flags = flags, .date = date }));
+        try ctx.ok("APPEND completed");
+    }
+
+    /// COPY / MOVE (RFC 6851), by sequence number or UID. Flags and arrival
+    /// dates travel with the messages.
+    fn copy(ctx: Context, p: *proto.Parser, by: Addressing, move: bool) !void {
+        try p.space();
+        const set = try p.sequenceSet();
+        try p.space();
+        const name = try p.astring();
+        try p.end();
+        if (move and ctx.session.read_only) return ctx.no("[READ-ONLY] mailbox is read-only");
+
+        const allocator = ctx.server.allocator;
+        const path = try ctx.mailboxPath(name) orelse return ctx.no("[TRYCREATE] no such mailbox");
+        defer allocator.free(path);
+        for (ctx.session.messages.items, 1..) |message, number| {
+            if (!ctx.session.inSet(set, by, number)) continue;
+            const data = Storage.readMessage(ctx.io, allocator, message) catch |err| switch (err) {
+                error.FileNotFound => return ctx.no("message no longer available"),
+                else => return err,
+            };
+            defer allocator.free(data);
+            allocator.free(try mailstore.deliverTo(ctx.io, allocator, path, "", data, .{ .flags = message.flags, .date = message.internal_date }));
+        }
+        if (move) {
+            const session = ctx.session;
+            var i: usize = session.messages.items.len;
+            while (i > 0) : (i -= 1) {
+                if (!session.inSet(set, by, i)) continue;
+                try Storage.deleteMessage(ctx.io, session.messages.items[i - 1]);
+                try ctx.w.print("* {d} EXPUNGE\r\n", .{i});
+                session.removeMessage(i - 1, allocator);
+            }
+        }
+        try ctx.ok(if (move) "MOVE completed" else "COPY completed");
     }
 
     fn fetch(ctx: Context, p: *proto.Parser, by: Addressing) !void {
@@ -592,6 +793,8 @@ const Session = struct {
     state: State = .not_authenticated,
     identity: ?Identity = null,
     messages: std.ArrayList(Message) = .empty,
+    /// The user's INBOX Maildir, set at login.
+    maildir: ?[]u8 = null,
     uid_validity: u32 = 0,
     uid_next: u32 = 0,
     read_only: bool = false,
@@ -619,9 +822,68 @@ const Session = struct {
     fn deinit(self: *Session, allocator: std.mem.Allocator) void {
         self.closeMailbox(allocator);
         if (self.identity) |identity| identity.deinit(allocator);
+        if (self.maildir) |path| allocator.free(path);
         self.* = .{};
     }
 };
+
+const default_folders = [_][]const u8{ "Sent", "Drafts", "Trash", "Junk" };
+
+fn specialUse(name: []const u8) ?[]const u8 {
+    for (default_folders) |folder| {
+        if (std.mem.eql(u8, name, folder)) return switch (folder[0]) {
+            'S' => "\\Sent",
+            'D' => "\\Drafts",
+            'T' => "\\Trash",
+            else => "\\Junk",
+        };
+    }
+    return null;
+}
+
+/// Creates the special-use folders on first login and subscribes to them.
+fn ensureDefaultFolders(io: Io, allocator: std.mem.Allocator, maildir: []const u8) !void {
+    const subscriptions = try std.fs.path.join(allocator, &.{ maildir, "subscriptions" });
+    defer allocator.free(subscriptions);
+    if (Io.Dir.cwd().access(io, subscriptions, .{})) |_| return else |_| {}
+    for (default_folders) |folder| mailstore.createFolder(io, allocator, maildir, folder) catch |err| switch (err) {
+        error.FolderExists => {},
+        else => return err,
+    };
+    try mailstore.writeSubscriptions(io, allocator, maildir, &(.{"INBOX"} ++ default_folders));
+}
+
+/// IMAP date-time, e.g. ` 7-Nov-2026 09:35:47 +0100`, as Unix seconds.
+fn parseDateTime(text: []const u8) ?u64 {
+    const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    var fields = std.mem.tokenizeAny(u8, text, " -:");
+    const day = std.fmt.parseInt(u32, fields.next() orelse return null, 10) catch return null;
+    const month_name = fields.next() orelse return null;
+    const year = std.fmt.parseInt(i64, fields.next() orelse return null, 10) catch return null;
+    const hour = std.fmt.parseInt(i64, fields.next() orelse return null, 10) catch return null;
+    const minute = std.fmt.parseInt(i64, fields.next() orelse return null, 10) catch return null;
+    const second = std.fmt.parseInt(i64, fields.next() orelse return null, 10) catch return null;
+    const zone = fields.next() orelse return null;
+    if (fields.next() != null or zone.len != 5 or (zone[0] != '+' and zone[0] != '-')) return null;
+    const zone_hours = std.fmt.parseInt(i64, zone[1..3], 10) catch return null;
+    const zone_minutes = std.fmt.parseInt(i64, zone[3..5], 10) catch return null;
+    var month: i64 = 0;
+    for (months, 1..) |name, i| {
+        if (std.ascii.eqlIgnoreCase(name, month_name)) month = @intCast(i);
+    }
+    if (month == 0 or day == 0 or day > 31 or hour > 23 or minute > 59 or second > 60) return null;
+
+    // Days from civil (Howard Hinnant's algorithm).
+    const y = year - @intFromBool(month <= 2);
+    const era = @divFloor(y, 400);
+    const yoe = y - era * 400;
+    const doy = @divFloor(153 * (month + (if (month > 2) @as(i64, -3) else 9)) + 2, 5) + day - 1;
+    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
+    const days = era * 146097 + doe - 719468;
+    const offset = (zone_hours * 3600 + zone_minutes * 60) * @as(i64, if (zone[0] == '-') -1 else 1);
+    const seconds = days * 86400 + hour * 3600 + minute * 60 + second - offset;
+    return if (seconds < 0) null else @intCast(seconds);
+}
 
 /// `flag` or `(flag ...)`; keywords are accepted and ignored.
 fn parseFlagList(p: *proto.Parser) !MessageFlags {
@@ -724,17 +986,19 @@ test "imap session: states, quoting and literals" {
         "a5 SELECT\r\n" ++
         "a6 LIST \"\" *\r\n" ++
         "a7 LIST \"\" \"\"\r\n" ++
-        "a8 SELECT Sent\r\n" ++
+        "a8 SELECT Nope\r\n" ++
         "a9 LOGOUT\r\n");
     defer allocator.free(transcript);
-    try std.testing.expectEqualStrings("* OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT] raven ready\r\n" ++
+    try std.testing.expectEqualStrings("* OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE] raven ready\r\n" ++
         "a0 BAD log in first\r\n" ++
         "a1 NO [AUTHENTICATIONFAILED] authentication failed\r\n" ++
-        "a2 OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT] LOGIN completed\r\n" ++
+        "a2 OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE] LOGIN completed\r\n" ++
         "a3 BAD command not valid in this state\r\n" ++
         "a4 BAD unknown command\r\n" ++
         "a5 BAD syntax error\r\n" ++
-        "* LIST (\\HasNoChildren) \"/\" INBOX\r\na6 OK LIST completed\r\n" ++
+        "* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n* LIST (\\HasNoChildren \\Drafts) \"/\" \"Drafts\"\r\n" ++
+        "* LIST (\\HasNoChildren \\Junk) \"/\" \"Junk\"\r\n* LIST (\\HasNoChildren \\Sent) \"/\" \"Sent\"\r\n" ++
+        "* LIST (\\HasNoChildren \\Trash) \"/\" \"Trash\"\r\na6 OK LIST completed\r\n" ++
         "* LIST (\\Noselect) \"/\" \"\"\r\na7 OK LIST completed\r\n" ++
         "a8 NO [NONEXISTENT] no such mailbox\r\n" ++
         "* BYE raven logging out\r\na9 OK LOGOUT completed\r\n", transcript);
@@ -755,8 +1019,8 @@ test "imap session: select, fetch, store and expunge" {
         "b2 UID BOGUS 1\r\n");
     defer allocator.free(transcript);
     const select = "* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)\r\n";
-    try std.testing.expectEqualStrings("* OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT] raven ready\r\n" ++
-        "a1 OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT] LOGIN completed\r\n" ++
+    try std.testing.expectEqualStrings("* OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE] raven ready\r\n" ++
+        "a1 OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE] LOGIN completed\r\n" ++
         select ++ "* OK [PERMANENTFLAGS ()] read-only\r\n* 2 EXISTS\r\n* 2 RECENT\r\n* OK [UIDVALIDITY 1234567890] UIDs valid\r\n* OK [UIDNEXT 3] predicted next UID\r\na2 OK [READ-ONLY] EXAMINE completed\r\n" ++
         "a3 NO [READ-ONLY] mailbox is read-only\r\n" ++
         select ++ "* OK [PERMANENTFLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft)] limited\r\n* 2 EXISTS\r\n* 0 RECENT\r\n* OK [UIDVALIDITY 1234567890] UIDs valid\r\n* OK [UIDNEXT 3] predicted next UID\r\na4 OK [READ-WRITE] SELECT completed\r\n" ++
@@ -840,4 +1104,58 @@ test "imap session: expunge renumbers from the highest message down" {
         "a3 STORE 1:2 +FLAGS.SILENT (\\Deleted)\r\na4 EXPUNGE\r\na5 FETCH 1:* FLAGS\r\n");
     defer allocator.free(transcript);
     try std.testing.expectStringEndsWith(transcript, "a3 OK STORE completed\r\n* 2 EXPUNGE\r\n* 1 EXPUNGE\r\na4 OK EXPUNGE completed\r\na5 OK FETCH completed\r\n");
+}
+
+test "parseDateTime" {
+    try std.testing.expectEqual(@as(?u64, 1794044147), parseDateTime(" 7-Nov-2026 09:35:47 +0000"));
+    try std.testing.expectEqual(@as(?u64, 1794044147), parseDateTime("07-Nov-2026 10:35:47 +0100"));
+    try std.testing.expectEqual(@as(?u64, 951782400), parseDateTime("29-Feb-2000 00:00:00 +0000"));
+    try std.testing.expectEqual(@as(?u64, null), parseDateTime("07-Foo-2026 10:35:47 +0100"));
+    try std.testing.expectEqual(@as(?u64, null), parseDateTime("07-Nov-2026 10:35:47"));
+}
+
+test "imap session: folders, append, copy, move, status" {
+    const allocator = std.testing.allocator;
+    const transcript = try testSession(allocator, "a1 LOGIN alice@example.com \"pass word\"\r\n" ++
+        "a2 CREATE Work/\r\n" ++
+        "a3 CREATE Work\r\n" ++
+        "a4 CREATE ../evil\r\n" ++
+        "a5 APPEND Work (\\Seen) \"29-Feb-2000 00:00:00 +0000\" {7+}\r\nnote\r\n\r\n" ++
+        "a6 APPEND Nope {1+}\r\nx\r\n" ++
+        "a7 SELECT INBOX\r\n" ++
+        "a8 COPY 1 Work\r\n" ++
+        "a9 MOVE 2 Trash\r\n" ++
+        "b1 STATUS Work (MESSAGES UNSEEN UIDNEXT)\r\n" ++
+        "b2 STATUS Trash (MESSAGES)\r\n" ++
+        "b3 RENAME Work Archive\r\n" ++
+        "b4 SUBSCRIBE Archive\r\n" ++
+        "b5 LSUB \"\" \"A*\"\r\n" ++
+        "b6 LIST \"\" \"%\"\r\n" ++
+        "b7 DELETE Archive\r\n" ++
+        "b8 DELETE INBOX\r\n" ++
+        "b9 SELECT Trash\r\n");
+    defer allocator.free(transcript);
+    const end = std.mem.indexOf(u8, transcript, "a1 OK").?;
+    const rest = transcript[end..];
+    const after_select = std.mem.indexOf(u8, rest, "a7 OK").?;
+    try std.testing.expectEqualStrings("a1 OK [CAPABILITY IMAP4rev1 LITERAL+ UNSELECT MOVE SPECIAL-USE] LOGIN completed\r\n" ++
+        "a2 OK CREATE completed\r\n" ++
+        "a3 NO [ALREADYEXISTS] mailbox exists\r\n" ++
+        "a4 NO [CANNOT] invalid mailbox name\r\n" ++
+        "a5 OK APPEND completed\r\n" ++
+        "a6 NO [TRYCREATE] no such mailbox\r\n", rest[0..std.mem.indexOf(u8, rest, "* FLAGS").?]);
+    try std.testing.expectEqualStrings("a7 OK [READ-WRITE] SELECT completed\r\n" ++
+        "a8 OK COPY completed\r\n" ++
+        "* 2 EXPUNGE\r\na9 OK MOVE completed\r\n" ++
+        // The appended note was \Seen; the copy of message 1 was not.
+        "* STATUS \"Work\" (MESSAGES 2 UNSEEN 1 UIDNEXT 3)\r\nb1 OK STATUS completed\r\n" ++
+        "* STATUS \"Trash\" (MESSAGES 1)\r\nb2 OK STATUS completed\r\n" ++
+        "b3 OK RENAME completed\r\n" ++
+        "b4 OK SUBSCRIBE completed\r\n" ++
+        "* LSUB (\\HasNoChildren) \"/\" \"Archive\"\r\nb5 OK LSUB completed\r\n" ++
+        "* LIST (\\HasNoChildren) \"/\" \"INBOX\"\r\n* LIST (\\HasNoChildren) \"/\" \"Archive\"\r\n* LIST (\\HasNoChildren \\Drafts) \"/\" \"Drafts\"\r\n" ++
+        "* LIST (\\HasNoChildren \\Junk) \"/\" \"Junk\"\r\n* LIST (\\HasNoChildren \\Sent) \"/\" \"Sent\"\r\n* LIST (\\HasNoChildren \\Trash) \"/\" \"Trash\"\r\nb6 OK LIST completed\r\n" ++
+        "b7 OK DELETE completed\r\n" ++
+        "b8 NO [CANNOT] INBOX cannot be deleted\r\n", rest[after_select .. std.mem.indexOf(u8, rest, "b8 NO").? + "b8 NO [CANNOT] INBOX cannot be deleted\r\n".len]);
+    try std.testing.expect(std.mem.indexOf(u8, rest, "* 1 EXISTS\r\n") != null); // Trash holds the moved message
 }
