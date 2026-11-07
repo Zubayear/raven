@@ -210,6 +210,96 @@ In a zone file, split values longer than 255 characters into several quoted stri
 
 Keys are read for every message, and the alphabetically last `<selector>.pem` signs: to rotate, add the new key and its DNS record, then remove the old key (and later its record). Without a key, or if signing fails, mail goes out unsigned.
 
+## Deployment
+
+### Ports and DNS
+
+| Port | Use | Option |
+|------|-----|--------|
+| 25 | mail from other servers, with STARTTLS | `listen_port` |
+| 587 | submission: mail clients send, AUTH required, STARTTLS | `submission_port` |
+| 465 | submission over implicit TLS | `smtps_port` |
+| 143 | IMAP with STARTTLS | `imap_port` |
+| 993 | IMAP over implicit TLS | `imaps_port` |
+
+Outbound mail goes to port 25 of the receiving servers. Many cloud providers block that port; then send through a smarthost with `relay_host`.
+
+DNS for `example.com`, served by `mail.example.com` at `203.0.113.10`:
+
+```text
+mail.example.com.                 A    203.0.113.10
+example.com.                      MX   10 mail.example.com.
+example.com.                      TXT  "v=spf1 mx -all"
+mail2026._domainkey.example.com.  TXT  "v=DKIM1; k=rsa; p=..."   (see DKIM)
+_dmarc.example.com.               TXT  "v=DMARC1; p=none; rua=mailto:postmaster@example.com"
+```
+
+- Ask your hosting provider to set the reverse DNS (PTR) of `203.0.113.10` to `mail.example.com`, and use that name as `hostname`. Raven greets clients and says `EHLO` with it, and many receivers refuse mail from addresses whose reverse DNS doesn't match.
+- Start DMARC at `p=none` and move to `quarantine` or `reject` once the reports look right.
+- RFC 5321 requires a `postmaster` mailbox: create it as an account or an alias (`postmaster alice`).
+
+### TLS certificates
+
+Get a certificate for the mail host from Let's Encrypt; `certbot certonly --standalone -d mail.example.com` needs port 80 free. Pass `fullchain.pem` and `privkey.pem` as `--tls-cert` and `--tls-key`. Raven reads them at startup, so restart it after each renewal from certbot's `--deploy-hook`.
+
+### systemd
+
+`contrib/raven.service` runs Raven as an unprivileged `raven` user on the standard ports. It receives the certificate through systemd credentials, so the key can stay readable by root only.
+
+```bash
+zig build -Doptimize=ReleaseSafe    # optimized, with safety checks kept
+sudo useradd --system --home-dir /var/lib/raven --shell /usr/sbin/nologin raven
+sudo install -m 0755 zig-out/bin/raven /usr/local/bin/raven
+sudo install -D -m 0644 contrib/raven.conf /etc/raven/raven.conf    # set hostname
+sudo install -m 0644 contrib/raven.service /etc/systemd/system/     # set the certificate paths
+sudo systemctl daemon-reload
+sudo systemctl enable --now raven
+journalctl -u raven -f
+```
+
+Mail data lives in `/var/lib/raven`. Manage tenants and accounts there as the `raven` user (see Accounts), and restart Raven after changing `tenants/index.txt`:
+
+```bash
+sudo -u raven mkdir -p /var/lib/raven/tenants/acme/domains/example.com
+echo "tenant acme example.com" | sudo -u raven tee -a /var/lib/raven/tenants/index.txt
+sudo systemctl restart raven
+sudo -u raven sh -c 'echo "alice $(raven passwd)" >> /var/lib/raven/tenants/acme/domains/example.com/accounts.txt'
+```
+
+Renewals: `certbot renew --deploy-hook "systemctl restart raven"`.
+
+### Docker
+
+The image runs Raven as uid 10001 on unprivileged ports. Publish them as the standard ones:
+
+```bash
+docker build -t raven .
+docker run -d --name raven --restart unless-stopped \
+  -e RAVEN_HOSTNAME=mail.example.com \
+  -e RAVEN_TLS_CERT=/certs/fullchain.pem -e RAVEN_TLS_KEY=/certs/privkey.pem \
+  -e RAVEN_SMTPS_PORT=2465 -e RAVEN_IMAPS_PORT=2993 \
+  -v raven-data:/data -v /srv/raven/certs:/certs:ro \
+  -p 25:2525 -p 587:2587 -p 465:2465 -p 143:2143 -p 993:2993 \
+  raven
+```
+
+Copy the certificate to a place that user can read, for example from certbot's deploy hook:
+
+```bash
+sudo install -d -m 0700 -o 10001 /srv/raven/certs
+sudo install -m 0600 -o 10001 /etc/letsencrypt/live/mail.example.com/fullchain.pem \
+  /etc/letsencrypt/live/mail.example.com/privkey.pem /srv/raven/certs/
+docker restart raven
+```
+
+Manage tenants and accounts inside the container:
+
+```bash
+docker exec raven sh -c 'mkdir -p /data/tenants/acme/domains/example.com && echo "tenant acme example.com" >> /data/tenants/index.txt'
+docker restart raven    # the tenant index is read at startup
+docker exec -it raven sh -c 'echo "alice $(raven passwd)" >> /data/tenants/acme/domains/example.com/accounts.txt'
+```
+
 ## Data layout
 
 ```text
@@ -230,16 +320,19 @@ Mailboxes are standard Maildirs: delivery writes to `tmp/`, syncs, then renames 
 
 - `zig build test` runs the unit tests, including SMTP and IMAP session transcripts.
 - `zig build smoke` starts the real binary (plain and TLS), delivers a message over SMTP, and reads it back over IMAP.
+- `docker build --target smoke .` runs the smoke test against the Docker image.
 
 ## Architecture
 
 - `src/main.zig` wires configuration, startup, TLS, and shutdown.
 - `src/server.zig` handles SMTP sessions and inbound delivery.
-- `src/imap.zig` handles mailbox access and IMAP commands.
+- `src/imap.zig` handles mailbox access and IMAP commands; `src/imap_proto.zig` parses them and `src/mime.zig` reads message structure.
 - `src/storage.zig` manages the filesystem layout and message files.
 - `src/config.zig` loads CLI, environment, and config-file settings.
 - `src/conn.zig` runs the accept loop and gives each connection socket I/O with an idle timeout.
-- `src/tls.zig` wraps OpenSSL for server-side TLS on top of that socket I/O.
+- `src/tls.zig` wraps OpenSSL for TLS on top of that socket I/O.
+- `src/limits.zig` keeps the login lockout and per-address connection counts.
+- `src/queue.zig` delivers queued mail with retries and bounces, through `src/dns.zig` (MX lookup) and `src/smtp_client.zig`.
 - `src/dkim.zig` DKIM-signs mail leaving through the queue.
 - `src/address.zig` validates mail addresses before they reach the filesystem.
 - `src/tenant_index.zig`, `src/alias_index.zig`, and `src/account_index.zig` provide routing and identity lookup.

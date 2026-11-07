@@ -1,0 +1,7 @@
+# Only build.zig, build.zig.zon, src/ and scripts/smoke.py are needed; keep
+# local mail data and keys out of the build context.
+*
+!build.zig
+!build.zig.zon
+!src
+!scripts/smoke.py

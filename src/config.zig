@@ -34,7 +34,7 @@ pub const Config = struct {
         const arena = process.arena.allocator();
         const args = try parseArgs(process, arena);
 
-        const config_path = args.config_path orelse try getEnvValue(process, "RAVEN_CONFIG");
+        const config_path = args.config_path orelse try getEnvValue(process, arena, "RAVEN_CONFIG");
         var config = if (config_path) |path| try loadFile(process.io, arena, path) else Config{};
         config.config_path = config_path;
 
@@ -179,27 +179,28 @@ fn applyArgs(config: *Config, args: ArgsOptions) void {
 }
 
 fn applyEnv(config: *Config, process: std.process.Init, arena: std.mem.Allocator) !void {
-    if (try getEnvValue(process, "RAVEN_LISTEN_ADDRESS")) |value| config.listen_address = try arena.dupe(u8, value);
-    if (try getEnvValue(process, "RAVEN_LISTEN_PORT")) |value| config.listen_port = try parsePort(value);
-    if (try getEnvValue(process, "RAVEN_IMAP_PORT")) |value| config.imap_port = try parsePort(value);
-    if (try getEnvValue(process, "RAVEN_SMTPS_PORT")) |value| config.smtps_port = try parsePort(value);
-    if (try getEnvValue(process, "RAVEN_IMAPS_PORT")) |value| config.imaps_port = try parsePort(value);
-    if (try getEnvValue(process, "RAVEN_SUBMISSION_PORT")) |value| config.submission_port = try parsePort(value);
-    if (try getEnvValue(process, "RAVEN_RELAY_HOST")) |value| config.relay_host = try arena.dupe(u8, value);
-    if (try getEnvValue(process, "RAVEN_RELAY_PORT")) |value| config.relay_port = try parsePort(value);
-    if (try getEnvValue(process, "RAVEN_ALLOW_PLAINTEXT_AUTH")) |value| config.allow_plaintext_auth = try parseBool(value);
-    if (try getEnvValue(process, "RAVEN_LOG_LEVEL")) |value| config.log_level = try parseLogLevel(value);
-    if (try getEnvValue(process, "RAVEN_HOSTNAME")) |value| config.hostname = try arena.dupe(u8, value);
-    if (try getEnvValue(process, "RAVEN_DATA_DIR")) |value| config.data_dir = try arena.dupe(u8, value);
-    if (try getEnvValue(process, "RAVEN_TLS_CERT")) |value| config.tls_cert_file = try arena.dupe(u8, value);
-    if (try getEnvValue(process, "RAVEN_TLS_KEY")) |value| config.tls_key_file = try arena.dupe(u8, value);
-    if (try getEnvValue(process, "RAVEN_MAX_CONNECTIONS")) |value| config.max_connections = try std.fmt.parseInt(u32, value, 10);
-    if (try getEnvValue(process, "RAVEN_MAX_CONNECTIONS_PER_IP")) |value| config.max_connections_per_ip = try std.fmt.parseInt(u32, value, 10);
-    if (try getEnvValue(process, "RAVEN_MAX_MESSAGE_SIZE")) |value| config.max_message_size = try std.fmt.parseInt(u64, value, 10);
+    if (try getEnvValue(process, arena, "RAVEN_LISTEN_ADDRESS")) |value| config.listen_address = value;
+    if (try getEnvValue(process, arena, "RAVEN_LISTEN_PORT")) |value| config.listen_port = try parsePort(value);
+    if (try getEnvValue(process, arena, "RAVEN_IMAP_PORT")) |value| config.imap_port = try parsePort(value);
+    if (try getEnvValue(process, arena, "RAVEN_SMTPS_PORT")) |value| config.smtps_port = try parsePort(value);
+    if (try getEnvValue(process, arena, "RAVEN_IMAPS_PORT")) |value| config.imaps_port = try parsePort(value);
+    if (try getEnvValue(process, arena, "RAVEN_SUBMISSION_PORT")) |value| config.submission_port = try parsePort(value);
+    if (try getEnvValue(process, arena, "RAVEN_RELAY_HOST")) |value| config.relay_host = value;
+    if (try getEnvValue(process, arena, "RAVEN_RELAY_PORT")) |value| config.relay_port = try parsePort(value);
+    if (try getEnvValue(process, arena, "RAVEN_ALLOW_PLAINTEXT_AUTH")) |value| config.allow_plaintext_auth = try parseBool(value);
+    if (try getEnvValue(process, arena, "RAVEN_LOG_LEVEL")) |value| config.log_level = try parseLogLevel(value);
+    if (try getEnvValue(process, arena, "RAVEN_HOSTNAME")) |value| config.hostname = value;
+    if (try getEnvValue(process, arena, "RAVEN_DATA_DIR")) |value| config.data_dir = value;
+    if (try getEnvValue(process, arena, "RAVEN_TLS_CERT")) |value| config.tls_cert_file = value;
+    if (try getEnvValue(process, arena, "RAVEN_TLS_KEY")) |value| config.tls_key_file = value;
+    if (try getEnvValue(process, arena, "RAVEN_MAX_CONNECTIONS")) |value| config.max_connections = try std.fmt.parseInt(u32, value, 10);
+    if (try getEnvValue(process, arena, "RAVEN_MAX_CONNECTIONS_PER_IP")) |value| config.max_connections_per_ip = try std.fmt.parseInt(u32, value, 10);
+    if (try getEnvValue(process, arena, "RAVEN_MAX_MESSAGE_SIZE")) |value| config.max_message_size = try std.fmt.parseInt(u64, value, 10);
 }
 
-fn getEnvValue(process: std.process.Init, key: []const u8) !?[]const u8 {
-    return process.minimal.environ.getAlloc(process.gpa, key) catch |err| switch (err) {
+/// The value lives in `arena`, like the rest of the configuration.
+fn getEnvValue(process: std.process.Init, arena: std.mem.Allocator, key: []const u8) !?[]const u8 {
+    return process.minimal.environ.getAlloc(arena, key) catch |err| switch (err) {
         error.EnvironmentVariableMissing => null,
         else => return err,
     };
