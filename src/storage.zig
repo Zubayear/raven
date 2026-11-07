@@ -52,6 +52,42 @@ pub const Storage = struct {
         return id;
     }
 
+    pub fn readQueued(self: Storage, io: Io, arena: std.mem.Allocator, id: []const u8) ![]u8 {
+        const path = try std.fmt.allocPrint(arena, "{s}/queue/outbound/{s}.eml", .{ self.root_dir, id });
+        return Io.Dir.cwd().readFileAlloc(io, path, arena, .unlimited);
+    }
+
+    /// Replaces an entry's envelope atomically (remaining recipients, next
+    /// attempt).
+    pub fn rescheduleQueued(self: Storage, io: Io, allocator: std.mem.Allocator, entry: QueueEntry) !void {
+        const queue_path = try self.queuePath(allocator);
+        defer allocator.free(queue_path);
+        var queue = try Io.Dir.cwd().openDir(io, queue_path, .{});
+        defer queue.close(io);
+        var envelope: Io.Writer.Allocating = .init(allocator);
+        defer envelope.deinit();
+        try entry.write(&envelope.writer);
+        var tmp_buf: [std.fs.max_name_bytes]u8 = undefined;
+        var name_buf: [std.fs.max_name_bytes]u8 = undefined;
+        const tmp_name = try std.fmt.bufPrint(&tmp_buf, "{s}.env.tmp", .{entry.id});
+        queue.deleteFile(io, tmp_name) catch {};
+        try writeSynced(io, queue, tmp_name, &.{envelope.written()});
+        try queue.rename(tmp_name, queue, try std.fmt.bufPrint(&name_buf, "{s}.env", .{entry.id}), io);
+    }
+
+    /// Removes a finished entry: the envelope first, so a crash in between
+    /// leaves only an unlisted message file behind, never a half entry.
+    pub fn removeQueued(self: Storage, io: Io, allocator: std.mem.Allocator, id: []const u8) !void {
+        for ([_][]const u8{ ".env", ".eml" }) |extension| {
+            const path = try std.fmt.allocPrint(allocator, "{s}/queue/outbound/{s}{s}", .{ self.root_dir, id, extension });
+            defer allocator.free(path);
+            Io.Dir.cwd().deleteFile(io, path) catch |err| switch (err) {
+                error.FileNotFound => {},
+                else => return err,
+            };
+        }
+    }
+
     /// Queued entries, oldest first; strings live in `arena`.
     pub fn listQueue(self: Storage, io: Io, arena: std.mem.Allocator) ![]QueueEntry {
         const queue_path = try self.queuePath(arena);

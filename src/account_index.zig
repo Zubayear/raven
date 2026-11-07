@@ -7,6 +7,7 @@ const argon2 = std.crypto.pwhash.argon2;
 const Storage = @import("storage.zig").Storage;
 const TenantCatalog = @import("tenant_index.zig").TenantCatalog;
 const address = @import("address.zig");
+const AliasTable = @import("alias_index.zig").AliasTable;
 
 /// OWASP's recommendation for argon2id (19 MiB, 2 passes). Each login holds
 /// that much memory while it verifies.
@@ -84,6 +85,20 @@ fn decodeBase64Payload(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 
         return buf;
     }
     return error.AuthFailed;
+}
+
+/// Maps a recipient address to a local mailbox: the domain must be hosted
+/// and the user an account, directly or through an alias. `+tag` is ignored.
+pub fn resolveMailbox(allocator: std.mem.Allocator, io: Io, storage: Storage, catalog: *const TenantCatalog, addr: address.Address) !Identity {
+    const hosted = catalog.find(addr.domain) orelse return error.NotHosted;
+
+    var aliases = try AliasTable.load(allocator, io, storage, hosted.tenant, hosted.domain);
+    defer aliases.deinit(allocator);
+    var accounts = try AccountStore.load(allocator, io, storage, hosted.tenant, hosted.domain);
+    defer accounts.deinit(allocator);
+
+    const account = accounts.find(aliases.find(addr.user) orelse addr.user) orelse return error.UnknownUser;
+    return Identity.init(allocator, hosted.tenant, hosted.domain, account.user);
 }
 
 /// Returns an argon2id PHC string for `password`; the caller owns it.

@@ -9,6 +9,8 @@ const Server = @import("server.zig").Server;
 const Storage = @import("storage.zig").Storage;
 const TenantCatalog = @import("tenant_index.zig").TenantCatalog;
 const TlsServer = @import("tls.zig").TlsServer;
+const TlsClient = @import("tls.zig").TlsClient;
+const queue = @import("queue.zig");
 
 pub fn main(process: std.process.Init) !void {
     const io = process.io;
@@ -88,9 +90,23 @@ pub fn main(process: std.process.Init) !void {
     imaps_options.implicit_tls = true;
     var imaps_task = if (imaps_listener) |*listener| try io.concurrent(conn.Listener(ImapServer).serve, .{ io, listener, &imap, imaps_options }) else null;
 
+    // Outbound delivery uses STARTTLS opportunistically whenever offered.
+    var tls_client = try TlsClient.init();
+    defer tls_client.deinit();
+    var runner: queue.Runner = .{
+        .allocator = allocator,
+        .storage = storage,
+        .catalog = &tenant_catalog,
+        .hostname = config.hostname,
+        .tls = &tls_client,
+        .relay = if (config.relay_host.len != 0) .{ .host = config.relay_host, .port = config.relay_port } else null,
+    };
+    var queue_task = try io.concurrent(queue.Runner.run, .{ &runner, io });
+
     var sig: c_int = 0;
     _ = std.c.sigwait(&signal_set, &sig);
     std.debug.print("shutdown requested by signal {d}\n", .{sig});
+    queue_task.cancel(io);
     smtp_task.cancel(io);
     if (smtps_task) |*task| task.cancel(io);
     if (submission_task) |*task| task.cancel(io);
@@ -154,6 +170,7 @@ test {
     _ = @import("imap.zig");
     _ = @import("imap_proto.zig");
     _ = @import("mime.zig");
+    _ = @import("queue.zig");
     _ = @import("server.zig");
     _ = @import("smtp_client.zig");
     _ = @import("storage.zig");

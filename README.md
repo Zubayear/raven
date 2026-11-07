@@ -15,6 +15,7 @@ It currently provides SMTP, IMAP, filesystem-backed storage, tenant-aware routin
 - Multi-tenant routing: only hosted domains and known users are accepted (no open relay), with aliases and `user+tag` plus-addressing
 - Accounts with argon2id password hashes (`raven passwd`)
 - TLS via OpenSSL: `STARTTLS` for SMTP and IMAP, implicit-TLS SMTPS/IMAPS; passwords only over TLS
+- Outbound delivery for authenticated users: durable queue, MX lookup, opportunistic STARTTLS, retries with backoff for 5 days, DSN bounces
 - Concurrent sessions with idle timeouts (SMTP 5 min, IMAP 30 min) and a connection cap
 - Graceful shutdown on signal
 
@@ -113,6 +114,7 @@ Common options:
 - `--smtps-port` (implicit-TLS SMTP; off by default)
 - `--imaps-port` (implicit-TLS IMAP; off by default)
 - `--submission-port` (mail submission, RFC 6409; AUTH required; off by default)
+- `--relay-host`, `--relay-port` (send outbound mail through a smarthost instead of MX lookup)
 - `--allow-plaintext-auth` (testing only)
 
 Environment variables use the `RAVEN_` prefix:
@@ -130,6 +132,7 @@ Environment variables use the `RAVEN_` prefix:
 - `RAVEN_SMTPS_PORT`
 - `RAVEN_IMAPS_PORT`
 - `RAVEN_SUBMISSION_PORT`
+- `RAVEN_RELAY_HOST`, `RAVEN_RELAY_PORT`
 - `RAVEN_ALLOW_PLAINTEXT_AUTH`
 
 Example config file:
