@@ -169,8 +169,8 @@ test "tenant catalog loads from filesystem" {
     try tmp.dir.writeFile(std.testing.io, .{
         .sub_path = "tenants/index.txt",
         .data =
-            \\tenant acme example.com
-            \\tenant beta beta.com
+        \\tenant acme example.com
+        \\tenant beta beta.com
         ,
     });
 
