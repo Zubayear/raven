@@ -5,6 +5,8 @@ const Config = @import("config.zig").Config;
 const AccountStore = @import("account_index.zig").AccountStore;
 const address = @import("address.zig");
 const Storage = @import("storage.zig").Storage;
+const Message = @import("storage.zig").Message;
+const MessageFlags = @import("storage.zig").MessageFlags;
 const TenantCatalog = @import("tenant_index.zig").TenantCatalog;
 
 pub const ImapServer = struct {
@@ -175,14 +177,13 @@ pub const ImapServer = struct {
                 const flags_text = try message.flags.format(self.allocator);
                 defer self.allocator.free(flags_text);
 
-                const data = try self.storage.readMailboxMessage(
-                    fs_io,
-                    self.allocator,
-                    session.tenant.?,
-                    session.domain.?,
-                    session.user.?,
-                    message.name,
-                );
+                const data = Storage.readMessage(fs_io, self.allocator, message) catch |err| switch (err) {
+                    error.FileNotFound => {
+                        try taggedNo(w, tag, "message no longer available");
+                        continue;
+                    },
+                    else => return err,
+                };
                 defer self.allocator.free(data);
 
                 try w.print("* {d} FETCH (FLAGS {s} BODY[] {{{d}}}\r\n", .{ number, flags_text, data.len });
@@ -231,19 +232,14 @@ pub const ImapServer = struct {
                     continue;
                 }
 
-                const added = parseFlagsList(flags_text);
-                var message = &session.messages.items[number - 1];
-                message.flags = message.flags.merge(added);
-
-                try self.storage.writeMailboxFlags(
-                    fs_io,
-                    self.allocator,
-                    session.tenant.?,
-                    session.domain.?,
-                    session.user.?,
-                    message.name,
-                    message.flags,
-                );
+                const message = &session.messages.items[number - 1];
+                Storage.setFlags(fs_io, self.allocator, message, message.flags.merge(parseFlagsList(flags_text))) catch |err| switch (err) {
+                    error.FileNotFound => {
+                        try taggedNo(w, tag, "message no longer available");
+                        continue;
+                    },
+                    else => return err,
+                };
 
                 try taggedOk(w, tag, "STORE completed");
                 continue;
@@ -265,14 +261,7 @@ pub const ImapServer = struct {
                     const idx = i - 1;
                     if (!session.messages.items[idx].flags.deleted) continue;
 
-                    try self.storage.deleteMailboxMessage(
-                        fs_io,
-                        self.allocator,
-                        session.tenant.?,
-                        session.domain.?,
-                        session.user.?,
-                        session.messages.items[idx].name,
-                    );
+                    try Storage.deleteMessage(fs_io, session.messages.items[idx]);
 
                     try w.print("* {d} EXPUNGE\r\n", .{idx + 1});
                     session.removeMessage(idx, self.allocator);
@@ -290,7 +279,7 @@ const Session = struct {
     tenant: ?[]u8 = null,
     domain: ?[]u8 = null,
     user: ?[]u8 = null,
-    messages: std.ArrayList(Storage.MailboxMessage) = .empty,
+    messages: std.ArrayList(Message) = .empty,
 
     fn isAuthenticated(self: Session) bool {
         return self.tenant != null and self.domain != null and self.user != null;
@@ -306,28 +295,23 @@ const Session = struct {
 
     fn loadMailbox(self: *Session, allocator: std.mem.Allocator, fs_io: Io, storage: Storage) !void {
         self.clearSelected(allocator);
-        self.messages = .fromOwnedSlice(try storage.listMailboxMessages(fs_io, allocator, self.tenant.?, self.domain.?, self.user.?));
+        self.messages = .fromOwnedSlice(try storage.listMailbox(fs_io, allocator, self.tenant.?, self.domain.?, self.user.?));
     }
 
     fn supportedFlags(self: Session, allocator: std.mem.Allocator) ![]u8 {
         _ = self;
-        const flags = Storage.MessageFlags{};
+        const flags = MessageFlags{};
         return flags.format(allocator);
     }
 
     fn clearSelected(self: *Session, allocator: std.mem.Allocator) void {
-        for (self.messages.items) |message| {
-            allocator.free(message.name);
-            allocator.free(message.path);
-        }
+        for (self.messages.items) |message| allocator.free(message.path);
         self.messages.deinit(allocator);
         self.messages = .empty;
     }
 
     fn removeMessage(self: *Session, index: usize, allocator: std.mem.Allocator) void {
-        const removed = self.messages.orderedRemove(index);
-        allocator.free(removed.name);
-        allocator.free(removed.path);
+        allocator.free(self.messages.orderedRemove(index).path);
     }
 
     fn clearIdentity(self: *Session, allocator: std.mem.Allocator) void {
@@ -369,8 +353,8 @@ fn freeLoginIdentity(allocator: std.mem.Allocator, identity: LoginIdentity) void
     allocator.free(identity.user);
 }
 
-fn parseFlagsList(raw: []const u8) Storage.MessageFlags {
-    var flags = Storage.MessageFlags{};
+fn parseFlagsList(raw: []const u8) MessageFlags {
+    var flags = MessageFlags{};
     const trimmed = std.mem.trim(u8, raw, " \t");
     const inner = if (trimmed.len >= 2 and trimmed[0] == '(' and trimmed[trimmed.len - 1] == ')') trimmed[1 .. trimmed.len - 1] else trimmed;
 
@@ -463,15 +447,15 @@ test "parseFlagsList reads standard flags" {
 test "session removeMessage compacts mailbox" {
     const allocator = std.testing.allocator;
     var session = Session{};
-    try session.messages.append(allocator, .{ .name = try allocator.dupe(u8, "1.eml"), .path = try allocator.dupe(u8, "p1"), .size = 1, .sequence = 1, .flags = .{} });
-    try session.messages.append(allocator, .{ .name = try allocator.dupe(u8, "2.eml"), .path = try allocator.dupe(u8, "p2"), .size = 1, .sequence = 2, .flags = .{ .deleted = true } });
-    try session.messages.append(allocator, .{ .name = try allocator.dupe(u8, "3.eml"), .path = try allocator.dupe(u8, "p3"), .size = 1, .sequence = 3, .flags = .{} });
+    try session.messages.append(allocator, .{ .path = try allocator.dupe(u8, "cur/1:2,"), .size = 1, .flags = .{} });
+    try session.messages.append(allocator, .{ .path = try allocator.dupe(u8, "cur/2:2,T"), .size = 1, .flags = .{ .deleted = true } });
+    try session.messages.append(allocator, .{ .path = try allocator.dupe(u8, "cur/3:2,"), .size = 1, .flags = .{} });
 
     session.removeMessage(1, allocator);
 
     try std.testing.expectEqual(@as(usize, 2), session.messages.items.len);
-    try std.testing.expectEqualStrings("1.eml", session.messages.items[0].name);
-    try std.testing.expectEqualStrings("3.eml", session.messages.items[1].name);
+    try std.testing.expectEqualStrings("cur/1:2,", session.messages.items[0].path);
+    try std.testing.expectEqualStrings("cur/3:2,", session.messages.items[1].path);
 
     session.clearSelected(allocator);
 }

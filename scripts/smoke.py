@@ -2,6 +2,7 @@
 """End-to-end smoke test against a real raven binary. Run with `zig build smoke`."""
 import hashlib
 import imaplib
+import mailbox
 import os
 import smtplib
 import socket
@@ -74,14 +75,14 @@ def setup_accounts(root):
     (domain / "accounts.txt").write_text(f"alice {hashlib.sha256(b'secret').hexdigest()}\n")
 
 
-def check_delivery(smtp, imap_sock):
-    smtp.sendmail("bob@external.test", ["alice@example.com"], "Subject: smoke\r\n\r\nhello raven\r\n")
+def check_delivery(smtp, imap_sock, expected=1):
+    smtp.sendmail("bob@external.test", ["alice@example.com"], f"Subject: smoke {expected}\r\n\r\nhello raven\r\n")
     smtp.quit()
 
     imap = Imap(imap_sock)
     imap.cmd("LOGIN alice@example.com secret")
-    assert b"* 1 EXISTS" in imap.cmd("SELECT INBOX")
-    assert b"hello raven" in imap.cmd("FETCH 1 BODY[]")
+    assert b"* %d EXISTS" % expected in imap.cmd("SELECT INBOX")
+    assert b"Subject: smoke %d" % expected in imap.cmd("FETCH %d BODY[]" % expected)
     imap.cmd("LOGOUT")
 
 
@@ -98,6 +99,18 @@ def main():
                            socket.create_connection((HOST, IMAP_PORT), timeout=5))
             for s in idle:
                 s.close()
+
+        with Raven(data):  # delivery after a restart must not collide with existing files (#6)
+            check_delivery(smtplib.SMTP(HOST, SMTP_PORT, timeout=5),
+                           socket.create_connection((HOST, IMAP_PORT), timeout=5), expected=2)
+            imap = Imap(socket.create_connection((HOST, IMAP_PORT), timeout=5))
+            imap.cmd("LOGIN alice@example.com secret")
+            imap.cmd("SELECT INBOX")
+            imap.cmd("STORE 1 +FLAGS (\\Seen)")
+            imap.cmd("LOGOUT")
+        # Any standard Maildir reader must see both messages and the flag.
+        maildir = mailbox.Maildir(data / "tenants/acme/domains/example.com/users/alice/Maildir", create=False)
+        assert sorted(m.get_flags() for m in maildir) == ["", "S"], [m.get_flags() for m in maildir]
 
         with Raven(tmp / "busy", "--max-connections", "1"):
             # The readiness probe's session may still hold the only slot briefly.

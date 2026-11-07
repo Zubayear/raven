@@ -11,7 +11,7 @@ It currently provides SMTP, IMAP, filesystem-backed storage, tenant-aware routin
 
 - SMTP listener with inbound delivery
 - IMAP listener with mailbox access
-- Filesystem-backed mail storage
+- Maildir storage: atomic delivery, flags in file names, safe across restarts
 - Tenant/domain routing and alias lookup
 - Account authentication from local storage
 - Optional TLS via OpenSSL
@@ -120,6 +120,17 @@ tls_cert_file = cert.pem
 tls_key_file = key.pem
 max_connections = 100
 ```
+
+## Data layout
+
+```text
+data/tenants/index.txt                                  tenant <name> <domain>...
+data/tenants/<tenant>/domains/<domain>/accounts.txt     <user> <password hash>
+data/tenants/<tenant>/domains/<domain>/aliases.txt      <alias> <user>
+data/tenants/<tenant>/domains/<domain>/users/<user>/Maildir/{tmp,new,cur}
+```
+
+Mailboxes are standard Maildirs: delivery writes to `tmp/`, syncs, then renames into `new/`; IMAP moves mail to `cur/` and stores flags in the file name (`:2,FS`), so tools like mutt can read them directly.
 
 ## Testing
 
