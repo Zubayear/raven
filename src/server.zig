@@ -152,7 +152,7 @@ pub const Server = struct {
                     try w.writeAll("501 5.0.0 authentication canceled\r\n");
                     continue;
                 }
-                auth_identity = completeAuthPlain(allocator, fs_io, self.storage, catalog, response) catch |err| switch (err) {
+                auth_identity = account_index.authenticatePlain(allocator, fs_io, self.storage, catalog, response) catch |err| switch (err) {
                     error.AuthFailed => {
                         try w.writeAll("535 5.7.8 authentication failed\r\n");
                         continue;
@@ -466,39 +466,6 @@ fn readData(allocator: std.mem.Allocator, r: *Io.Reader, max_size: u64) !?Data {
     return .{ .message = try message.toOwnedSlice(allocator) };
 }
 
-/// RFC 4616 PLAIN: base64("authzid\0authcid\0password").
-fn completeAuthPlain(allocator: std.mem.Allocator, io: Io, storage: Storage, catalog: *const TenantCatalog, encoded: []const u8) !Identity {
-    const decoded = try decodeBase64Payload(allocator, std.mem.trim(u8, encoded, " \t"));
-    defer allocator.free(decoded);
-
-    var fields = std.mem.splitScalar(u8, decoded, 0);
-    const authzid = fields.next() orelse return error.AuthFailed;
-    const login = fields.next() orelse return error.AuthFailed;
-    const password = fields.next() orelse return error.AuthFailed;
-    if (fields.next() != null or password.len == 0) return error.AuthFailed;
-    // Acting as another user is not supported.
-    if (authzid.len != 0 and !std.ascii.eqlIgnoreCase(authzid, login)) return error.AuthFailed;
-
-    return account_index.authenticate(allocator, io, storage, catalog, login, password);
-}
-
-fn decodeBase64Payload(allocator: std.mem.Allocator, encoded: []const u8) ![]u8 {
-    const clean = std.mem.trim(u8, encoded, " \t");
-    const codecs = [_]std.base64.Codecs{ std.base64.standard, std.base64.standard_no_pad };
-
-    for (codecs) |codec| {
-        const decoder = &codec.Decoder;
-        const size = decoder.calcSizeForSlice(clean) catch continue;
-        const buf = try allocator.alloc(u8, size);
-        decoder.decode(buf, clean) catch {
-            allocator.free(buf);
-            continue;
-        };
-        return buf;
-    }
-    return error.AuthFailed;
-}
-
 /// Maps a recipient address to a local mailbox: the domain must be hosted
 /// and the user an account, directly or through an alias. `+tag` is ignored.
 fn resolveRecipient(allocator: std.mem.Allocator, io: Io, storage: Storage, catalog: *const TenantCatalog, addr: address.Address) !Identity {
@@ -583,7 +550,7 @@ test "resolveRecipient maps aliases, plus tags and case to the canonical account
     try std.testing.expectError(error.NotHosted, resolveRecipient(allocator, std.testing.io, storage, &dir.catalog, try address.parse("<alice@other.com>")));
 }
 
-test "completeAuthPlain authenticates and refuses impersonation" {
+test "authenticatePlain authenticates and refuses impersonation" {
     const allocator = std.testing.allocator;
     var dir = try TestDir.init(allocator);
     defer dir.deinit(allocator);
@@ -591,7 +558,7 @@ test "completeAuthPlain authenticates and refuses impersonation" {
 
     const payload = try buildPlainAuthPayload(allocator, "", "alice@example.com", "secret");
     defer allocator.free(payload);
-    const identity = try completeAuthPlain(allocator, std.testing.io, storage, &dir.catalog, payload);
+    const identity = try account_index.authenticatePlain(allocator, std.testing.io, storage, &dir.catalog, payload);
     defer identity.deinit(allocator);
     try std.testing.expectEqualStrings("alice", identity.user);
 
@@ -601,7 +568,7 @@ test "completeAuthPlain authenticates and refuses impersonation" {
     }) |attempt| {
         const bad = try buildPlainAuthPayload(allocator, attempt[0], attempt[1], attempt[2]);
         defer allocator.free(bad);
-        try std.testing.expectError(error.AuthFailed, completeAuthPlain(allocator, std.testing.io, storage, &dir.catalog, bad));
+        try std.testing.expectError(error.AuthFailed, account_index.authenticatePlain(allocator, std.testing.io, storage, &dir.catalog, bad));
     }
 }
 

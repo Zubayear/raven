@@ -43,7 +43,7 @@ pub fn main(process: std.process.Init) !void {
 
     var smtp_listener = try smtp.listen(io, config.listen_port);
     defer smtp_listener.deinit(io);
-    var imap_listener = try imap.listen(io);
+    var imap_listener = try imap.listen(io, config.imap_port);
     defer imap_listener.deinit(io);
 
     // Block only SIGINT/SIGTERM for sigwait; std.Io cancelation interrupts
@@ -66,16 +66,19 @@ pub fn main(process: std.process.Init) !void {
     var smtps_options = smtp_options;
     smtps_options.implicit_tls = true;
     var smtps_task = if (smtps_listener) |*listener| try io.concurrent(conn.Listener(Server).serve, .{ io, listener, &smtp, smtps_options }) else null;
-    var imap_task = try io.concurrent(conn.Listener(ImapServer).serve, .{
-        io, &imap_listener, &imap,
-        .{
-            .max_connections = config.max_connections,
-            .idle_timeout = .fromSeconds(30 * 60), // RFC 3501 §5.4 autologout
-            .busy_reply = "* BYE too many connections, try again later\r\n",
-            .tls = tls,
-            .implicit_tls = tls != null, // until IMAP STARTTLS (#19)
-        },
-    });
+    const imap_options: conn.Options = .{
+        .max_connections = config.max_connections,
+        .idle_timeout = .fromSeconds(30 * 60), // RFC 3501 §5.4 autologout
+        .busy_reply = "* BYE too many connections, try again later\r\n",
+        .tls = tls, // offered through STARTTLS
+    };
+    var imap_task = try io.concurrent(conn.Listener(ImapServer).serve, .{ io, &imap_listener, &imap, imap_options });
+
+    var imaps_listener: ?std.Io.net.Server = if (config.imaps_port != 0) try imap.listen(io, config.imaps_port) else null;
+    defer if (imaps_listener) |*listener| listener.deinit(io);
+    var imaps_options = imap_options;
+    imaps_options.implicit_tls = true;
+    var imaps_task = if (imaps_listener) |*listener| try io.concurrent(conn.Listener(ImapServer).serve, .{ io, listener, &imap, imaps_options }) else null;
 
     var sig: c_int = 0;
     _ = std.c.sigwait(&signal_set, &sig);
@@ -83,6 +86,7 @@ pub fn main(process: std.process.Init) !void {
     smtp_task.cancel(io);
     if (smtps_task) |*task| task.cancel(io);
     imap_task.cancel(io);
+    if (imaps_task) |*task| task.cancel(io);
 }
 
 /// `raven passwd`: reads a password from stdin and prints its argon2id hash,
