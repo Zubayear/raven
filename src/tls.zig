@@ -113,8 +113,12 @@ fn drain(w: *Io.Writer, data: []const []const u8, splat: usize) Io.Writer.Error!
 
 fn bioRead(bio: ?*c.BIO, buf: [*c]u8, len: usize, read_len: [*c]usize) callconv(.c) c_int {
     const socket: *Socket = @ptrCast(@alignCast(c.BIO_get_data(bio)));
+    c.BIO_clear_retry_flags(bio);
     const n = socket.read(buf[0..len]) catch |err| {
         socket.err = err;
+        // A timeout is retryable (IMAP IDLE polls with short timeouts);
+        // without the retry flag OpenSSL would treat it as a dead peer.
+        if (err == error.Timeout) c.BIO_set_retry_read(bio);
         return 0;
     };
     read_len.* = n;
