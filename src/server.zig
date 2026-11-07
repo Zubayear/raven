@@ -10,6 +10,7 @@ const AliasTable = @import("alias_index.zig").AliasTable;
 const Storage = @import("storage.zig").Storage;
 const TenantCatalog = @import("tenant_index.zig").TenantCatalog;
 const TenantIndex = @import("tenant_index.zig");
+const conn = @import("conn.zig");
 
 pub const Server = struct {
     allocator: std.mem.Allocator,
@@ -26,15 +27,23 @@ pub const Server = struct {
         };
     }
 
-    pub fn listen(self: *Server, io: Io) !std.Io.net.Server {
-        const ip = try std.Io.net.IpAddress.parse(self.config.listen_address, self.config.listen_port);
+    /// Passwords only travel encrypted, unless the operator opted out.
+    fn authAllowed(self: *const Server, client: *const conn.Client) bool {
+        return client.secure or self.config.allow_plaintext_auth;
+    }
+
+    pub fn listen(self: *Server, io: Io, port: u16) !std.Io.net.Server {
+        const ip = try std.Io.net.IpAddress.parse(self.config.listen_address, port);
         const listener = try ip.listen(io, .{ .reuse_address = true });
         std.debug.print("smtp listening on {any}\n", .{ip});
         return listener;
     }
 
-    pub fn handleClient(self: *Server, fs_io: Io, r: *Io.Reader, w: *Io.Writer) !void {
+    pub fn handleClient(self: *Server, fs_io: Io, client: *conn.Client) !void {
         const allocator = self.allocator;
+        // Both change when STARTTLS upgrades the connection.
+        var r = client.reader;
+        var w = client.writer;
         const catalog = self.tenant_catalog;
         try w.print("220 {s} ESMTP raven ready\r\n", .{self.config.hostname});
 
@@ -80,11 +89,37 @@ pub const Server = struct {
                 if (std.ascii.eqlIgnoreCase(verb, "HELO")) {
                     try w.print("250 {s}\r\n", .{self.config.hostname});
                 } else {
-                    try w.print("250-{s}\r\n250-PIPELINING\r\n250-SIZE {d}\r\n250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n250 AUTH PLAIN\r\n", .{ self.config.hostname, self.config.max_message_size });
+                    try w.print("250-{s}\r\n250-PIPELINING\r\n250-SIZE {d}\r\n250-8BITMIME\r\n", .{ self.config.hostname, self.config.max_message_size });
+                    if (client.canStartTls()) try w.writeAll("250-STARTTLS\r\n");
+                    if (self.authAllowed(client)) try w.writeAll("250-AUTH PLAIN\r\n");
+                    try w.writeAll("250 ENHANCEDSTATUSCODES\r\n");
                 }
+            } else if (std.ascii.eqlIgnoreCase(verb, "STARTTLS")) {
+                if (args.len != 0) {
+                    try w.writeAll("501 5.5.4 syntax: STARTTLS\r\n");
+                    continue;
+                }
+                if (!client.canStartTls()) {
+                    try w.writeAll(if (client.secure) "503 5.5.1 TLS already active\r\n" else "454 4.7.0 TLS not available\r\n");
+                    continue;
+                }
+                try w.writeAll("220 2.0.0 ready to start TLS\r\n");
+                // A failed handshake leaves the stream in an unknown state: hang up.
+                try client.startTls();
+                r = client.reader;
+                w = client.writer;
+                // RFC 3207 §4.2: forget everything learned before the upgrade.
+                greeted = false;
+                tx.reset(allocator);
+                if (auth_identity) |value| value.deinit(allocator);
+                auth_identity = null;
             } else if (!greeted and isTransactionVerb(verb)) {
                 try w.writeAll("503 5.5.1 send EHLO first\r\n");
             } else if (std.ascii.eqlIgnoreCase(verb, "AUTH")) {
+                if (!self.authAllowed(client)) {
+                    try w.writeAll("538 5.7.11 encryption required for authentication\r\n");
+                    continue;
+                }
                 if (auth_identity != null) {
                     try w.writeAll("503 5.5.1 already authenticated\r\n");
                     continue;
@@ -444,16 +479,18 @@ const TestDir = struct {
     }
 
     /// Runs one SMTP session and returns the transcript; the caller frees it.
+    /// Runs a session as if over TLS, so AUTH is available.
     fn session(self: *TestDir, allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-        return self.sessionWith(allocator, .{ .data_dir = self.root }, input);
+        return self.sessionWith(allocator, .{ .data_dir = self.root }, true, input);
     }
 
-    fn sessionWith(self: *TestDir, allocator: std.mem.Allocator, config: Config, input: []const u8) ![]u8 {
+    fn sessionWith(self: *TestDir, allocator: std.mem.Allocator, config: Config, secure: bool, input: []const u8) ![]u8 {
         var server = Server.init(allocator, config, &self.catalog);
         var in: Io.Reader = .fixed(input);
         var out: Io.Writer.Allocating = .init(allocator);
         defer out.deinit();
-        try server.handleClient(std.testing.io, &in, &out.writer);
+        var client: conn.Client = .{ .reader = &in, .writer = &out.writer, .secure = secure };
+        try server.handleClient(std.testing.io, &client);
         return out.toOwnedSlice();
     }
 
@@ -510,7 +547,7 @@ fn buildPlainAuthPayload(allocator: std.mem.Allocator, authzid: []const u8, logi
 }
 
 const greeting = "220 localhost ESMTP raven ready\r\n";
-const ehlo_reply = "250-localhost\r\n250-PIPELINING\r\n250-SIZE 26214400\r\n250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n250 AUTH PLAIN\r\n";
+const ehlo_reply = "250-localhost\r\n250-PIPELINING\r\n250-SIZE 26214400\r\n250-8BITMIME\r\n250-AUTH PLAIN\r\n250 ENHANCEDSTATUSCODES\r\n";
 
 test "smtp session delivers a pipelined transaction" {
     const allocator = std.testing.allocator;
@@ -569,13 +606,13 @@ test "smtp session enforces size and line limits" {
 
     const long_command = "NOOP " ++ @as([600]u8, @splat('x')) ++ "\r\n";
     const long_text = @as([999]u8, @splat('y')) ++ "\r\n";
-    const transcript = try dir.sessionWith(allocator, .{ .data_dir = dir.root, .max_message_size = 64 }, "EHLO client\r\n" ++ long_command ++
+    const transcript = try dir.sessionWith(allocator, .{ .data_dir = dir.root, .max_message_size = 64 }, true, "EHLO client\r\n" ++ long_command ++
         "MAIL FROM:<bob@external.test> SIZE=65\r\n" ++
         "MAIL FROM:<bob@external.test>\r\nRCPT TO:<alice@example.com>\r\nDATA\r\n" ++ @as([70]u8, @splat('z')) ++ "\r\n.\r\n" ++
         "MAIL FROM:<bob@external.test>\r\nRCPT TO:<alice@example.com>\r\nDATA\r\n" ++ long_text ++ ".\r\nQUIT\r\n");
     defer allocator.free(transcript);
     try std.testing.expectEqualStrings(greeting ++
-        "250-localhost\r\n250-PIPELINING\r\n250-SIZE 64\r\n250-8BITMIME\r\n250-ENHANCEDSTATUSCODES\r\n250 AUTH PLAIN\r\n" ++
+        "250-localhost\r\n250-PIPELINING\r\n250-SIZE 64\r\n250-8BITMIME\r\n250-AUTH PLAIN\r\n250 ENHANCEDSTATUSCODES\r\n" ++
         "500 5.5.2 line too long\r\n552 5.3.4 message size exceeds limit\r\n" ++
         "250 2.1.0 ok\r\n250 2.1.5 ok\r\n354 end data with <CR><LF>.<CR><LF>\r\n552 5.3.4 message size exceeds limit\r\n" ++
         "250 2.1.0 ok\r\n250 2.1.5 ok\r\n354 end data with <CR><LF>.<CR><LF>\r\n500 5.5.2 line too long\r\n221 2.0.0 bye\r\n", transcript);
@@ -634,6 +671,21 @@ test "smtp session enforces relay, recipient and sender rules" {
         "530 5.7.0 authentication required\r\n250 2.1.0 ok\r\n550 5.7.1 relaying denied\r\n550 5.1.1 user unknown\r\n250 2.0.0 ok\r\n" ++
         "235 2.7.0 authentication successful\r\n503 5.5.1 already authenticated\r\n553 5.7.1 sender not authorized\r\n" ++
         "250 2.1.0 ok\r\n221 2.0.0 bye\r\n", transcript);
+}
+
+test "smtp session refuses AUTH over plaintext unless allowed" {
+    const allocator = std.testing.allocator;
+    var dir = try TestDir.init(allocator);
+    defer dir.deinit(allocator);
+
+    const plain = try dir.sessionWith(allocator, .{ .data_dir = dir.root }, false, "EHLO client\r\nAUTH PLAIN\r\nSTARTTLS\r\nQUIT\r\n");
+    defer allocator.free(plain);
+    try std.testing.expectEqualStrings(greeting ++ "250-localhost\r\n250-PIPELINING\r\n250-SIZE 26214400\r\n250-8BITMIME\r\n250 ENHANCEDSTATUSCODES\r\n" ++
+        "538 5.7.11 encryption required for authentication\r\n454 4.7.0 TLS not available\r\n221 2.0.0 bye\r\n", plain);
+
+    const opted_out = try dir.sessionWith(allocator, .{ .data_dir = dir.root, .allow_plaintext_auth = true }, false, "EHLO client\r\nAUTH PLAIN\r\n*\r\nQUIT\r\n");
+    defer allocator.free(opted_out);
+    try std.testing.expectEqualStrings(greeting ++ ehlo_reply ++ "334 \r\n501 5.0.0 authentication canceled\r\n221 2.0.0 bye\r\n", opted_out);
 }
 
 test "smtp session handles AUTH continuation and cancel" {

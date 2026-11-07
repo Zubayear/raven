@@ -32,7 +32,7 @@ pub fn main(process: std.process.Init) !void {
     }
     const tls: ?*TlsServer = if (tls_server) |*value| value else null;
 
-    var smtp_listener = try smtp.listen(io);
+    var smtp_listener = try smtp.listen(io, config.listen_port);
     defer smtp_listener.deinit(io);
     var imap_listener = try imap.listen(io);
     defer imap_listener.deinit(io);
@@ -44,15 +44,19 @@ pub fn main(process: std.process.Init) !void {
     std.posix.sigaddset(&signal_set, .TERM);
     std.posix.sigprocmask(std.posix.SIG.BLOCK, &signal_set, null);
 
-    var smtp_task = try io.concurrent(conn.Listener(Server).serve, .{
-        io, &smtp_listener, &smtp,
-        .{
-            .max_connections = config.max_connections,
-            .idle_timeout = .fromSeconds(5 * 60), // RFC 5321 §4.5.3.2.7
-            .busy_reply = "421 4.7.0 too many connections, try again later\r\n",
-            .tls = tls,
-        },
-    });
+    const smtp_options: conn.Options = .{
+        .max_connections = config.max_connections,
+        .idle_timeout = .fromSeconds(5 * 60), // RFC 5321 §4.5.3.2.7
+        .busy_reply = "421 4.7.0 too many connections, try again later\r\n",
+        .tls = tls, // offered through STARTTLS
+    };
+    var smtp_task = try io.concurrent(conn.Listener(Server).serve, .{ io, &smtp_listener, &smtp, smtp_options });
+
+    var smtps_listener: ?std.Io.net.Server = if (config.smtps_port != 0) try smtp.listen(io, config.smtps_port) else null;
+    defer if (smtps_listener) |*listener| listener.deinit(io);
+    var smtps_options = smtp_options;
+    smtps_options.implicit_tls = true;
+    var smtps_task = if (smtps_listener) |*listener| try io.concurrent(conn.Listener(Server).serve, .{ io, listener, &smtp, smtps_options }) else null;
     var imap_task = try io.concurrent(conn.Listener(ImapServer).serve, .{
         io, &imap_listener, &imap,
         .{
@@ -60,6 +64,7 @@ pub fn main(process: std.process.Init) !void {
             .idle_timeout = .fromSeconds(30 * 60), // RFC 3501 §5.4 autologout
             .busy_reply = "* BYE too many connections, try again later\r\n",
             .tls = tls,
+            .implicit_tls = tls != null, // until IMAP STARTTLS (#19)
         },
     });
 
@@ -67,6 +72,7 @@ pub fn main(process: std.process.Init) !void {
     _ = std.c.sigwait(&signal_set, &sig);
     std.debug.print("shutdown requested by signal {d}\n", .{sig});
     smtp_task.cancel(io);
+    if (smtps_task) |*task| task.cancel(io);
     imap_task.cancel(io);
 }
 

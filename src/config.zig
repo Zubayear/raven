@@ -4,6 +4,8 @@ pub const Config = struct {
     listen_address: []const u8 = "127.0.0.1",
     listen_port: u16 = 5882,
     imap_port: u16 = 1143,
+    /// Implicit-TLS SMTP (usually 465); 0 disables it.
+    smtps_port: u16 = 0,
     hostname: []const u8 = "localhost",
     data_dir: []const u8 = "data",
     tls_cert_file: []const u8 = "",
@@ -12,6 +14,8 @@ pub const Config = struct {
     max_connections: u32 = 100,
     /// Largest accepted message in bytes, advertised with SMTP SIZE.
     max_message_size: u64 = 25 * 1024 * 1024,
+    /// Accept AUTH without TLS. Only for local testing.
+    allow_plaintext_auth: bool = false,
     config_path: ?[]const u8 = null,
 
     pub fn load(process: std.process.Init) !Config {
@@ -34,6 +38,7 @@ pub const Config = struct {
         if (self.data_dir.len == 0) return error.InvalidConfig;
         if (self.listen_port == 0 or self.imap_port == 0) return error.InvalidConfig;
         if (self.max_connections == 0 or self.max_message_size == 0) return error.InvalidConfig;
+        if (self.smtps_port != 0 and self.tls_cert_file.len == 0) return error.InvalidConfig;
     }
 };
 
@@ -42,12 +47,14 @@ const ArgsOptions = struct {
     listen_address: ?[]const u8 = null,
     listen_port: ?u16 = null,
     imap_port: ?u16 = null,
+    smtps_port: ?u16 = null,
     hostname: ?[]const u8 = null,
     data_dir: ?[]const u8 = null,
     tls_cert_file: ?[]const u8 = null,
     tls_key_file: ?[]const u8 = null,
     max_connections: ?u32 = null,
     max_message_size: ?u64 = null,
+    allow_plaintext_auth: ?bool = null,
 };
 
 fn parseArgs(process: std.process.Init, arena: std.mem.Allocator) !ArgsOptions {
@@ -71,6 +78,14 @@ fn parseArgs(process: std.process.Init, arena: std.mem.Allocator) !ArgsOptions {
         }
         if (std.mem.eql(u8, arg, "--imap-port")) {
             args.imap_port = try parsePort(it.next() orelse return error.MissingConfigValue);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--smtps-port")) {
+            args.smtps_port = try parsePort(it.next() orelse return error.MissingConfigValue);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--allow-plaintext-auth")) {
+            args.allow_plaintext_auth = true;
             continue;
         }
         if (std.mem.eql(u8, arg, "--hostname")) {
@@ -105,6 +120,8 @@ fn applyArgs(config: *Config, args: ArgsOptions) void {
     if (args.listen_address) |value| config.listen_address = value;
     if (args.listen_port) |value| config.listen_port = value;
     if (args.imap_port) |value| config.imap_port = value;
+    if (args.smtps_port) |value| config.smtps_port = value;
+    if (args.allow_plaintext_auth) |value| config.allow_plaintext_auth = value;
     if (args.hostname) |value| config.hostname = value;
     if (args.data_dir) |value| config.data_dir = value;
     if (args.tls_cert_file) |value| config.tls_cert_file = value;
@@ -117,6 +134,8 @@ fn applyEnv(config: *Config, process: std.process.Init, arena: std.mem.Allocator
     if (try getEnvValue(process, "RAVEN_LISTEN_ADDRESS")) |value| config.listen_address = try arena.dupe(u8, value);
     if (try getEnvValue(process, "RAVEN_LISTEN_PORT")) |value| config.listen_port = try parsePort(value);
     if (try getEnvValue(process, "RAVEN_IMAP_PORT")) |value| config.imap_port = try parsePort(value);
+    if (try getEnvValue(process, "RAVEN_SMTPS_PORT")) |value| config.smtps_port = try parsePort(value);
+    if (try getEnvValue(process, "RAVEN_ALLOW_PLAINTEXT_AUTH")) |value| config.allow_plaintext_auth = try parseBool(value);
     if (try getEnvValue(process, "RAVEN_HOSTNAME")) |value| config.hostname = try arena.dupe(u8, value);
     if (try getEnvValue(process, "RAVEN_DATA_DIR")) |value| config.data_dir = try arena.dupe(u8, value);
     if (try getEnvValue(process, "RAVEN_TLS_CERT")) |value| config.tls_cert_file = try arena.dupe(u8, value);
@@ -166,6 +185,14 @@ fn applyKeyValue(config: *Config, allocator: std.mem.Allocator, key: []const u8,
         config.imap_port = try parsePort(value);
         return;
     }
+    if (std.mem.eql(u8, key, "smtps_port")) {
+        config.smtps_port = try parsePort(value);
+        return;
+    }
+    if (std.mem.eql(u8, key, "allow_plaintext_auth")) {
+        config.allow_plaintext_auth = try parseBool(value);
+        return;
+    }
     if (std.mem.eql(u8, key, "hostname")) {
         config.hostname = try allocator.dupe(u8, value);
         return;
@@ -190,6 +217,12 @@ fn applyKeyValue(config: *Config, allocator: std.mem.Allocator, key: []const u8,
         config.max_message_size = try std.fmt.parseInt(u64, value, 10);
         return;
     }
+}
+
+fn parseBool(value: []const u8) !bool {
+    for ([_][]const u8{ "1", "true", "yes", "on" }) |t| if (std.ascii.eqlIgnoreCase(value, t)) return true;
+    for ([_][]const u8{ "0", "false", "no", "off" }) |f| if (std.ascii.eqlIgnoreCase(value, f)) return false;
+    return error.InvalidConfig;
 }
 
 fn parsePort(value: []const u8) !u16 {
