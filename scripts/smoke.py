@@ -32,12 +32,14 @@ class Raven:
                      "--data-dir", str(data_dir), *extra]
 
     def __enter__(self):
-        self.proc = subprocess.Popen(self.args, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        # A file, not a pipe: nobody drains a pipe, and a full one would block raven.
+        self.log_file = tempfile.TemporaryFile()
+        self.proc = subprocess.Popen(self.args, stdout=subprocess.DEVNULL, stderr=self.log_file)
         for port in self.ports:
             deadline = time.monotonic() + 10
             while True:
                 if self.proc.poll() is not None:
-                    sys.exit(f"raven exited early:\n{self.proc.stderr.read().decode()}")
+                    sys.exit(f"raven exited early:\n{self.log()}")
                 with socket.socket() as s:
                     if s.connect_ex((HOST, port)) == 0:
                         break
@@ -49,6 +51,10 @@ class Raven:
     def __exit__(self, *exc):
         self.proc.terminate()
         self.proc.wait(timeout=10)
+
+    def log(self):
+        self.log_file.seek(0)
+        return self.log_file.read().decode()
 
 
 PASSWORD = "correct horse"  # the space exercises IMAP quoting (#12)
@@ -186,7 +192,7 @@ def main():
         with Raven(remote, "--tls-cert", str(cert), "--tls-key", str(key), ports=(3525, 3143), hostname="mx.remote.test"), \
                 Raven(data, "--tls-cert", str(cert), "--tls-key", str(key), "--smtps-port", str(SMTPS_PORT),
                       "--imaps-port", str(IMAPS_PORT), "--submission-port", str(SUBMISSION_PORT),
-                      "--relay-host", HOST, "--relay-port", "3525"):
+                      "--relay-host", HOST, "--relay-port", "3525", "--log-level", "debug") as sender:
             # Submission: AUTH first, then remote recipients go to the queue (#20).
             sub = smtplib.SMTP(HOST, SUBMISSION_PORT, timeout=5)
             sub.starttls(context=ctx)
@@ -276,6 +282,13 @@ def main():
             idle_tls = ctx.wrap_socket(socket.create_connection((HOST, IMAPS_PORT), timeout=5))
             assert idle_tls.recv(64).startswith(b"* OK")
         idle_tls.close()
+
+        # Leveled logs carry connection ids; passwords never reach them, even at debug (#25).
+        log = sender.log()
+        assert "info(smtp): #" in log and "authenticated as alice@example.com" in log, log
+        assert "debug(imap): #" in log and ": connected" in log, log
+        plain = base64.b64encode(b"\0alice@example.com\0" + PASSWORD.encode()).decode()
+        assert PASSWORD not in log and plain not in log, log
 
         bad = subprocess.run([BIN, "--data-dir", str(tmp / "bad"), "--tls-cert", str(cert)],
                              capture_output=True, timeout=10)

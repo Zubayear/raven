@@ -189,6 +189,6 @@ fn bioCtrl(bio: ?*c.BIO, cmd: c_int, _: c_long, _: ?*anyopaque) callconv(.c) c_l
 fn sslError(what: []const u8) error{TlsInitFailed} {
     var buf: [256]u8 = undefined;
     c.ERR_error_string_n(c.ERR_get_error(), &buf, buf.len);
-    std.debug.print("tls: {s} failed: {s}\n", .{ what, std.mem.sliceTo(&buf, 0) });
+    std.log.scoped(.tls).err("{s} failed: {s}", .{ what, std.mem.sliceTo(&buf, 0) });
     return error.TlsInitFailed;
 }

@@ -13,6 +13,8 @@ const TenantCatalog = @import("tenant_index.zig").TenantCatalog;
 const TlsClient = @import("tls.zig").TlsClient;
 const writeDate = @import("server.zig").writeDate;
 
+const log = std.log.scoped(.queue);
+
 /// After this long, temporary failures are bounced (RFC 5321 §4.5.4.1
 /// suggests 4–5 days).
 const max_age = 5 * std.time.s_per_day;
@@ -37,7 +39,7 @@ pub const Runner = struct {
         while (true) {
             self.runOnce(io) catch |err| switch (err) {
                 error.Canceled => return,
-                else => std.debug.print("queue: {}\n", .{err}),
+                else => log.err("{t}", .{err}),
             };
             io.sleep(self.interval, .boot) catch return;
         }
@@ -66,7 +68,7 @@ pub const Runner = struct {
     fn attemptTask(self: *Runner, io: Io, entry: QueueEntry) Io.Cancelable!void {
         self.attempt(io, entry) catch |err| switch (err) {
             error.Canceled => return error.Canceled,
-            else => std.debug.print("queue: {s}: {}\n", .{ entry.id, err }),
+            else => log.err("{s}: {t}", .{ entry.id, err }),
         };
     }
 
@@ -87,10 +89,17 @@ pub const Runner = struct {
                     try everyone(arena, message.recipients.len, .retry, try std.fmt.allocPrint(arena, "{s}: {t}", .{ relay.host, err }))
             else
                 try smtp_client.deliver(arena, io, group.key_ptr.*, message, .{ .hostname = self.hostname, .tls = self.tls });
+            // Details are remote replies: escaped, so they can't forge log lines.
             for (message.recipients, results) |recipient, result| switch (result.outcome) {
-                .delivered => std.debug.print("queue: {s}: delivered to {s}\n", .{ entry.id, recipient }),
-                .retry => try retry.append(arena, recipient),
-                .failed => try failed.append(arena, .{ .recipient = recipient, .detail = result.detail }),
+                .delivered => log.info("{s}: delivered to {s}", .{ entry.id, recipient }),
+                .retry => {
+                    log.info("{s}: deferred for {s}: {f}", .{ entry.id, recipient, std.zig.fmtString(result.detail) });
+                    try retry.append(arena, recipient);
+                },
+                .failed => {
+                    log.info("{s}: failed for {s}: {f}", .{ entry.id, recipient, std.zig.fmtString(result.detail) });
+                    try failed.append(arena, .{ .recipient = recipient, .detail = result.detail });
+                },
             };
         }
 

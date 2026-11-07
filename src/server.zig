@@ -13,6 +13,8 @@ const TenantIndex = @import("tenant_index.zig");
 const conn = @import("conn.zig");
 const dkim = @import("dkim.zig");
 
+const log = std.log.scoped(Server.log_scope);
+
 pub const Server = struct {
     allocator: std.mem.Allocator,
     config: Config,
@@ -30,6 +32,8 @@ pub const Server = struct {
         };
     }
 
+    pub const log_scope = .smtp;
+
     /// Passwords only travel encrypted, unless the operator opted out.
     fn authAllowed(self: *const Server, client: *const conn.Client) bool {
         return client.secure or self.config.allow_plaintext_auth;
@@ -37,16 +41,16 @@ pub const Server = struct {
 
     /// A DKIM-Signature for `message` from `identity`'s domain, or null if
     /// the domain has no key or signing fails: the mail then goes unsigned.
-    fn dkimSignature(self: *const Server, io: Io, identity: Identity, message: []const u8, seconds: u64) ?[]u8 {
+    fn dkimSignature(self: *const Server, io: Io, client: *const conn.Client, identity: Identity, message: []const u8, seconds: u64) ?[]u8 {
         const key_dir = self.storage.dkimPath(self.allocator, identity.tenant, identity.domain) catch return null;
         defer self.allocator.free(key_dir);
         const key = (dkim.loadKey(self.allocator, io, key_dir) catch |err| {
-            std.debug.print("dkim: cannot load key for {s}: {}\n", .{ identity.domain, err });
+            client.log(.warn, log_scope, "dkim: cannot load key for {s}: {t}", .{ identity.domain, err });
             return null;
         }) orelse return null;
         defer key.deinit(self.allocator);
         return dkim.sign(self.allocator, key, identity.domain, message, seconds) catch |err| {
-            std.debug.print("dkim: signing for {s} failed: {}\n", .{ identity.domain, err });
+            client.log(.warn, log_scope, "dkim: signing for {s} failed: {t}", .{ identity.domain, err });
             return null;
         };
     }
@@ -54,7 +58,7 @@ pub const Server = struct {
     pub fn listen(self: *Server, io: Io, port: u16) !std.Io.net.Server {
         const ip = try std.Io.net.IpAddress.parse(self.config.listen_address, port);
         const listener = try ip.listen(io, .{ .reuse_address = true });
-        std.debug.print("smtp listening on {any}\n", .{ip});
+        log.info("listening on {f}", .{ip});
         return listener;
     }
 
@@ -171,13 +175,16 @@ pub const Server = struct {
                     try w.writeAll("501 5.0.0 authentication canceled\r\n");
                     continue;
                 }
+                // Never log `response`: it carries the password.
                 auth_identity = account_index.authenticatePlain(allocator, fs_io, self.storage, catalog, response) catch |err| switch (err) {
                     error.AuthFailed => {
+                        client.log(.warn, log_scope, "authentication failed", .{});
                         try w.writeAll("535 5.7.8 authentication failed\r\n");
                         continue;
                     },
                     else => return err,
                 };
+                client.log(.info, log_scope, "authenticated as {s}@{s}", .{ auth_identity.?.user, auth_identity.?.domain });
                 try w.writeAll("235 2.7.0 authentication successful\r\n");
             } else if (std.ascii.eqlIgnoreCase(verb, "MAIL")) {
                 if (tx.sender != null) {
@@ -309,27 +316,27 @@ pub const Server = struct {
                     header.clearRetainingCapacity();
                     try writeTrace(&header.writer, trace, recipient);
                     const name = self.storage.deliver(fs_io, allocator, recipient.tenant, recipient.domain, recipient.user, header.written(), message) catch |err| {
-                        std.debug.print("delivery to {s}@{s} failed: {}\n", .{ recipient.user, recipient.domain, err });
+                        client.log(.err, log_scope, "delivery to {s}@{s} failed: {t}", .{ recipient.user, recipient.domain, err });
                         break false;
                     };
                     defer allocator.free(name);
-                    std.debug.print("delivered to {s}@{s} as {s}\n", .{ recipient.user, recipient.domain, name });
+                    client.log(.info, log_scope, "delivered to {s}@{s} as {s}", .{ recipient.user, recipient.domain, name });
                 } else true;
                 const queued = tx.remote.items.len == 0 or queued: {
                     // One queue entry for every remote recipient; Return-Path is
                     // left for the final delivery (RFC 5321 §4.4).
                     header.clearRetainingCapacity();
                     // Only authenticated users relay, and only as themselves.
-                    const signature = if (auth_identity) |identity| self.dkimSignature(fs_io, identity, message, trace.seconds) else null;
+                    const signature = if (auth_identity) |identity| self.dkimSignature(fs_io, client, identity, message, trace.seconds) else null;
                     defer if (signature) |value| allocator.free(value);
                     if (signature) |value| try header.writer.writeAll(value);
                     try writeTrace(&header.writer, trace, null);
                     const id = self.storage.enqueue(fs_io, allocator, tx.sender.?, tx.remote.items, header.written(), message) catch |err| {
-                        std.debug.print("queueing failed: {}\n", .{err});
+                        client.log(.err, log_scope, "queueing failed: {t}", .{err});
                         break :queued false;
                     };
                     defer allocator.free(id);
-                    std.debug.print("queued {s} for {d} remote recipient(s)\n", .{ id, tx.remote.items.len });
+                    client.log(.info, log_scope, "queued {s} for {d} remote recipient(s)", .{ id, tx.remote.items.len });
                     break :queued true;
                 };
                 // A temporary failure makes the client retry: a duplicate beats a lost message.
@@ -536,6 +543,8 @@ const TestDir = struct {
     tmp: std.testing.TmpDir,
     root: []u8,
     catalog: TenantCatalog,
+    /// Collects the sessions' log lines when set.
+    log: ?*Io.Writer = null,
 
     fn init(allocator: std.mem.Allocator) !TestDir {
         var tmp = std.testing.tmpDir(.{});
@@ -564,7 +573,7 @@ const TestDir = struct {
         var in: Io.Reader = .fixed(input);
         var out: Io.Writer.Allocating = .init(allocator);
         defer out.deinit();
-        var client: conn.Client = .{ .reader = &in, .writer = &out.writer, .secure = secure };
+        var client: conn.Client = .{ .reader = &in, .writer = &out.writer, .secure = secure, .log_capture = self.log };
         try server.handleClient(std.testing.io, &client);
         return out.toOwnedSlice();
     }
@@ -886,4 +895,26 @@ test "the submission port requires AUTH before MAIL" {
     var client: conn.Client = .{ .reader = &in, .writer = &out.writer, .secure = true };
     try server.handleClient(std.testing.io, &client);
     try std.testing.expectStringEndsWith(out.written(), "530 5.7.0 authentication required\r\n221 2.0.0 bye\r\n");
+}
+
+test "AUTH payloads never reach the log" {
+    const allocator = std.testing.allocator;
+    var dir = try TestDir.init(allocator);
+    defer dir.deinit(allocator);
+    var log_lines: Io.Writer.Allocating = .init(allocator);
+    defer log_lines.deinit();
+    dir.log = &log_lines.writer;
+
+    const wrong = try buildPlainAuthPayload(allocator, "", "alice@example.com", "hunter2-wrong");
+    defer allocator.free(wrong);
+    const right = try buildPlainAuthPayload(allocator, "", "alice@example.com", "secret");
+    defer allocator.free(right);
+    const input = try std.mem.concat(allocator, u8, &.{ "EHLO client\r\nAUTH PLAIN ", wrong, "\r\nAUTH PLAIN\r\n", right, "\r\nQUIT\r\n" });
+    defer allocator.free(input);
+    allocator.free(try dir.session(allocator, input));
+
+    const logged = log_lines.written();
+    try std.testing.expect(std.mem.indexOf(u8, logged, "#0: authentication failed\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, logged, "#0: authenticated as alice@example.com\n") != null);
+    for ([_][]const u8{ "secret", "hunter2", wrong, right }) |leak| try std.testing.expect(std.mem.indexOf(u8, logged, leak) == null);
 }

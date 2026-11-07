@@ -103,7 +103,7 @@ pub const Storage = struct {
             const id = entry.name[0 .. entry.name.len - ".env".len];
             const raw = try queue.readFileAlloc(io, entry.name, arena, .limited(1024 * 1024));
             const parsed = QueueEntry.parse(arena, try arena.dupe(u8, id), raw) catch {
-                std.debug.print("queue: skipping unreadable envelope {s}\n", .{entry.name});
+                std.log.scoped(.storage).warn("skipping unreadable queue envelope {s}", .{entry.name});
                 continue;
             };
             try entries.append(arena, parsed);

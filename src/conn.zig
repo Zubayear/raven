@@ -6,6 +6,9 @@ const net = Io.net;
 const tls = @import("tls.zig");
 const TlsServer = tls.TlsServer;
 
+/// Numbers connections across all listeners, for log lines.
+var next_id = std.atomic.Value(u64).init(1);
+
 pub const Options = struct {
     max_connections: u32,
     /// A session is closed when the peer sends nothing for this long.
@@ -27,6 +30,22 @@ pub const Client = struct {
     transport: ?*Transport = null,
     /// The peer's address, if known.
     remote: ?net.IpAddress = null,
+    id: u64 = 0,
+    /// Unit tests collect this connection's log lines here instead.
+    log_capture: ?*Io.Writer = null,
+
+    /// Logs one line about this connection, prefixed with its id and address.
+    pub fn log(self: *const Client, comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime format: []const u8, args: anytype) void {
+        const peer: Peer = .{ .id = self.id, .remote = self.remote };
+        if (self.log_capture) |w| return w.print("{f}: " ++ format ++ "\n", .{peer} ++ args) catch {};
+        const scoped = std.log.scoped(scope);
+        switch (level) {
+            .err => scoped.err("{f}: " ++ format, .{peer} ++ args),
+            .warn => scoped.warn("{f}: " ++ format, .{peer} ++ args),
+            .info => scoped.info("{f}: " ++ format, .{peer} ++ args),
+            .debug => scoped.debug("{f}: " ++ format, .{peer} ++ args),
+        }
+    }
 
     /// Changes how long reads wait for the peer (IMAP IDLE polls).
     pub fn setReadTimeout(self: *Client, timeout: Io.Duration) void {
@@ -64,6 +83,17 @@ pub const Client = struct {
     }
 };
 
+/// "#<id> <address>", the prefix of every log line about a connection.
+const Peer = struct {
+    id: u64,
+    remote: ?net.IpAddress,
+
+    pub fn format(self: Peer, w: *Io.Writer) Io.Writer.Error!void {
+        try w.print("#{d}", .{self.id});
+        if (self.remote) |ip| try w.print(" {f}", .{ip});
+    }
+};
+
 pub const Transport = struct {
     socket: Socket,
     tls_server: ?*TlsServer,
@@ -72,8 +102,10 @@ pub const Transport = struct {
     tls_write_buf: [4096]u8 = undefined,
 };
 
-/// A protocol server: `Handler.handleClient(*Handler, Io, *Client)`.
+/// A protocol server: `Handler.handleClient(*Handler, Io, *Client)`, with
+/// `Handler.log_scope` naming it in logs.
 pub fn Listener(comptime Handler: type) type {
+    const log = std.log.scoped(Handler.log_scope);
     return struct {
         /// Accepts connections until canceled and serves each one
         /// concurrently. Canceling this task cancels every open session.
@@ -86,26 +118,28 @@ pub fn Listener(comptime Handler: type) type {
                 const stream = listener.accept(io) catch |err| switch (err) {
                     error.Canceled, error.SocketNotListening => return,
                     else => {
-                        std.debug.print("accept error: {}\n", .{err});
+                        log.err("accept failed: {t}", .{err});
                         continue;
                     },
                 };
+                const id = next_id.fetchAdd(1, .monotonic);
                 if (active.fetchAdd(1, .monotonic) >= options.max_connections) {
                     _ = active.fetchSub(1, .monotonic);
+                    log.warn("{f}: turned away, {d} connections open", .{ Peer{ .id = id, .remote = stream.socket.address }, options.max_connections });
                     var writer = stream.writer(io, &.{});
                     writer.interface.writeAll(options.busy_reply) catch {};
                     stream.close(io);
                     continue;
                 }
-                sessions.concurrent(io, session, .{ io, stream, handler, options, &active }) catch |err| {
+                sessions.concurrent(io, session, .{ io, stream, handler, options, &active, id }) catch |err| {
                     _ = active.fetchSub(1, .monotonic);
                     stream.close(io);
-                    std.debug.print("cannot start session: {}\n", .{err});
+                    log.err("cannot start session: {t}", .{err});
                 };
             }
         }
 
-        fn session(io: Io, stream: net.Stream, handler: *Handler, options: Options, active: *std.atomic.Value(u32)) void {
+        fn session(io: Io, stream: net.Stream, handler: *Handler, options: Options, active: *std.atomic.Value(u32), id: u64) void {
             defer {
                 stream.close(io);
                 _ = active.fetchSub(1, .monotonic);
@@ -129,14 +163,17 @@ pub fn Listener(comptime Handler: type) type {
                 .writer = &transport.socket.writer.interface,
                 .transport = &transport,
                 .remote = stream.socket.address,
+                .id = id,
             };
+            client.log(.debug, Handler.log_scope, "connected", .{});
+            defer client.log(.debug, Handler.log_scope, "disconnected", .{});
 
             if (options.implicit_tls) client.startTls() catch |err| {
-                std.debug.print("tls handshake failed: {} ({?})\n", .{ err, transport.socket.err });
+                client.log(.info, Handler.log_scope, "tls handshake failed: {t} ({?t})", .{ err, transport.socket.err });
                 return;
             };
             handler.handleClient(io, &client) catch |err| {
-                std.debug.print("session ended: {} ({?})\n", .{ err, transport.socket.err });
+                client.log(.info, Handler.log_scope, "session ended: {t} ({?t})", .{ err, transport.socket.err });
             };
         }
     };

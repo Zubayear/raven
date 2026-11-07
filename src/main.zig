@@ -12,6 +12,19 @@ const TlsServer = @import("tls.zig").TlsServer;
 const TlsClient = @import("tls.zig").TlsClient;
 const queue = @import("queue.zig");
 
+pub const std_options: std.Options = .{
+    // Everything is compiled in; `--log-level` filters at runtime.
+    .log_level = .debug,
+    .logFn = logFn,
+};
+
+var log_level: std.log.Level = .info;
+
+fn logFn(comptime level: std.log.Level, comptime scope: @EnumLiteral(), comptime format: []const u8, args: anytype) void {
+    if (@backingInt(level) > @backingInt(log_level)) return;
+    std.log.defaultLog(level, scope, format, args);
+}
+
 pub fn main(process: std.process.Init) !void {
     const io = process.io;
     const allocator = process.gpa;
@@ -25,7 +38,8 @@ pub fn main(process: std.process.Init) !void {
     }
 
     const config = try Config.load(process);
-    std.debug.print("starting raven {s} on {s}:{d} / imap {d} data={s}\n", .{ config.hostname, config.listen_address, config.listen_port, config.imap_port, config.data_dir });
+    log_level = config.log_level;
+    std.log.info("starting raven {s} on {s}:{d} / imap {d} data={s}", .{ config.hostname, config.listen_address, config.listen_port, config.imap_port, config.data_dir });
 
     const storage = Storage.init(config.data_dir);
     try storage.ensureLayout(io, allocator);
@@ -41,7 +55,7 @@ pub fn main(process: std.process.Init) !void {
     if (config.tls_cert_file.len != 0 or config.tls_key_file.len != 0) {
         if (config.tls_cert_file.len == 0 or config.tls_key_file.len == 0) return error.InvalidConfig;
         tls_server = try TlsServer.init(allocator, config.tls_cert_file, config.tls_key_file);
-        std.debug.print("tls enabled with {s} and {s}\n", .{ config.tls_cert_file, config.tls_key_file });
+        std.log.info("tls enabled with {s} and {s}", .{ config.tls_cert_file, config.tls_key_file });
     }
     const tls: ?*TlsServer = if (tls_server) |*value| value else null;
 
@@ -105,7 +119,7 @@ pub fn main(process: std.process.Init) !void {
 
     var sig: c_int = 0;
     _ = std.c.sigwait(&signal_set, &sig);
-    std.debug.print("shutdown requested by signal {d}\n", .{sig});
+    std.log.info("shutdown requested by signal {d}", .{sig});
     queue_task.cancel(io);
     smtp_task.cancel(io);
     if (smtps_task) |*task| task.cancel(io);
