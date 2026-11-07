@@ -12,9 +12,72 @@ pub const Storage = struct {
     }
 
     pub fn ensureLayout(self: Storage, io: Io, allocator: std.mem.Allocator) !void {
-        const tenants = try std.fs.path.join(allocator, &.{ self.root_dir, "tenants" });
-        defer allocator.free(tenants);
-        try Io.Dir.cwd().createDirPath(io, tenants);
+        for ([_][]const u8{ "tenants", "queue/outbound" }) |sub| {
+            const path = try std.fs.path.join(allocator, &.{ self.root_dir, sub });
+            defer allocator.free(path);
+            try Io.Dir.cwd().createDirPath(io, path);
+        }
+    }
+
+    pub fn queuePath(self: Storage, allocator: std.mem.Allocator) ![]u8 {
+        return std.fs.path.join(allocator, &.{ self.root_dir, "queue", "outbound" });
+    }
+
+    /// Queues a message for remote delivery: `<id>.eml` holds the message,
+    /// `<id>.env` the envelope. Both are synced, and the envelope is renamed
+    /// into place last, so a listed entry is always complete. Returns the
+    /// id; the caller owns it.
+    pub fn enqueue(self: Storage, io: Io, allocator: std.mem.Allocator, sender: []const u8, recipients: []const []const u8, header: []const u8, body: []const u8) ![]u8 {
+        const queue_path = try self.queuePath(allocator);
+        defer allocator.free(queue_path);
+        var queue = try Io.Dir.cwd().createDirPathOpen(io, queue_path, .{});
+        defer queue.close(io);
+
+        const id = try uniqueName(io, allocator);
+        errdefer allocator.free(id);
+        var name_buf: [std.fs.max_name_bytes]u8 = undefined;
+        var tmp_buf: [std.fs.max_name_bytes]u8 = undefined;
+
+        const message_name = try std.fmt.bufPrint(&name_buf, "{s}.eml", .{id});
+        try writeSynced(io, queue, message_name, &.{ header, body });
+        errdefer queue.deleteFile(io, message_name) catch {};
+
+        var envelope: Io.Writer.Allocating = .init(allocator);
+        defer envelope.deinit();
+        const now: u64 = @intCast(@divFloor(Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
+        try (QueueEntry{ .id = id, .sender = sender, .recipients = recipients, .created = now, .next_attempt = now }).write(&envelope.writer);
+        const tmp_name = try std.fmt.bufPrint(&tmp_buf, "{s}.env.tmp", .{id});
+        try writeSynced(io, queue, tmp_name, &.{envelope.written()});
+        try queue.rename(tmp_name, queue, try std.fmt.bufPrint(&name_buf, "{s}.env", .{id}), io);
+        return id;
+    }
+
+    /// Queued entries, oldest first; strings live in `arena`.
+    pub fn listQueue(self: Storage, io: Io, arena: std.mem.Allocator) ![]QueueEntry {
+        const queue_path = try self.queuePath(arena);
+        var queue = Io.Dir.cwd().openDir(io, queue_path, .{ .iterate = true }) catch |err| switch (err) {
+            error.FileNotFound => return &.{},
+            else => return err,
+        };
+        defer queue.close(io);
+        var entries = std.ArrayList(QueueEntry).empty;
+        var it = queue.iterate();
+        while (try it.next(io)) |entry| {
+            if (entry.kind != .file or !std.mem.endsWith(u8, entry.name, ".env")) continue;
+            const id = entry.name[0 .. entry.name.len - ".env".len];
+            const raw = try queue.readFileAlloc(io, entry.name, arena, .limited(1024 * 1024));
+            const parsed = QueueEntry.parse(arena, try arena.dupe(u8, id), raw) catch {
+                std.debug.print("queue: skipping unreadable envelope {s}\n", .{entry.name});
+                continue;
+            };
+            try entries.append(arena, parsed);
+        }
+        std.sort.pdq(QueueEntry, entries.items, {}, struct {
+            fn lessThan(_: void, a: QueueEntry, b: QueueEntry) bool {
+                return std.mem.order(u8, a.id, b.id) == .lt;
+            }
+        }.lessThan);
+        return entries.items;
     }
 
     pub fn tenantIndexPath(self: Storage, allocator: std.mem.Allocator) ![]u8 {
@@ -269,6 +332,58 @@ pub fn folderPath(allocator: std.mem.Allocator, maildir_path: []const u8, folder
     defer allocator.free(dir);
     std.mem.replaceScalar(u8, dir, '/', '.');
     return std.fs.path.join(allocator, &.{ maildir_path, dir });
+}
+
+/// An outbound queue envelope. The text form is one `key value` per line.
+pub const QueueEntry = struct {
+    id: []const u8,
+    /// Reverse-path without brackets; empty for bounces.
+    sender: []const u8,
+    recipients: []const []const u8,
+    /// Unix seconds.
+    created: u64,
+    next_attempt: u64,
+    attempts: u32 = 0,
+
+    pub fn write(self: QueueEntry, w: *Io.Writer) !void {
+        try w.print("sender {s}\ncreated {d}\nnext {d}\nattempts {d}\n", .{ self.sender, self.created, self.next_attempt, self.attempts });
+        for (self.recipients) |recipient| try w.print("recipient {s}\n", .{recipient});
+    }
+
+    fn parse(arena: std.mem.Allocator, id: []const u8, raw: []const u8) !QueueEntry {
+        var entry: QueueEntry = .{ .id = id, .sender = "", .recipients = &.{}, .created = 0, .next_attempt = 0 };
+        var recipients = std.ArrayList([]const u8).empty;
+        var saw_sender = false;
+        var lines = std.mem.tokenizeScalar(u8, raw, '\n');
+        while (lines.next()) |line| {
+            const space = std.mem.indexOfScalar(u8, line, ' ') orelse line.len;
+            const key = line[0..space];
+            const value = if (space < line.len) line[space + 1 ..] else "";
+            if (std.mem.eql(u8, key, "sender")) {
+                entry.sender = value;
+                saw_sender = true;
+            } else if (std.mem.eql(u8, key, "created")) {
+                entry.created = try std.fmt.parseInt(u64, value, 10);
+            } else if (std.mem.eql(u8, key, "next")) {
+                entry.next_attempt = try std.fmt.parseInt(u64, value, 10);
+            } else if (std.mem.eql(u8, key, "attempts")) {
+                entry.attempts = try std.fmt.parseInt(u32, value, 10);
+            } else if (std.mem.eql(u8, key, "recipient")) {
+                try recipients.append(arena, value);
+            } else return error.Corrupt;
+        }
+        if (!saw_sender or recipients.items.len == 0) return error.Corrupt;
+        entry.recipients = recipients.items;
+        return entry;
+    }
+};
+
+/// Writes `parts` to a new file `name` in `dir` and syncs it.
+fn writeSynced(io: Io, dir: Io.Dir, name: []const u8, parts: []const []const u8) !void {
+    const file = try dir.createFile(io, name, .{ .exclusive = true });
+    defer file.close(io);
+    for (parts) |part| try file.writeStreamingAll(io, part);
+    try file.sync(io);
 }
 
 pub const DeliverOptions = struct {
@@ -692,4 +807,31 @@ test "deliverTo with flags and a date lands in cur" {
     try std.testing.expect(mailbox.messages[0].flags.seen);
     try std.testing.expect(!mailbox.messages[0].recent); // went straight to cur/
     try std.testing.expectEqual(@as(u64, 951782400), mailbox.messages[0].internal_date);
+}
+
+test "queue entries are durable and survive a restart" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const root = try testRoot(allocator, &tmp);
+    defer allocator.free(root);
+
+    allocator.free(try Storage.init(root).enqueue(io, allocator, "alice@example.com", &.{ "bob@remote.test", "carol@other.test" }, "Received: x\r\n", "hi\r\n"));
+    allocator.free(try Storage.init(root).enqueue(io, allocator, "", &.{"dan@remote.test"}, "", "bounce\r\n"));
+
+    var arena_state = std.heap.ArenaAllocator.init(allocator);
+    defer arena_state.deinit();
+    const entries = try Storage.init(root).listQueue(io, arena_state.allocator());
+    try std.testing.expectEqual(@as(usize, 2), entries.len);
+    try std.testing.expectEqualStrings("alice@example.com", entries[0].sender);
+    try std.testing.expectEqual(@as(usize, 2), entries[0].recipients.len);
+    try std.testing.expectEqualStrings("carol@other.test", entries[0].recipients[1]);
+    try std.testing.expectEqualStrings("", entries[1].sender);
+
+    const message = try std.fmt.allocPrint(allocator, "queue/outbound/{s}.eml", .{entries[0].id});
+    defer allocator.free(message);
+    const data = try tmp.dir.readFileAlloc(io, message, allocator, .limited(1024));
+    defer allocator.free(data);
+    try std.testing.expectEqualStrings("Received: x\r\nhi\r\n", data);
 }

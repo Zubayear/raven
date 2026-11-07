@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 
 BIN = os.environ.get("RAVEN_BIN", "zig-out/bin/raven")
-HOST, SMTP_PORT, IMAP_PORT, SMTPS_PORT, IMAPS_PORT = "127.0.0.1", 2525, 2143, 2465, 2993
+HOST, SMTP_PORT, IMAP_PORT, SMTPS_PORT, IMAPS_PORT, SUBMISSION_PORT = "127.0.0.1", 2525, 2143, 2465, 2993, 2587
 
 
 class Raven:
@@ -165,7 +165,21 @@ def main():
         data = tmp / "tls"
         setup_accounts(data)
         with Raven(data, "--tls-cert", str(cert), "--tls-key", str(key), "--smtps-port", str(SMTPS_PORT),
-                   "--imaps-port", str(IMAPS_PORT)):
+                   "--imaps-port", str(IMAPS_PORT), "--submission-port", str(SUBMISSION_PORT)):
+            # Submission: AUTH first, then remote recipients go to the queue (#20).
+            sub = smtplib.SMTP(HOST, SUBMISSION_PORT, timeout=5)
+            sub.starttls(context=ctx)
+            try:
+                sub.sendmail("alice@example.com", ["bob@remote.test"], "Subject: out\r\n\r\nhi\r\n")
+                sys.exit("submission without AUTH must fail")
+            except smtplib.SMTPSenderRefused as err:
+                assert err.smtp_code == 530, err
+            sub.login("alice@example.com", PASSWORD)
+            sub.sendmail("alice@example.com", ["bob@remote.test"], "Subject: out\r\n\r\nhi\r\n")
+            sub.quit()
+            envelopes = list((data / "queue/outbound").glob("*.env"))
+            assert len(envelopes) == 1 and "recipient bob@remote.test" in envelopes[0].read_text(), envelopes
+
             # IMAP refuses passwords before STARTTLS, then accepts them (#19).
             imap = imaplib.IMAP4(HOST, IMAP_PORT, timeout=5)
             assert "LOGINDISABLED" in imap.capabilities and "STARTTLS" in imap.capabilities, imap.capabilities

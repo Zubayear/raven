@@ -8,6 +8,8 @@ pub const Config = struct {
     smtps_port: u16 = 0,
     /// Implicit-TLS IMAP (usually 993); 0 disables it.
     imaps_port: u16 = 0,
+    /// Mail submission (usually 587, RFC 6409): AUTH required; 0 disables it.
+    submission_port: u16 = 0,
     hostname: []const u8 = "localhost",
     data_dir: []const u8 = "data",
     tls_cert_file: []const u8 = "",
@@ -51,6 +53,7 @@ const ArgsOptions = struct {
     imap_port: ?u16 = null,
     smtps_port: ?u16 = null,
     imaps_port: ?u16 = null,
+    submission_port: ?u16 = null,
     hostname: ?[]const u8 = null,
     data_dir: ?[]const u8 = null,
     tls_cert_file: ?[]const u8 = null,
@@ -91,6 +94,10 @@ fn parseArgs(process: std.process.Init, arena: std.mem.Allocator) !ArgsOptions {
             args.imaps_port = try parsePort(it.next() orelse return error.MissingConfigValue);
             continue;
         }
+        if (std.mem.eql(u8, arg, "--submission-port")) {
+            args.submission_port = try parsePort(it.next() orelse return error.MissingConfigValue);
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--allow-plaintext-auth")) {
             args.allow_plaintext_auth = true;
             continue;
@@ -129,6 +136,7 @@ fn applyArgs(config: *Config, args: ArgsOptions) void {
     if (args.imap_port) |value| config.imap_port = value;
     if (args.smtps_port) |value| config.smtps_port = value;
     if (args.imaps_port) |value| config.imaps_port = value;
+    if (args.submission_port) |value| config.submission_port = value;
     if (args.allow_plaintext_auth) |value| config.allow_plaintext_auth = value;
     if (args.hostname) |value| config.hostname = value;
     if (args.data_dir) |value| config.data_dir = value;
@@ -144,6 +152,7 @@ fn applyEnv(config: *Config, process: std.process.Init, arena: std.mem.Allocator
     if (try getEnvValue(process, "RAVEN_IMAP_PORT")) |value| config.imap_port = try parsePort(value);
     if (try getEnvValue(process, "RAVEN_SMTPS_PORT")) |value| config.smtps_port = try parsePort(value);
     if (try getEnvValue(process, "RAVEN_IMAPS_PORT")) |value| config.imaps_port = try parsePort(value);
+    if (try getEnvValue(process, "RAVEN_SUBMISSION_PORT")) |value| config.submission_port = try parsePort(value);
     if (try getEnvValue(process, "RAVEN_ALLOW_PLAINTEXT_AUTH")) |value| config.allow_plaintext_auth = try parseBool(value);
     if (try getEnvValue(process, "RAVEN_HOSTNAME")) |value| config.hostname = try arena.dupe(u8, value);
     if (try getEnvValue(process, "RAVEN_DATA_DIR")) |value| config.data_dir = try arena.dupe(u8, value);
@@ -200,6 +209,10 @@ fn applyKeyValue(config: *Config, allocator: std.mem.Allocator, key: []const u8,
     }
     if (std.mem.eql(u8, key, "imaps_port")) {
         config.imaps_port = try parsePort(value);
+        return;
+    }
+    if (std.mem.eql(u8, key, "submission_port")) {
+        config.submission_port = try parsePort(value);
         return;
     }
     if (std.mem.eql(u8, key, "allow_plaintext_auth")) {
